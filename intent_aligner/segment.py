@@ -1,0 +1,251 @@
+"""Cut a user message into segments with an LLM-driven pointer.
+
+The model never reports offsets: each call shows the whole message split at the
+pointer and asks for the intents of the next segment plus the segment's closing
+text, copied verbatim. Code locates that text in the rest of the message, so one
+segment always ends where the next begins.
+
+The prompt also carries the window before the message (intent_aligner.window),
+so the digests of its conversation must exist first (intent_aligner.compress).
+
+Usage: python -m intent_aligner.segment MERGED.jsonl --uuid UUID
+           --digests DIGESTS.jsonl
+           --backend hive --model deployment/pc-qwen38-np6 --out SEGMENTS.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from collections.abc import Sequence
+from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from intent_aligner.llm import Ask, LLMError, asker
+from intent_aligner.units import Item, UserMessage, conversation_units
+from intent_aligner.window import (
+    PROMPT_BUDGET,
+    Count,
+    Digests,
+    load_digests,
+    qwen_tokens,
+    window_text,
+)
+
+MAX_ATTEMPTS = 4
+CONTEXT_CHARS = 30
+# Room kept free for retry feedback, which can quote every place an anchor occurs.
+FEEDBACK_ROOM = 2_000
+
+SYSTEM_PROMPT = """\
+你在把一条用户消息按意图切成连续的段落。<此前的对话> 是这条消息之前的对话，其中 AI 每一轮的工具操作已经压缩成一段概括（【AI 的工具操作】）；它只用来理解用户在回应什么、指的是什么，不切分它。要切的消息分成两部分：<已处理> 是前面已经切好的文本，<剩余> 是还没有切的文本。你只确定下一段：它从 <剩余> 的第一个字符开始，到哪里结束由你判断。
+
+一段是一串连续的文本，其中表达的意图集合保持不变；意图集合一变，这一段就结束。一个句子可以被切成几段，几句话也可以是一段。本身没有意图的内容（客套话、粘贴进来的材料、日志、表格、图片标记 [Image #N]）归入用到它、说明它或回应它的那一段，不单独成段。
+
+回答两项：
+- intents：这一段里用户的意图，每项一句话。每项要脱离对话也能看懂：用 <此前的对话> 把“这个”“当前任务”“继续干”这类指代换成具体的事。用户要 AI 做的事不同，才算不同的意图；用户告知的情况（理由、背景、条件、自己接下来的状态）并入它支撑的那个意图，不单独列出。一段里只有告知、没有要 AI 做的事时，告知的内容本身就是意图。
+- segment_end：从 <剩余> 里原样抄出这一段末尾的几个字符（不含末尾的空格和换行），一个字符都不能改，包括标点和空格。代码会在 <剩余> 里查找它来确定段落结尾，所以它在 <剩余> 里必须只出现一次；不够唯一就往前多抄几个字。
+"""
+
+FROM_START_RULE = (
+    "这一次 segment_end 改成从 <剩余> 的第一个字符开始，原样抄到这一段的末尾，"
+    "代码会检查 <剩余> 是否以它开头。"
+)
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intents": {"type": "array", "items": {"type": "string"}},
+        "segment_end": {"type": "string", "minLength": 1},
+    },
+    "required": ["intents", "segment_end"],
+    "additionalProperties": False,
+}
+
+
+class SegmentAnswer(BaseModel):
+    """What the model returns for one segment."""
+
+    model_config = ConfigDict(frozen=True)
+
+    intents: list[str]
+    segment_end: str
+
+
+class Segment(BaseModel):
+    """Characters [start, end) of the message body, with the intents the model gave."""
+
+    model_config = ConfigDict(frozen=True)
+
+    start: int
+    end: int
+    text: str
+    intents: list[str]
+    attempts: int
+
+
+class AnchorError(ValueError):
+    """The closing text does not pin down one position; the message goes back to the model."""
+
+    def __init__(self, message: str, *, ambiguous: bool) -> None:
+        super().__init__(message)
+        self.ambiguous = ambiguous
+
+
+def locate_end(body: str, start: int, anchor: str, *, from_start: bool) -> int:
+    """Return the end of the segment that starts at `start` and closes with `anchor`.
+
+    `anchor` must occur exactly once in body[start:] (overlapping occurrences
+    count); with `from_start` it is instead the whole segment and must be a prefix
+    of body[start:]. Whitespace right after the match joins the segment.
+
+    Examples:
+        >>> locate_end("好的，好的，就这样。\\n\\n下一句", 0, "就这样。", from_start=False)
+        12
+        >>> locate_end("好的，好的，就这样。", 3, "好的，", from_start=True)
+        6
+    """
+    rest = body[start:]
+    if from_start:
+        if not rest.startswith(anchor):
+            raise AnchorError(
+                f"<剩余> 不是以你给的 segment_end 开头。<剩余> 的开头是："
+                f"{rest[: len(anchor) + CONTEXT_CHARS]!r}",
+                ambiguous=False,
+            )
+        hits = [0]
+    else:
+        hits = [i for i in range(len(rest)) if rest.startswith(anchor, i)]
+    if not hits:
+        raise AnchorError(
+            "segment_end 在 <剩余> 里找不到。它必须是 <剩余> 里逐字照抄的一段文本。",
+            ambiguous=False,
+        )
+    if len(hits) > 1:
+        places = "\n".join(f"- …{_around(rest, i, len(anchor))}…" for i in hits)
+        raise AnchorError(
+            f"segment_end 在 <剩余> 里出现了 {len(hits)} 次，无法确定是哪一处：\n{places}",
+            ambiguous=True,
+        )
+    end = start + hits[0] + len(anchor)
+    while end < len(body) and body[end].isspace():
+        end += 1
+    return end
+
+
+def _around(rest: str, i: int, length: int) -> str:
+    left = max(0, i - CONTEXT_CHARS)
+    return (
+        f"{rest[left:i]}【{rest[i : i + length]}】{rest[i + length : i + length + CONTEXT_CHARS]}"
+    )
+
+
+def build_prompt(window: str, message: UserMessage, start: int, feedback: str) -> str:
+    """The window, the message split at the pointer, its images, and any retry feedback."""
+    parts = [
+        f"<此前的对话>\n{window}\n</此前的对话>",
+        f"<已处理>\n{message.body[:start]}\n</已处理>",
+        f"<剩余>\n{message.body[start:]}\n</剩余>",
+    ]
+    if message.images:
+        parts.append("这条消息附带的图片（只有路径，内容不可见）：\n" + "\n".join(message.images))
+    if feedback:
+        parts.append(f"你上一次的回答有问题，请重新回答。\n{feedback}")
+    return "\n\n".join(parts)
+
+
+def segment_message(window: str, message: UserMessage, ask: Ask) -> list[Segment]:
+    """Walk the pointer through the body; `ask` sends one prompt and returns the reply text.
+
+    Raises LLMError when a segment is still not located after MAX_ATTEMPTS calls,
+    because the pointer cannot move past it.
+    """
+    segments: list[Segment] = []
+    start = 0
+    while start < len(message.body):
+        segment = _next_segment(window, message, start, ask)
+        segments.append(segment)
+        start = segment.end
+    return segments
+
+
+def _next_segment(window: str, message: UserMessage, start: int, ask: Ask) -> Segment:
+    feedback = ""
+    from_start = False
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        reply = ask(build_prompt(window, message, start, feedback))
+        try:
+            answer = SegmentAnswer.model_validate_json(reply)
+            end = locate_end(message.body, start, answer.segment_end, from_start=from_start)
+        except ValidationError as error:
+            feedback = f"回答不是要求的 JSON：{error}"
+            continue
+        except AnchorError as error:
+            from_start = from_start or error.ambiguous
+            rule = FROM_START_RULE if from_start else ""
+            feedback = f"你给的 segment_end 是 {answer.segment_end!r}。{error}\n{rule}"
+            continue
+        return Segment(
+            start=start,
+            end=end,
+            text=message.body[start:end],
+            intents=answer.intents,
+            attempts=attempt,
+        )
+    raise LLMError(
+        f"Segment at char {start} of message {message.source.uuid} was not located in "
+        f"{MAX_ATTEMPTS} attempts; last feedback: {feedback}"
+    )
+
+
+def message_window(items: Sequence[Item], index: int, digests: Digests, count: Count) -> str:
+    """The window for segmenting items[index], sized so the longest prompt still fits."""
+    message = items[index]
+    assert isinstance(message, UserMessage)
+    rest = count(SYSTEM_PROMPT) + count(build_prompt("", message, 0, ""))
+    return window_text(items, index, digests, PROMPT_BUDGET - rest - FEEDBACK_ROOM, count)
+
+
+def find_index(items: Sequence[Item], uuid: str) -> int:
+    """Position of the user message with this record uuid."""
+    for index, item in enumerate(items):
+        if isinstance(item, UserMessage) and item.source.uuid == uuid:
+            return index
+    raise ValueError(f"No user message {uuid}; uuids are in corpus/units/*.jsonl.")
+
+
+def main() -> None:
+    """CLI entry point: segment one message, write the segments as JSON and print them."""
+    parser = argparse.ArgumentParser(description="Segment one user message with an LLM.")
+    parser.add_argument("merged", type=Path)
+    parser.add_argument("--uuid", required=True)
+    parser.add_argument("--digests", type=Path, required=True)
+    parser.add_argument("--backend", choices=["claude", "codex", "hive"], required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], default="xhigh")
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="hive only: read the reply as a stream or as one block",
+    )
+    args = parser.parse_args()
+
+    items = list(conversation_units(args.merged))
+    index = find_index(items, args.uuid)
+    message = items[index]
+    assert isinstance(message, UserMessage)
+    window = message_window(items, index, load_digests(args.digests), qwen_tokens)
+    ask = asker(args.backend, args.model, args.effort, SYSTEM_PROMPT, SCHEMA, args.stream)
+    segments = segment_message(window, message, ask)
+    args.out.write_text(
+        json.dumps([s.model_dump() for s in segments], ensure_ascii=False, indent=2) + "\n"
+    )
+    for s in segments:
+        print(f"[{s.start}, {s.end}) attempts={s.attempts} {s.intents}\n  {s.text!r}")
+
+
+if __name__ == "__main__":
+    main()

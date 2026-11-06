@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.13",
     "attrs>=26",
     "pyyaml>=6",
+    "tokenizers>=0.22",
 ]
 
 [dependency-groups]
@@ -68,6 +69,11 @@ warn_unreachable = true
 warn_redundant_casts = true
 pretty = true
 show_error_codes = true
+
+# tokenizers ships no py.typed marker.
+[[tool.mypy.overrides]]
+module = "tokenizers"
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "tests.*"

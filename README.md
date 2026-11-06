@@ -2,7 +2,7 @@
 
 意图对齐器由三部分组成：轨迹提取器、可视化，以及后续待定的部分。
 
-轨迹提取器从一段对话的时间线开头开始，依次读取用户说的话、AI 的工具调用和环境返回的结果，提取其中的意图、观测以及它们之间的关系。轨迹提取器目前还没有实现；`playground/` 里是手工完成的示范提取，每个 topic 一个文件 `playground/topics/<topic 编号>.yaml`，所有 topic 列在 `playground/topics.yaml` 里。
+轨迹提取器从一段对话的时间线开头开始，依次读取用户说的话、AI 的工具调用和环境返回的结果，提取其中的意图、观测以及它们之间的关系。轨迹提取器的前三步已经实现：把对话按时间顺序切成处理单元、两级压缩工具操作、把用户消息按意图切成段落（见下面“运行”的第 3 到 5 步）；之后建节点和关系的步骤还没有实现。`playground/` 里是手工完成的示范提取，每个 topic 一个文件 `playground/topics/<topic 编号>.yaml`，所有 topic 列在 `playground/topics.yaml` 里。
 
 ## 运行
 
@@ -17,7 +17,33 @@ $PY -m intent_aligner.corpus
 
 # 2. 取出合并文件里第 N 条用户亲手发送的消息（从 0 开始计数）
 $PY -m intent_aligner.turns corpus/merged/claude-5a1f0c1a.jsonl --index 0 --out playground/t
+
+# 3. 把合并后的对话（Claude 或 Codex，按文件名前缀区分）按时间顺序切成处理单元，
+#    每行一个单元，并打印各类单元的数量
+mkdir -p corpus/units
+$PY -m intent_aligner.units corpus/merged/claude-5a1f0c1a.jsonl --out corpus/units/claude-5a1f0c1a.jsonl
 ```
+
+```bash
+# 4. 把一个对话的工具操作分两级压缩。第一级把每个工具调用压成一句话意图和它针对的具体对象，把它的
+#    结果对照调用的意图和全文压成一句话（太长的结果按行切段，每段一句），一个调用和它的结果是一个任务，
+#    任务之间互相独立，--workers 个并行。第二级把一轮里全部的意图、对象和结果压成一段概括。
+#    第二级同时看开启这一轮的用户消息。输出边跑边追加，中断后重跑会从断点继续；--until 在这条用户消息之前停下。
+EXP=corpus/experiments/10-example
+mkdir -p $EXP/digests $EXP/segments
+$PY -m intent_aligner.compress corpus/merged/claude-5a1f0c1a.jsonl \
+    --backend hive --model deployment/pc-qwen38-np8 \
+    --out $EXP/digests/claude-5a1f0c1a.jsonl --until d24611b1-bf6d-4f27-985e-8a614806da2c
+
+# 5. 把一条用户消息按意图切成连续的段落，打印每段的字符区间和意图
+$PY -m intent_aligner.segment corpus/merged/claude-5a1f0c1a.jsonl \
+    --uuid d24611b1-bf6d-4f27-985e-8a614806da2c --digests $EXP/digests/claude-5a1f0c1a.jsonl \
+    --backend hive --model deployment/pc-qwen38-np8 --out $EXP/segments/d24611b1.json
+```
+
+第 3 步输出的单元有 `user_message`（用户消息全文，附带图片路径）、`user_signal`、`tool_call` 和 `observation`；另外 `ai_text` 是 AI 对用户说的话，只注入 input，不做处理。
+
+第 5 步的模型除了这条消息，还会看到它之前两轮对话；两轮放不下时只看前一轮。这些对话里，每一轮的工具操作只显示第 4 步写出的那一段概括，所以这条消息之前的对话必须先压缩过。
 
 第 1 步完成后，`corpus/index.json` 会列出每个合并后的对话，包括成员 session、记录条数、丢弃的 fork 复制品数量，以及损坏的行。
 
@@ -34,8 +60,9 @@ echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.ll
 ```
 
 - `--backend` 可以是 `claude`、`codex`、`pi` 或 `hive`。`--model` 按对应命令行的写法给出，pi 的写法是 `provider/model-id`，hive 的写法是网关 `/v1/models` 列出的 `deployment/<部署名>`。
-- `hive` 不经过任何 agent 命令行，发给网关的请求里只有系统提示和用户 prompt。网关地址默认是 `http://127.0.0.1:8790`，可以用环境变量 `HIVE_FRAME_URL` 改。思考参数按网关为这个部署声明的模型协议设置：Qwen 模板的模型打开思考，`low`、`medium`、`high` 分别给 2048、8192、16384 个思考 token 的预算（与 pi 的默认值相同），`xhigh` 不设预算，只受上下文窗口限制。
+- `hive` 不经过任何 agent 命令行，发给网关的请求里只有系统提示和用户 prompt。网关地址默认是 `http://127.0.0.1:8790`，可以用环境变量 `HIVE_FRAME_URL` 改。思考参数按网关为这个部署声明的模型协议设置：Qwen 模板的模型打开思考，`low` 给 2048 个思考 token 的预算，`medium`、`high`、`xhigh` 都给 9216 个，这样单槽 18,944 token 里还放得下 prompt 和答案。
 - `--effort` 可以是 `low`、`medium`、`high` 或 `xhigh`，默认是 `xhigh`。
+- `--stream` 和 `--no-stream` 决定 `hive` 用流式还是整块接收回复，默认是流式，对其他后端没有影响。`--no-stream` 的请求如果超过网关 1200 秒的读取超时，这个槽位就会一直被占着，直到部署重启。`compress` 和 `segment` 也有这两个选项。
 - `--schema` 是可选的 JSON schema，给出时回复就是满足它的 JSON。pi 不支持这个参数。
 - 调用产生的对话记录只写进 `--home` 指定的目录，默认是工具根目录下的 `llm-home/`。对话记录不会出现在日常使用的 `~/.claude/projects`、`~/.codex/sessions` 或 `~/.pi/agent/sessions` 里。
 

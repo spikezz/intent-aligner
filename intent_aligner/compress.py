@@ -1,0 +1,379 @@
+"""Compress the tool work of a conversation in two levels.
+
+Level 1 reads each tool call and its result: the call becomes what it is for and what
+it acts on, the result one sentence per chunk, read against the call's intent and full
+text. A call
+and its result are one job; jobs read nothing of the conversation around them and run
+in parallel.
+
+Level 2 reads the user message that opened a round and the level-1 trajectory of the
+round (intents, targets and results, in order) and writes one passage. That passage is all a window (intent_aligner.window) shows
+of the round's tools. A trajectory too long for one prompt is summarized batch by
+batch, and the batch summaries are summarized again until one passage is left.
+
+Usage: python -m intent_aligner.compress MERGED.jsonl --backend hive
+           --model deployment/pc-qwen38-np8 --out DIGESTS.jsonl
+           [--workers 8] [--until UUID]
+The output is appended to as digests are made, so a stopped run resumes where it was.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
+from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from intent_aligner.llm import Ask, LLMError, asker
+from intent_aligner.units import (
+    Item,
+    Observation,
+    ToolCall,
+    UserMessage,
+    UserSignal,
+    conversation_units,
+)
+from intent_aligner.window import (
+    DIGEST_ADAPTER,
+    PROMPT_BUDGET,
+    CallDigest,
+    Count,
+    Digest,
+    Digests,
+    ResultDigest,
+    RoundDigest,
+    load_digests,
+    qwen_tokens,
+)
+
+MAX_ATTEMPTS = 3
+# Room kept free for the retry feedback a second attempt appends.
+FEEDBACK_ROOM = 1_000
+# Every chunk of a result repeats the call's full text, so a call must leave this much
+# of the prompt for the result; the largest call in the corpus (6,116 tokens) leaves 1,650.
+MIN_RESULT_ROOM = 1_000
+# A round's opening message is repeated in every batch of its trajectory, so it is cut to
+# this many tokens; the corpus has single messages (38cb90a8) larger than a whole prompt.
+MESSAGE_ROOM = 2_000
+# Room for the "（第 i/n 段）" label on a chunked result.
+LABEL_ROOM = 50
+
+CALL_SYSTEM_PROMPT = """\
+你在提炼 AI 助手一次工具调用的意图，让后面读对话的人不看原文也知道这次调用是做什么的。<调用> 是这次调用的完整原文。
+
+回答两项：
+- intent：这次调用想达成什么，一句话。只写目的，不写具体怎么做。
+- targets：这次调用针对的具体对象：路径、文件名、命令、关键参数和数值。
+"""
+
+RESULT_SYSTEM_PROMPT = """\
+你在压缩一次工具调用返回的结果，让后面读对话的人不看原文也知道结果说了什么。<调用> 是产生这个结果的调用：它的意图和原文；<结果> 是返回的原文，结果太长时只是其中一段，会注明是第几段。
+
+回答 summary：<结果> 说了什么，一句话。对照调用的意图写出结论：意图达成了、没达成（为什么），或者得到了什么。只保留这个结论直接依据的具体信息，例如决定结论的数值、状态、报错的关键原文；其余细节归纳进结论，不逐项列出。
+"""
+
+ROUND_SYSTEM_PROMPT = """\
+你在概括 AI 助手在一轮对话里做的全部工具操作。这段概括会放进对话记录，供人判断用户下一条消息的意图时阅读：读的人要靠它知道 AI 这一轮在为什么事做操作、做到了哪一步、发现了什么。<用户消息> 是开启这一轮的用户消息，太长时只保留开头，会注明；注明了“AI 工作时发出”的消息，AI 这一轮也可能还在接着做之前的请求。对话开头没有用户消息时，没有这一项。<轨迹> 按时间顺序列出每次工具调用的意图、对象和结果，或者更细的轨迹已经写成的几段概括；太长时 <轨迹> 只是其中一段，会注明是第几段，这时只概括这一段。
+
+回答 summary：一小段话，写出 AI 在为用户的什么请求做这些操作、最后的状态和结论、还没解决的问题。只保留和最后结论直接相关的对象和数值，例如结论依据的关键数值、改动或产出的文件；单次操作的细节和其余数值归纳进主线，不逐项列出。只供 AI 自己中转的东西不写，例如后台任务 ID 和临时输出文件名。
+"""
+
+CALL_SCHEMA = {
+    "type": "object",
+    "properties": {"intent": {"type": "string"}, "targets": {"type": "string"}},
+    "required": ["intent", "targets"],
+    "additionalProperties": False,
+}
+
+SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {"summary": {"type": "string"}},
+    "required": ["summary"],
+    "additionalProperties": False,
+}
+
+
+class _CallAnswer(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    intent: str
+    targets: str
+
+
+class _SummaryAnswer(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    summary: str
+
+
+def compress_conversation(
+    items: Sequence[Item],
+    done: Digests,
+    ask_call: Ask,
+    ask_result: Ask,
+    ask_round: Ask,
+    count: Count,
+    workers: int,
+) -> Iterator[Digest]:
+    """Yield the digests missing from `done`, adding them there: level 1, then level 2.
+
+    A failed job does not stop the others, because a long run must keep what it can;
+    LLMError is raised when any level-1 job failed (before level 2, which needs them all)
+    or after the last level-2 job.
+    """
+    results = {
+        item.tool_use_id: item
+        for item in items
+        if isinstance(item, Observation) and item.origin == "tool_result"
+    }
+    pending = results.keys() - done.results.keys()
+    jobs = [
+        partial(
+            _compress_pair, item, results.get(item.tool_use_id), done, ask_call, ask_result, count
+        )
+        for item in items
+        if isinstance(item, ToolCall)
+        and (item.tool_use_id not in done.calls or item.tool_use_id in pending)
+    ]
+    yield from _run_jobs(jobs, done, workers)
+    rejections = {
+        item.tool_use_id: item.text
+        for item in items
+        if isinstance(item, UserSignal) and item.tool_use_id is not None
+    }
+    messages = {item.source.uuid: item for item in items if isinstance(item, UserMessage)}
+    round_jobs = [
+        partial(_compress_round, round_uuid, messages.get(round_uuid), trajectory, ask_round, count)
+        for round_uuid, trajectory in _trajectories(items, done, rejections).items()
+        if round_uuid not in done.rounds
+    ]
+    yield from _run_jobs(round_jobs, done, workers)
+
+
+def _run_jobs(
+    jobs: Sequence[Callable[[], list[Digest]]], done: Digests, workers: int
+) -> Iterator[Digest]:
+    failures: list[LLMError] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for future in as_completed([pool.submit(job) for job in jobs]):
+            try:
+                made = future.result()
+            except LLMError as error:
+                failures.append(error)
+                print(error, file=sys.stderr, flush=True)
+                continue
+            for digest in made:
+                done.add(digest)
+                yield digest
+    if failures:
+        raise LLMError(
+            f"{len(failures)} of {len(jobs)} jobs failed, the rest are written; rerun the same "
+            f"command to retry only those. First failure: {failures[0]}"
+        )
+
+
+def _compress_pair(
+    call: ToolCall,
+    result: Observation | None,
+    done: Digests,
+    ask_call: Ask,
+    ask_result: Ask,
+    count: Count,
+) -> list[Digest]:
+    """A call (unless done) then its result; a rejected or unanswered call has no result."""
+    made: list[Digest] = []
+    digest = done.calls.get(call.tool_use_id)
+    if digest is None:
+        digest = _compress_call(call, ask_call, count)
+        made.append(digest)
+    if result is not None and call.tool_use_id not in done.results:
+        made.append(_compress_result(result, call, digest, ask_result, count))
+    return made
+
+
+def _compress_call(item: ToolCall, ask: Ask, count: Count) -> CallDigest:
+    prompt = f"<调用>\n{item.text}\n</调用>"
+    room = PROMPT_BUDGET - count(CALL_SYSTEM_PROMPT) - FEEDBACK_ROOM
+    if count(prompt) > room:
+        raise LLMError(
+            f"Tool call {item.tool_use_id} needs {count(prompt):,} tokens but the prompt budget "
+            f"leaves {room:,}; the largest call in the corpus was 6,116, so check its input."
+        )
+    answer = _ask_until_valid(ask, prompt, _CallAnswer, item.tool_use_id)
+    return CallDigest(tool_use_id=item.tool_use_id, intent=answer.intent, targets=answer.targets)
+
+
+def _compress_result(
+    item: Observation, call: ToolCall, digest: CallDigest, ask: Ask, count: Count
+) -> ResultDigest:
+    head = f"<调用>\n意图：{digest.intent}\n原文：\n{call.text}\n</调用>\n\n"
+    room = PROMPT_BUDGET - count(RESULT_SYSTEM_PROMPT) - count(head) - FEEDBACK_ROOM - LABEL_ROOM
+    if room < MIN_RESULT_ROOM:
+        raise LLMError(
+            f"Tool call {call.tool_use_id} leaves {room:,} tokens for each chunk of its result, "
+            f"below {MIN_RESULT_ROOM:,}; check the call's input."
+        )
+    parts = chunks(item.text, room, count)
+    summaries = []
+    for number, part in enumerate(parts, 1):
+        label = f"（第 {number}/{len(parts)} 段）" if len(parts) > 1 else ""
+        prompt = f"{head}<结果>{label}\n{part}\n</结果>"
+        summaries.append(_ask_until_valid(ask, prompt, _SummaryAnswer, call.tool_use_id).summary)
+    return ResultDigest(tool_use_id=call.tool_use_id, summaries=summaries)
+
+
+def _trajectories(
+    items: Sequence[Item], digests: Digests, rejections: dict[str, str]
+) -> dict[str, list[str]]:
+    """One line per tool call, grouped by the round that made it, in timeline order."""
+    trajectories: dict[str, list[str]] = {}
+    round_uuid = ""
+    for item in items:
+        if isinstance(item, UserMessage):
+            round_uuid = item.source.uuid
+        elif isinstance(item, ToolCall):
+            digest = digests.calls[item.tool_use_id]
+            outcome = _outcome(item.tool_use_id, digests, rejections)
+            line = f"{item.name} 意图：{digest.intent} 对象：{digest.targets} 结果：{outcome}"
+            trajectories.setdefault(round_uuid, []).append(" ".join(line.split()))
+    return trajectories
+
+
+def _outcome(tool_use_id: str, digests: Digests, rejections: dict[str, str]) -> str:
+    if tool_use_id in digests.results:
+        return " ".join(digests.results[tool_use_id].summaries)
+    if tool_use_id in rejections:
+        return f"用户拒绝了这次调用：{rejections[tool_use_id]}"
+    return "没有返回结果"
+
+
+def _compress_round(
+    round_uuid: str, message: UserMessage | None, trajectory: list[str], ask: Ask, count: Count
+) -> list[Digest]:
+    head = _message_block(message, count)
+    room = PROMPT_BUDGET - count(ROUND_SYSTEM_PROMPT) - count(head) - FEEDBACK_ROOM - LABEL_ROOM
+    lines = trajectory
+    while True:
+        parts = chunks("\n".join(lines), room, count)
+        summaries = []
+        for number, part in enumerate(parts, 1):
+            label = f"（第 {number}/{len(parts)} 段）" if len(parts) > 1 else ""
+            prompt = f"{head}<轨迹>{label}\n{part}\n</轨迹>"
+            summaries.append(_ask_until_valid(ask, prompt, _SummaryAnswer, round_uuid).summary)
+        if len(summaries) == 1:
+            return [RoundDigest(round_uuid=round_uuid, summary=summaries[0])]
+        lines = [" ".join(summary.split()) for summary in summaries]
+
+
+def _message_block(message: UserMessage | None, count: Count) -> str:
+    """The `<用户消息>` block a round prompt starts with; empty for tool work before any message."""
+    if message is None:
+        return ""
+    text = message.body + "".join(f"\n[图片] {path}" for path in message.images)
+    label = "（AI 工作时发出）" if message.queued else ""
+    if count(text) > MESSAGE_ROOM:
+        text, label = chunks(text, MESSAGE_ROOM, count)[0], f"{label}（太长，只保留开头）"
+    return f"<用户消息>{label}\n{text}\n</用户消息>\n"
+
+
+def chunks(text: str, room: int, count: Count) -> list[str]:
+    """Cut `text` at line ends into pieces of at most `room` tokens; longer lines are cut inside.
+
+    Examples:
+        >>> chunks("ab\\ncd\\nef", 6, len)
+        ['ab\\ncd\\n', 'ef']
+        >>> chunks("abcdefgh", 3, len)
+        ['abc', 'def', 'gh']
+    """
+    pieces: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if current and count(current + line) > room:
+            pieces.append(current)
+            current = ""
+        while count(line) > room:
+            cut = _longest_prefix(line, room, count)
+            pieces.append(line[:cut])
+            line = line[cut:]
+        current += line
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _longest_prefix(line: str, room: int, count: Count) -> int:
+    """Binary search, because token counts do not grow in step with characters."""
+    low, high = 1, len(line)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count(line[:middle]) <= room:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def _ask_until_valid[Answer: BaseModel](
+    ask: Ask, prompt: str, schema: type[Answer], tool_use_id: str
+) -> Answer:
+    feedback = ""
+    for _ in range(MAX_ATTEMPTS):
+        reply = ask(prompt + feedback)
+        try:
+            return schema.model_validate_json(reply)
+        except ValidationError as error:
+            feedback = f"\n\n你上一次的回答不是要求的 JSON，请重新回答：{error}"
+    raise LLMError(f"No valid digest for {tool_use_id} in {MAX_ATTEMPTS} attempts: {feedback}")
+
+
+def _until(items: list[Item], uuid: str | None) -> list[Item]:
+    """Items before the user message `uuid`, or all of them."""
+    if uuid is None:
+        return items
+    for index, item in enumerate(items):
+        if isinstance(item, UserMessage) and item.source.uuid == uuid:
+            return items[:index]
+    raise ValueError(f"No user message {uuid}; uuids are in corpus/units/*.jsonl.")
+
+
+def main() -> None:
+    """CLI entry point: compress one merged conversation, appending digests to --out."""
+    parser = argparse.ArgumentParser(description="Compress tool calls and results with an LLM.")
+    parser.add_argument("merged", type=Path)
+    parser.add_argument("--backend", choices=["claude", "codex", "hive"], required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], default="xhigh")
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--workers", type=int, default=8, help="np8 serves 8 slots")
+    parser.add_argument("--until", help="stop before this user message uuid")
+    parser.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="hive only: read the reply as a stream or as one block",
+    )
+    args = parser.parse_args()
+
+    items = _until(list(conversation_units(args.merged)), args.until)
+    done = load_digests(args.out) if args.out.exists() else Digests()
+    llm_args = (args.backend, args.model, args.effort)
+    ask_call = asker(*llm_args, CALL_SYSTEM_PROMPT, CALL_SCHEMA, args.stream)
+    ask_result = asker(*llm_args, RESULT_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream)
+    ask_round = asker(*llm_args, ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream)
+    digests = compress_conversation(
+        items, done, ask_call, ask_result, ask_round, qwen_tokens, args.workers
+    )
+    with args.out.open("a", encoding="utf-8") as out:
+        for digest in digests:
+            line = DIGEST_ADAPTER.dump_json(digest).decode()
+            out.write(line + "\n")
+            out.flush()
+            print(line, flush=True)
+
+
+if __name__ == "__main__":
+    main()
