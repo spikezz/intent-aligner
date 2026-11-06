@@ -21,6 +21,7 @@ jobs:
         run: |
           ruff check .
           ruff format --check .
+          shellcheck scripts/*.sh
       - name: Type check
         run: mypy intent_aligner tests
       - name: Test

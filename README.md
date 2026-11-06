@@ -38,6 +38,16 @@ echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.ll
 - `--schema` 是可选的 JSON schema，给出时回复就是满足它的 JSON。pi 不支持这个参数。
 - 调用产生的对话记录只写进 `llm-home/`，不会出现在日常使用的 `~/.claude/projects`、`~/.codex/sessions` 或 `~/.pi/agent/sessions` 里。
 
+### 手动测试端点
+
+`scripts/llm-chat.sh` 是一个交互式的小工具，用来手动给三个端点发消息。每条消息都是一次独立的调用，不会带上之前的消息。
+
+```bash
+PY=$PY scripts/llm-chat.sh            # 默认从 claude 开始，也可以写 codex 或 pi
+```
+
+输入一行文字回车就会发出去，回复和对话记录路径会打印出来。以 `/` 开头的是命令：`/backend` 切换端点（模型同时换成这个端点的默认模型），`/model` 换模型，`/effort` 换思考强度，`/system` 换系统提示，`/show` 显示当前设置，`/help` 列出全部命令，`/quit` 退出。
+
 ## 测试
 
 ```bash
