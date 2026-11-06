@@ -50,10 +50,10 @@ def test_each_message_is_one_call_with_current_settings(tmp_path: Path) -> None:
 
     assert len(calls) == 2, calls
     first, second = calls
-    assert (_flag(first, "--backend"), _flag(first, "--model")) == ("claude", "opus"), first
+    assert (_flag(first, "--backend"), _flag(first, "--model")) == ("claude", "sonnet"), first
     assert _flag(first, "--effort") == "xhigh", first
     assert first["stdin"] == "hello", first
-    assert (_flag(second, "--backend"), _flag(second, "--model")) == ("codex", "gpt-6-astra")
+    assert (_flag(second, "--backend"), _flag(second, "--model")) == ("codex", "gpt-6.1-sol")
     assert _flag(second, "--effort") == "low", second
     assert second["system"] == "Be terse.", second
     assert second["stdin"] == "second", "no history may be carried into the next call"

@@ -11,8 +11,8 @@ set -euo pipefail
 PY="${PY:-python3}"
 
 declare -A DEFAULT_MODEL=(
-    [claude]="opus"
-    [codex]="gpt-6-astra"
+    [claude]="sonnet"
+    [codex]="gpt-6.1-sol"
     [pi]="fireworks/accounts/fireworks/models/glm-5p3-flash"
     [hive]="deployment/pc-qwen38-np8"
 )
