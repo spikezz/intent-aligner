@@ -1,0 +1,49 @@
+# Seed sessions of the intent trajectory corpus.
+# session: id prefix as shown by the CLI; corpus.build resolves it to the full id
+#          and pulls in fork relatives and subagent logs, plus every resume segment
+#          of a Codex thread. A Claude session continued in a new session id is not
+#          pulled in; list it as its own seed.
+# intent_start: Europe/Berlin local time of the first relevant user request.
+
+- platform: claude
+  session: 5a1f0c1a
+  intent_start: 2026-10-13T23:47:24
+- platform: claude
+  session: 1d740917
+  intent_start: 2026-10-14T00:32:18
+- platform: claude
+  session: 87eeb4bd
+  intent_start: 2026-10-14T00:55:24
+- platform: claude
+  session: 80e0ef17
+  intent_start: 2026-10-14T09:57:17
+- platform: claude
+  session: 5095b3ce
+  intent_start: 2026-10-22T15:50:10
+- platform: claude
+  session: 617cdb4b
+  intent_start: 2026-10-26T14:13:56
+- platform: claude
+  session: 8ccab5ce
+  intent_start: 2026-10-25T12:14:51
+- platform: claude
+  session: fd92acab
+  intent_start: 2026-10-30T17:12:38
+- platform: codex
+  session: 01a0bb35
+  intent_start: 2026-09-26T13:08:16
+- platform: codex
+  session: 01a0c0e9
+  intent_start: 2026-09-21T00:22:16
+- platform: codex
+  session: 01a153f1
+  intent_start: 2026-10-19T13:36:16
+- platform: codex
+  session: 01a16f18
+  intent_start: 2026-10-24T20:14:47
+- platform: codex
+  session: 01a17eff
+  intent_start: 2026-10-27T21:14:17
+- platform: codex
+  session: 01a189d3
+  intent_start: 2026-10-29T23:57:32

@@ -1,0 +1,125 @@
+# 结构和填写规则见 docs/trajectory-extractor.md（路径相对于工具根目录）
+meta:
+  topic: T001
+  graph:
+    nodes:
+      I001:
+        type: intent
+        actor: user
+        label: 在动手之前，先把 somnia-farm 项目怎么用彻底弄清楚。
+      I002:
+        type: intent
+        actor: user
+        label: 让 AI 生成一段音乐 MV。
+      I003:
+        type: intent
+        actor: user
+        label: 生产要建立在用户已经搭好的基础设施和现成的工作流（wf）上；这套基础设施只搭好了一部分。
+      I004:
+        type: intent
+        actor: user
+        label: AI 要自主运用工具的全部功能，并主动探索参数，而不是只用默认值。
+      I005:
+        type: intent
+        actor: user
+        label: MV 使用的音乐是 /home/spikezz/Music/The Wind Remembers.wav 这首歌。
+    edges:
+      - from: I001
+        to: I003
+        relation: prerequisite
+        span: S002
+        evidence: "调查清楚…使用方法，我接下来要你用我已经搭好的部分的基础设施"
+      - from: I003
+        to: I002
+        relation: serves
+        span: S004
+        evidence: "用我已经搭好的部分的基础设施…和已经搭建好的wf ,来生成一段音乐的mv"
+      - from: I004
+        to: I002
+        relation: serves
+        span: S004
+        evidence: "自己运用工具的所有功能（参数探索）…来生成一段音乐的mv"
+      - from: I002
+        to: I005
+        relation: refines
+        span: S005
+        evidence: "来生成一段音乐的mv。音乐是这个/home/spikezz/Music/The Wind Remembers.wav"
+
+spans:
+  - id: S001
+    kind: user_text
+    source:
+      merged_file: corpus/merged/claude-5a1f0c1a.jsonl
+      session: 5a1f0c1a-b1be-4631-8999-7e7ae48a8b3a
+      uuid: c88f10d9-e5f5-4fa5-83ee-e6da86897875
+      timestamp: "2026-10-13T23:47:24+02:00"
+    chars: [0, 67]
+    text: "调查清楚/home/spikezz/.openclaw/workspace/projects/somnia-farm/项目的使用方法，"
+    intents:
+      - id: I001
+        evidence: "调查清楚…项目的使用方法"
+        explicit: true
+        note: "“清楚”是完成标准，“使用方法”限定了调查范围，二者写进意图文本，不单独成为轨迹单元。"
+
+  - id: S002
+    kind: user_text
+    source:
+      merged_file: corpus/merged/claude-5a1f0c1a.jsonl
+      session: 5a1f0c1a-b1be-4631-8999-7e7ae48a8b3a
+      uuid: c88f10d9-e5f5-4fa5-83ee-e6da86897875
+      timestamp: "2026-10-13T23:47:24+02:00"
+    chars: [67, 88]
+    text: "我接下来要你用我已经搭好的部分的基础设施，"
+    intents:
+      - id: I003
+        evidence: "要你用我已经搭好的部分的基础设施"
+        explicit: true
+        note: "“部分的”说明基础设施并不完整，这是对现状的交代，作为属性写进意图文本。原文没有说遇到缺口时怎么处理。"
+
+  - id: S003
+    kind: user_text
+    source:
+      merged_file: corpus/merged/claude-5a1f0c1a.jsonl
+      session: 5a1f0c1a-b1be-4631-8999-7e7ae48a8b3a
+      uuid: c88f10d9-e5f5-4fa5-83ee-e6da86897875
+      timestamp: "2026-10-13T23:47:24+02:00"
+    chars: [88, 116]
+    text: "自己运用工具的所有功能（参数探索）和已经搭建好的wf ,"
+    intents:
+      - id: I004
+        evidence: "自己运用工具的所有功能（参数探索）"
+        explicit: true
+      - id: I003
+        evidence: "和已经搭建好的wf"
+        explicit: true
+    note: "“工具的所有功能”和“wf”都是“运用”的宾语，所以这一个子句同时包含两个意图。I003 在 S002 已经出现过，这里按编号再次引用。"
+
+  - id: S004
+    kind: user_text
+    source:
+      merged_file: corpus/merged/claude-5a1f0c1a.jsonl
+      session: 5a1f0c1a-b1be-4631-8999-7e7ae48a8b3a
+      uuid: c88f10d9-e5f5-4fa5-83ee-e6da86897875
+      timestamp: "2026-10-13T23:47:24+02:00"
+    chars: [116, 127]
+    text: "来生成一段音乐的mv。"
+    intents:
+      - id: I002
+        evidence: "来生成一段音乐的mv"
+        explicit: true
+    note: "“来”表示目的，把前面两个子句的意图（I003、I004）都指向生成 MV，所以两条 serves 边在这一段确立。"
+
+  - id: S005
+    kind: user_text
+    source:
+      merged_file: corpus/merged/claude-5a1f0c1a.jsonl
+      session: 5a1f0c1a-b1be-4631-8999-7e7ae48a8b3a
+      uuid: c88f10d9-e5f5-4fa5-83ee-e6da86897875
+      timestamp: "2026-10-13T23:47:24+02:00"
+    chars: [127, 176]
+    text: "音乐是这个/home/spikezz/Music/The Wind Remembers.wav\n\n"
+    intents:
+      - id: I005
+        evidence: "音乐是这个/home/spikezz/Music/The Wind Remembers.wav"
+        explicit: true
+        note: "这句话指定了 I002 里的“一段音乐”具体是哪首歌。I002 的文本没有包含这个信息，所以按完整性规则登记新意图，并从 I002 连一条 refines 边指向它。"

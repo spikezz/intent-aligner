@@ -1,0 +1,5 @@
+# 结构和填写规则见 docs/trajectory-extractor.md（路径相对于工具根目录）
+topics:
+  - id: T001
+    title: 用用户搭好的 somnia-farm 基础设施和现成工作流，为《The Wind Remembers》这首歌生成音乐 MV。
+    file: playground/topics/T001.yaml

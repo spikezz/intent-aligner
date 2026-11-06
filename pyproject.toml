@@ -1,0 +1,80 @@
+[project]
+name = "intent-aligner"
+version = "0.1.0-dev"
+description = "Intent aligner: trajectory extraction, visualization and alignment over agent sessions"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+
+# Runs from the shared venv /home/spikezz/.openclaw/.venv (editable install);
+# never create a per-tool .venv.
+dependencies = [
+    "pydantic>=2.13",
+    "attrs>=26",
+    "pyyaml>=6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9",
+    "ruff>=0.15",
+    "mypy>=1.20",
+    "types-pyyaml>=6",
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["intent_aligner"]
+
+[tool.setuptools.package-data]
+intent_aligner = ["py.typed"]
+
+# ================================================================
+# Ruff
+# ================================================================
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "PTH", "RUF"]
+ignore = [
+    "E501",   # handled by formatter
+    "SIM108", # ternary not always clearer
+    "RUF001", # CJK intentional in strings/docstrings/comments
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["intent_aligner"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ================================================================
+# Mypy (strict is a hard requirement, see workspace/CODE_STYLE.md)
+# ================================================================
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+warn_redundant_casts = true
+pretty = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_decorators = false
+
+# ================================================================
+# Pytest
+# ================================================================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
