@@ -1,9 +1,10 @@
 """One-shot LLM calls through the Claude Code, Codex and pi CLIs, isolated from daily use.
 
 Usage: python -m intent_aligner.llm --backend B --model M --system FILE
-           [--effort E] [--schema FILE] < prompt.txt
+           [--effort E] [--schema FILE] [--home DIR] < prompt.txt
 
-Every transcript a call produces lands under LLM_HOME and nowhere else:
+Every transcript a call produces lands under the home directory (--home, default
+LLM_HOME) and nowhere else:
     llm-home/claude/projects/<cwd slug>/<session>.jsonl   CLAUDE_CONFIG_DIR of the call
     llm-home/codex/<thread>.jsonl                         request + `codex exec --json` events
     llm-home/pi/<time>_<session>.jsonl                    `pi --session-dir`
@@ -259,6 +260,9 @@ def main() -> None:
     parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], default="xhigh")
     parser.add_argument("--system", type=Path, required=True, help="file holding the system prompt")
     parser.add_argument("--schema", type=Path, help="file holding a JSON schema for the reply")
+    parser.add_argument(
+        "--home", type=Path, default=LLM_HOME, help=f"where transcripts go (default {LLM_HOME})"
+    )
     args = parser.parse_args()
     call = LLMCall(
         backend=args.backend,
@@ -268,7 +272,8 @@ def main() -> None:
         prompt=sys.stdin.read(),
         json_schema=json.loads(args.schema.read_text()) if args.schema else None,
     )
-    reply = complete(call)
+    # Absolute because every backend runs with cwd inside home and gets paths under it.
+    reply = complete(call, args.home.resolve())
     print(reply.text)
     print(f"transcript: {reply.transcript}", file=sys.stderr)
 

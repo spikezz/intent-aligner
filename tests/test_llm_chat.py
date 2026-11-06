@@ -74,6 +74,16 @@ def test_invalid_commands_send_nothing(tmp_path: Path) -> None:
     assert "Unknown command '/nope'" in out, out
 
 
+def test_home_is_passed_on_only_when_given(tmp_path: Path) -> None:
+    _, given = _run(tmp_path, "hi\n", "--home", "/x/home", "codex")
+    (tmp_path / "fake-python.log").unlink()
+    _, default = _run(tmp_path, "hi\n")
+
+    assert _flag(given[0], "--home") == "/x/home", given
+    assert _flag(given[0], "--backend") == "codex", given
+    assert "--home" not in default[0]["argv"], "the default home belongs to the wrapper"  # type: ignore[operator]
+
+
 def test_unknown_start_backend_exits(tmp_path: Path) -> None:
     proc = subprocess.run(["bash", str(SCRIPT), "gemini"], capture_output=True, text=True)
 

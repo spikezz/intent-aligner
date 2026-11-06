@@ -2,8 +2,9 @@
 # Send single messages to the claude / codex / pi endpoints of intent_aligner.llm.
 # Every message is an independent one-shot call: no history is carried over.
 #
-# Usage: scripts/llm-chat.sh [claude|codex|pi]
-# Set PY to the Python that has intent_aligner installed.
+# Usage: scripts/llm-chat.sh [--home DIR] [claude|codex|pi]
+# Set PY to the Python that has intent_aligner installed. --home is passed on to
+# intent_aligner.llm; without it the wrapper's default home is used.
 
 set -euo pipefail
 
@@ -14,6 +15,16 @@ declare -A DEFAULT_MODEL=(
     [codex]="gpt-6-astra"
     [pi]="fireworks/accounts/fireworks/models/glm-5p3-flash"
 )
+
+home_args=()
+if [[ "${1:-}" == "--home" ]]; then
+    if [[ -z "${2:-}" ]]; then
+        echo "--home needs a directory." >&2
+        exit 2
+    fi
+    home_args=(--home "$2")
+    shift 2
+fi
 
 backend="${1:-claude}"
 if [[ -z "${DEFAULT_MODEL[$backend]+set}" ]]; then
@@ -28,7 +39,7 @@ system_file="$(mktemp)"
 trap 'rm -f "$system_file"' EXIT
 
 show() {
-    echo "backend=$backend  model=$model  effort=$effort"
+    echo "backend=$backend  model=$model  effort=$effort  home=${home_args[1]:-default}"
     echo "system: $system"
 }
 
@@ -49,7 +60,8 @@ send() {
     printf '%s' "$system" > "$system_file"
     # The wrapper prints the reply on stdout and the transcript path on stderr.
     if ! printf '%s' "$1" | "$PY" -m intent_aligner.llm \
-        --backend "$backend" --model "$model" --effort "$effort" --system "$system_file"; then
+        --backend "$backend" --model "$model" --effort "$effort" --system "$system_file" \
+        "${home_args[@]}"; then
         echo "[call failed]" >&2
     fi
 }

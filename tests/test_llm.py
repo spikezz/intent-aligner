@@ -6,6 +6,7 @@ INTENT_ALIGNER_LIVE=1; CI runs the offline ones.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import time
@@ -100,6 +101,27 @@ def test_pi_rejects_a_schema(tmp_path: Path) -> None:
 def test_empty_system_prompt_is_rejected() -> None:
     with pytest.raises(ValidationError):
         LLMCall(backend="pi", model="m", effort="low", system_prompt="", prompt="p")
+
+
+def test_main_sends_transcripts_to_the_home_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    system = tmp_path / "system.txt"
+    system.write_text("s")
+    homes: list[Path] = []
+
+    def fake_complete(call: LLMCall, home: Path) -> llm.LLMReply:
+        homes.append(home)
+        return llm.LLMReply(text="ok", session_id="id", transcript=home / "t.jsonl")
+
+    monkeypatch.setattr(llm, "complete", fake_complete)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.stdin", io.StringIO("p"))
+    argv = ["llm", "--backend", "pi", "--model", "m", "--system", str(system), "--home", "rel"]
+    monkeypatch.setattr("sys.argv", argv)
+    llm.main()
+
+    assert homes == [tmp_path / "rel"], "a relative --home must be resolved before the call"
 
 
 LIVE_MODELS: dict[llm.Backend, str] = {
