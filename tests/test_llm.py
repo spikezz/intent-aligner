@@ -141,7 +141,8 @@ def _hive_call(effort: llm.Effort = "low", schema: bool = False) -> LLMCall:
 
 
 def test_hive_body_is_only_system_and_user() -> None:
-    body = hive_request_body(_hive_call(), {"reasoning": False})
+    call = _hive_call().model_copy(update={"stream": False})
+    body = hive_request_body(call, {"reasoning": False})
 
     assert body == {
         "model": "deployment/d",
@@ -152,14 +153,21 @@ def test_hive_body_is_only_system_and_user() -> None:
     }, body
 
 
-def test_hive_qwen_thinking_uses_pi_budgets_and_xhigh_is_unbounded() -> None:
+def test_hive_streams_by_default() -> None:
+    body = hive_request_body(_hive_call(), {"reasoning": False})
+
+    assert body["stream"] is True, body
+    assert body["stream_options"] == {"include_usage": True}, body
+
+
+def test_hive_qwen_thinking_budget_leaves_room_for_the_prompt() -> None:
     low = hive_request_body(_hive_call("low"), QWEN_CLIENT)
     xhigh = hive_request_body(_hive_call("xhigh"), QWEN_CLIENT)
 
     assert low["chat_template_kwargs"] == {"enable_thinking": True}, low
     assert low["reasoning_budget_tokens"] == 2048, low
     assert xhigh["chat_template_kwargs"] == {"enable_thinking": True}, xhigh
-    assert "reasoning_budget_tokens" not in xhigh, xhigh
+    assert xhigh["reasoning_budget_tokens"] == 9216, xhigh
 
 
 def test_hive_openai_thinking_sends_reasoning_effort() -> None:
@@ -208,10 +216,26 @@ def gateway(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Gateway]:
         def do_GET(self) -> None:
             self._answer(200, state.models)
 
+        def _stream(self, body: dict[str, Any]) -> None:
+            choice = body["choices"][0]
+            chunk = {
+                "choices": [
+                    {"delta": choice["message"], "finish_reason": choice["finish_reason"]},
+                ]
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode())
+
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state.requests.append((dict(self.headers), body))
-            self._answer(*state.reply)
+            status, reply = state.reply
+            if status == 200 and body.get("stream"):
+                self._stream(reply)
+            else:
+                self._answer(status, reply)
 
         def log_message(self, *args: object) -> None:
             pass
@@ -235,6 +259,42 @@ def test_hive_call_records_request_and_response(tmp_path: Path, gateway: _Gatewa
     assert "x-hive-lease" not in {k.lower() for k in headers}, "one-shot calls hold no lease"
 
 
+def test_hive_block_reply_needs_no_assembly(tmp_path: Path, gateway: _Gateway) -> None:
+    call = _hive_call(schema=True).model_copy(update={"stream": False})
+
+    reply = complete(call, tmp_path)
+
+    assert json.loads(reply.text) == {"answer": 4}, reply.text
+    assert "stream" not in gateway.requests[0][1], gateway.requests[0][1]
+
+
+def test_a_stream_is_assembled_into_one_completion() -> None:
+    lines = [
+        b'data: {"choices": [{"delta": {"reasoning_content": "hm"}, "finish_reason": null}]}\n',
+        b"\n",
+        b'data: {"choices": [{"delta": {"content": "{\\"a\\""}, "finish_reason": null}]}\n',
+        b'data: {"choices": [{"delta": {"content": ": 1}"}, "finish_reason": "stop"}]}\n',
+        b'data: {"choices": [], "usage": {"completion_tokens": 3}}\n',
+        b"data: [DONE]\n",
+    ]
+
+    assert llm._assemble_stream(lines) == {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"content": '{"a": 1}', "reasoning_content": "hm"},
+            }
+        ],
+        "usage": {"completion_tokens": 3},
+    }
+
+
+def test_a_stream_cut_off_is_an_incomplete_reply() -> None:
+    lines = [b'data: {"choices": [{"delta": {"content": "{"}, "finish_reason": null}]}\n']
+
+    assert llm._assemble_stream(lines)["choices"][0]["finish_reason"] is None
+
+
 def test_hive_rejects_a_role_without_client_declaration(tmp_path: Path, gateway: _Gateway) -> None:
     with pytest.raises(LLMError, match=r"Running now: \['deployment/d'\]"):
         complete(_call("hive", "chat"), tmp_path)
@@ -250,13 +310,32 @@ def test_hive_truncated_reply_is_an_error_but_still_recorded(
     assert len(list((tmp_path / "hive").iterdir())) == 1
 
 
-def test_hive_gateway_refusal_is_recorded(tmp_path: Path, gateway: _Gateway) -> None:
+def test_hive_gateway_refusal_is_recorded(
+    tmp_path: Path, gateway: _Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(llm, "_HIVE_CAPACITY_WAIT", 0)
     gateway.reply = (409, {"detail": "No verified compatible capacity is available"})
 
     with pytest.raises(LLMError, match="409"):
         complete(_hive_call(), tmp_path)
     (transcript,) = (tmp_path / "hive").iterdir()
     assert "No verified compatible capacity" in transcript.read_text(), transcript
+
+
+def test_hive_waits_out_a_full_gateway(
+    tmp_path: Path, gateway: _Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer = gateway.reply
+    gateway.reply = (409, {"error": "No verified compatible capacity is available"})
+
+    def free_a_slot(_seconds: float) -> None:
+        gateway.reply = answer
+
+    monkeypatch.setattr("time.sleep", free_a_slot)
+    reply = complete(_hive_call(), tmp_path)
+
+    assert reply.text == '{"answer": 4}', reply
+    assert len(gateway.requests) == 2, gateway.requests
 
 
 LIVE_MODELS: dict[llm.Backend, str] = {

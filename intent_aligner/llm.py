@@ -5,7 +5,7 @@ to the Hive Frame gateway (HIVE_FRAME_URL, default http://127.0.0.1:8790) with n
 harness in between: the request carries only the system prompt and the user prompt.
 
 Usage: python -m intent_aligner.llm --backend B --model M --system FILE
-           [--effort E] [--schema FILE] [--home DIR] < prompt.txt
+           [--effort E] [--schema FILE] [--home DIR] [--no-stream] < prompt.txt
 
 Every transcript a call produces lands under the home directory (--home, default
 LLM_HOME) and nowhere else:
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import subprocess
@@ -28,6 +29,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -46,9 +48,18 @@ _CLAUDE_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
 HIVE_FRAME_URL = os.environ.get("HIVE_FRAME_URL", "http://127.0.0.1:8790").rstrip("/")
 
 # pi's default thinking budgets for token-budget models, so a Hive model thinks as much
-# here as it does under pi. xhigh sends no budget: thinking is bounded only by the
-# context window, which the gateway enforces through max_tokens.
-_HIVE_THINKING_BUDGET: dict[Effort, int] = {"low": 2048, "medium": 8192, "high": 16384}
+# here as it does under pi, except at the top: a np8 slot holds 18,944 tokens for prompt,
+# thinking and answer together, so high and xhigh are capped to leave window.PROMPT_BUDGET.
+_HIVE_THINKING_BUDGET: dict[Effort, int] = {
+    "low": 2048,
+    "medium": 9216,
+    "high": 9216,
+    "xhigh": 9216,
+}
+# The gateway answered 409 to a burst right after a stopped run and accepted the same
+# requests about 40 s later (2026-11-06), so a 409 is waited out before it counts as failure.
+_HIVE_CAPACITY_WAIT = 1800
+_HIVE_CAPACITY_POLL = 10
 
 
 class LLMCall(BaseModel):
@@ -60,6 +71,11 @@ class LLMCall(BaseModel):
     pi takes "provider/model-id"; hive takes a gateway id "deployment/<name>". `json_schema`
     constrains the reply on claude, codex and hive; pi has no structured-output mode, so
     it rejects a schema.
+
+    `stream` only matters on hive, the one backend this module reads over HTTP. Streaming
+    is the default because the gateway never frees the slot of a non-streaming request
+    that outlives its read timeout (2026-11-06: 6 of 8 np8 slots lost that way); a stream
+    only times out when the engine goes silent, not when a long answer takes long.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -70,6 +86,7 @@ class LLMCall(BaseModel):
     system_prompt: str = Field(min_length=1)
     prompt: str
     json_schema: dict[str, Any] | None = None
+    stream: bool = True
 
 
 class LLMReply(BaseModel):
@@ -124,6 +141,34 @@ def complete(call: LLMCall, home: Path = LLM_HOME) -> LLMReply:
     if call.backend == "codex":
         return _codex_reply(call, proc.stdout, home)
     return _pi_reply(proc.stdout, home)
+
+
+Ask = Callable[[str], str]
+
+
+def asker(
+    backend: Backend,
+    model: str,
+    effort: Effort,
+    system_prompt: str,
+    schema: dict[str, Any],
+    stream: bool,
+) -> Ask:
+    """An Ask: one isolated call per prompt under a fixed system prompt and reply schema."""
+
+    def ask(prompt: str) -> str:
+        call = LLMCall(
+            backend=backend,
+            model=model,
+            effort=effort,
+            system_prompt=system_prompt,
+            prompt=prompt,
+            json_schema=schema,
+            stream=stream,
+        )
+        return complete(call).text
+
+    return ask
 
 
 def build_invocation(call: LLMCall, home: Path) -> Invocation:
@@ -278,6 +323,8 @@ def hive_request_body(call: LLMCall, client: dict[str, Any]) -> dict[str, Any]:
             {"role": "user", "content": call.prompt},
         ],
     }
+    if call.stream:
+        body |= {"stream": True, "stream_options": {"include_usage": True}}
     if client.get("reasoning"):
         if client.get("thinking_format") == "qwen-chat-template":
             body["chat_template_kwargs"] = {"enable_thinking": True}
@@ -310,6 +357,11 @@ def _hive_complete(call: LLMCall, home: Path) -> LLMReply:
         }
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     status, response = _hive_post("/v1/chat/completions", body)
+    waited = 0
+    while status == 409 and waited < _HIVE_CAPACITY_WAIT:
+        time.sleep(_HIVE_CAPACITY_POLL)
+        waited += _HIVE_CAPACITY_POLL
+        status, response = _hive_post("/v1/chat/completions", body)
     with transcript.open("a", encoding="utf-8") as f:
         record = {"type": "response", "status": status, "body": response}
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -349,22 +401,54 @@ def _hive_post(path: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", "x-hive-client": "intent-aligner"},
     )
-    # The gateway gives the engine 600 s before it fails the request itself.
-    return _hive_send(request, timeout=660)
+    # The gateway waits 1200 s for each read from the engine before it fails the request itself.
+    return _hive_send(
+        request, timeout=1260, read=_assemble_stream if body.get("stream") else json.load
+    )
 
 
-def _hive_send(request: urllib.request.Request, timeout: float) -> tuple[int, dict[str, Any]]:
+def _assemble_stream(lines: Iterable[bytes]) -> dict[str, Any]:
+    """The server-sent chunks as one chat completion, so transcripts keep a single shape.
+
+    A stream that ends without a finish_reason yields finish_reason None, which the
+    caller reports as an incomplete reply.
+    """
+    response: dict[str, Any] = {}
+    content: list[str] = []
+    reasoning: list[str] = []
+    finish_reason = None
+    for raw in lines:
+        line = raw.decode()
+        if not line.startswith("data: ") or line.startswith("data: [DONE]"):
+            continue
+        chunk = json.loads(line.removeprefix("data: "))
+        for choice in chunk.get("choices", []):
+            content.append(choice["delta"].get("content") or "")
+            reasoning.append(choice["delta"].get("reasoning_content") or "")
+            finish_reason = choice.get("finish_reason") or finish_reason
+        response |= {k: v for k, v in chunk.items() if k != "choices" and v is not None}
+    message = {"content": "".join(content)}
+    if any(reasoning):
+        message["reasoning_content"] = "".join(reasoning)
+    return {"choices": [{"finish_reason": finish_reason, "message": message}], **response}
+
+
+def _hive_send(
+    request: urllib.request.Request,
+    timeout: float,
+    read: Callable[[Any], dict[str, Any]] = json.load,
+) -> tuple[int, dict[str, Any]]:
     """Gateway refusals come back as (status, body) so they reach the transcript."""
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.status, cast(dict[str, Any], json.load(response))
+            return response.status, read(response)
     except urllib.error.HTTPError as exc:
         text = exc.read().decode(errors="replace")
         try:
             return exc.code, cast(dict[str, Any], json.loads(text))
         except ValueError:
             return exc.code, {"error": text}
-    except OSError as exc:
+    except (OSError, http.client.HTTPException) as exc:
         raise LLMError(
             f"Hive gateway at {HIVE_FRAME_URL} is unreachable: {exc}. Check "
             "`systemctl --user status hive-frame-gateway` or set HIVE_FRAME_URL."
@@ -389,6 +473,12 @@ def main() -> None:
     parser.add_argument(
         "--home", type=Path, default=LLM_HOME, help=f"where transcripts go (default {LLM_HOME})"
     )
+    parser.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="hive only: read the reply as a stream or as one block",
+    )
     args = parser.parse_args()
     call = LLMCall(
         backend=args.backend,
@@ -397,6 +487,7 @@ def main() -> None:
         system_prompt=args.system.read_text(),
         prompt=sys.stdin.read(),
         json_schema=json.loads(args.schema.read_text()) if args.schema else None,
+        stream=args.stream,
     )
     # Absolute because every backend runs with cwd inside home and gets paths under it.
     reply = complete(call, args.home.resolve())
