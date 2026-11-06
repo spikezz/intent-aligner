@@ -23,6 +23,30 @@ $PY -m intent_aligner.turns corpus/merged/claude-5a1f0c1a.jsonl --index 0 --out 
 
 第 2 步写出的是原始记录，只改成了缩进排版，字段内容不变。
 
+### 调用 LLM
+
+轨迹提取器通过 Claude Code、Codex 或 pi 的命令行调用模型。每次调用都是独立的一问一答，prompt 从标准输入读入，回复打印到标准输出，对话记录的路径打印到标准错误。
+
+```bash
+echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.llm \
+    --backend claude --model opus --effort xhigh \
+    --system system.txt --schema schema.json
+```
+
+- `--backend` 可以是 `claude`、`codex` 或 `pi`。`--model` 按对应命令行的写法给出，pi 的写法是 `provider/model-id`。
+- `--effort` 可以是 `low`、`medium`、`high` 或 `xhigh`，默认是 `xhigh`。
+- `--schema` 是可选的 JSON schema，给出时回复就是满足它的 JSON。pi 不支持这个参数。
+- 调用产生的对话记录只写进 `llm-home/`，不会出现在日常使用的 `~/.claude/projects`、`~/.codex/sessions` 或 `~/.pi/agent/sessions` 里。
+
+## 测试
+
+```bash
+$PY -m pytest -q                            # 离线测试
+INTENT_ALIGNER_LIVE=1 $PY -m pytest -q -k live   # 真实调用三个后端，会消耗 token
+```
+
+没有构建语料时，语料相关的测试会跳过；没有设置 `INTENT_ALIGNER_LIVE=1` 时，真实调用的测试会跳过。CI 只运行离线测试。
+
 ## 许可证
 
 MIT，见 `LICENSE`。
