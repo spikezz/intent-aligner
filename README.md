@@ -25,7 +25,7 @@ $PY -m intent_aligner.turns corpus/merged/claude-5a1f0c1a.jsonl --index 0 --out 
 
 ### 调用 LLM
 
-轨迹提取器通过 Claude Code、Codex 或 pi 的命令行调用模型。每次调用都是独立的一问一答，prompt 从标准输入读入，回复打印到标准输出，对话记录的路径打印到标准错误。
+轨迹提取器可以通过 Claude Code、Codex 或 pi 的命令行调用模型，也可以直接通过 HTTP 调用 Hive Frame 网关上的本地模型。每次调用都是独立的一问一答，prompt 从标准输入读入，回复打印到标准输出，对话记录的路径打印到标准错误。
 
 ```bash
 echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.llm \
@@ -33,7 +33,8 @@ echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.ll
     --system system.txt --schema schema.json
 ```
 
-- `--backend` 可以是 `claude`、`codex` 或 `pi`。`--model` 按对应命令行的写法给出，pi 的写法是 `provider/model-id`。
+- `--backend` 可以是 `claude`、`codex`、`pi` 或 `hive`。`--model` 按对应命令行的写法给出，pi 的写法是 `provider/model-id`，hive 的写法是网关 `/v1/models` 列出的 `deployment/<部署名>`。
+- `hive` 不经过任何 agent 命令行，发给网关的请求里只有系统提示和用户 prompt。网关地址默认是 `http://127.0.0.1:8790`，可以用环境变量 `HIVE_FRAME_URL` 改。思考参数按网关为这个部署声明的模型协议设置：Qwen 模板的模型打开思考，`low`、`medium`、`high` 分别给 2048、8192、16384 个思考 token 的预算（与 pi 的默认值相同），`xhigh` 不设预算，只受上下文窗口限制。
 - `--effort` 可以是 `low`、`medium`、`high` 或 `xhigh`，默认是 `xhigh`。
 - `--schema` 是可选的 JSON schema，给出时回复就是满足它的 JSON。pi 不支持这个参数。
 - 调用产生的对话记录只写进 `--home` 指定的目录，默认是工具根目录下的 `llm-home/`。对话记录不会出现在日常使用的 `~/.claude/projects`、`~/.codex/sessions` 或 `~/.pi/agent/sessions` 里。
@@ -43,7 +44,7 @@ echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.ll
 `scripts/llm-chat.sh` 是一个交互式的小工具，用来手动给三个端点发消息。每条消息都是一次独立的调用，不会带上之前的消息。
 
 ```bash
-PY=$PY scripts/llm-chat.sh                     # 默认从 claude 开始，也可以写 codex 或 pi
+PY=$PY scripts/llm-chat.sh                     # 默认从 claude 开始，也可以写 codex、pi 或 hive
 PY=$PY scripts/llm-chat.sh --home /some/dir pi   # 对话记录写进 /some/dir
 ```
 
@@ -53,7 +54,7 @@ PY=$PY scripts/llm-chat.sh --home /some/dir pi   # 对话记录写进 /some/dir
 
 ```bash
 $PY -m pytest -q                            # 离线测试
-INTENT_ALIGNER_LIVE=1 $PY -m pytest -q -k live   # 真实调用三个后端，会消耗 token
+INTENT_ALIGNER_LIVE=1 $PY -m pytest -q -k live   # 真实调用四个后端，会消耗 token；hive 需要网关上正在运行 deployment/pc-qwen38-np8
 ```
 
 没有构建语料时，语料相关的测试会跳过；没有设置 `INTENT_ALIGNER_LIVE=1` 时，真实调用的测试会跳过。CI 只运行离线测试。

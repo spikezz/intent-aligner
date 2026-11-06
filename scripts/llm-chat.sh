@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Send single messages to the claude / codex / pi endpoints of intent_aligner.llm.
+# Send single messages to the claude / codex / pi / hive endpoints of intent_aligner.llm.
 # Every message is an independent one-shot call: no history is carried over.
 #
-# Usage: scripts/llm-chat.sh [--home DIR] [claude|codex|pi]
+# Usage: scripts/llm-chat.sh [--home DIR] [claude|codex|pi|hive]
 # Set PY to the Python that has intent_aligner installed. --home is passed on to
 # intent_aligner.llm; without it the wrapper's default home is used.
 
@@ -14,6 +14,7 @@ declare -A DEFAULT_MODEL=(
     [claude]="opus"
     [codex]="gpt-6-astra"
     [pi]="fireworks/accounts/fireworks/models/glm-5p3-flash"
+    [hive]="deployment/pc-qwen38-np8"
 )
 
 home_args=()
@@ -28,7 +29,7 @@ fi
 
 backend="${1:-claude}"
 if [[ -z "${DEFAULT_MODEL[$backend]+set}" ]]; then
-    echo "Unknown backend '$backend'; choose claude, codex or pi." >&2
+    echo "Unknown backend '$backend'; choose claude, codex, pi or hive." >&2
     exit 2
 fi
 model="${DEFAULT_MODEL[$backend]}"
@@ -46,7 +47,8 @@ show() {
 usage() {
     cat <<'EOF'
 Type a message and press Enter to send it. Commands:
-  /backend claude|codex|pi   switch endpoint (model resets to that backend's default)
+  /backend claude|codex|pi|hive
+                             switch endpoint (model resets to that backend's default)
   /model NAME                set the model
   /effort low|medium|high|xhigh
   /system TEXT               set the system prompt
@@ -82,7 +84,7 @@ while IFS= read -r -e -p "[$backend] > " line; do
                 model="${DEFAULT_MODEL[$backend]}"
                 show
             else
-                echo "Unknown backend '$next'; choose claude, codex or pi."
+                echo "Unknown backend '$next'; choose claude, codex, pi or hive."
             fi
             ;;
         /model\ *) model="${line#/model }"; show ;;

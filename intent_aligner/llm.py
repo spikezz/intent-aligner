@@ -1,4 +1,8 @@
-"""One-shot LLM calls through the Claude Code, Codex and pi CLIs, isolated from daily use.
+"""One-shot LLM calls, isolated from daily use.
+
+The claude, codex and pi backends run those CLIs. The hive backend talks HTTP straight
+to the Hive Frame gateway (HIVE_FRAME_URL, default http://127.0.0.1:8790) with no agent
+harness in between: the request carries only the system prompt and the user prompt.
 
 Usage: python -m intent_aligner.llm --backend B --model M --system FILE
            [--effort E] [--schema FILE] [--home DIR] < prompt.txt
@@ -8,6 +12,7 @@ LLM_HOME) and nowhere else:
     llm-home/claude/projects/<cwd slug>/<session>.jsonl   CLAUDE_CONFIG_DIR of the call
     llm-home/codex/<thread>.jsonl                         request + `codex exec --json` events
     llm-home/pi/<time>_<session>.jsonl                    `pi --session-dir`
+    llm-home/hive/<call id>.jsonl                         request body + gateway response
     llm-home/work/                                        empty cwd shared by all calls
 """
 
@@ -20,6 +25,9 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -30,10 +38,17 @@ from intent_aligner.corpus import TOOL_ROOT
 
 LLM_HOME = TOOL_ROOT / "llm-home"
 
-Backend = Literal["claude", "codex", "pi"]
+Backend = Literal["claude", "codex", "pi", "hive"]
 Effort = Literal["low", "medium", "high", "xhigh"]
 
 _CLAUDE_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
+
+HIVE_FRAME_URL = os.environ.get("HIVE_FRAME_URL", "http://127.0.0.1:8790").rstrip("/")
+
+# pi's default thinking budgets for token-budget models, so a Hive model thinks as much
+# here as it does under pi. xhigh sends no budget: thinking is bounded only by the
+# context window, which the gateway enforces through max_tokens.
+_HIVE_THINKING_BUDGET: dict[Effort, int] = {"low": 2048, "medium": 8192, "high": 16384}
 
 
 class LLMCall(BaseModel):
@@ -42,8 +57,9 @@ class LLMCall(BaseModel):
     `system_prompt` replaces the CLI's own. It must be non-empty: how each CLI treats
     an empty value (pi documents a coding-assistant default) is unverified.
 
-    pi takes "provider/model-id". `json_schema` constrains the reply on claude and
-    codex; pi has no structured-output mode, so it rejects a schema.
+    pi takes "provider/model-id"; hive takes a gateway id "deployment/<name>". `json_schema`
+    constrains the reply on claude, codex and hive; pi has no structured-output mode, so
+    it rejects a schema.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -86,6 +102,8 @@ def complete(call: LLMCall, home: Path = LLM_HOME) -> LLMReply:
     """Run `call` once and return its reply; raises LLMError on any backend failure."""
     if call.backend == "pi" and call.json_schema is not None:
         raise ValueError("pi has no structured-output mode; drop json_schema or use claude/codex.")
+    if call.backend == "hive":
+        return _hive_complete(call, home)
     (home / "work").mkdir(parents=True, exist_ok=True)
     invocation = build_invocation(call, home)
     proc = subprocess.run(
@@ -109,7 +127,9 @@ def complete(call: LLMCall, home: Path = LLM_HOME) -> LLMReply:
 
 
 def build_invocation(call: LLMCall, home: Path) -> Invocation:
-    """Command line, environment and cwd that isolate `call` inside `home`."""
+    """Command line, environment and cwd that isolate a CLI-backed `call` inside `home`."""
+    if call.backend == "hive":
+        raise ValueError("The hive backend is HTTP, not a CLI; use complete().")
     work = home / "work"
     if call.backend == "claude":
         argv = [
@@ -245,6 +265,112 @@ def _pi_reply(stdout: str, home: Path) -> LLMReply:
     return LLMReply(text=text, session_id=session_id, transcript=transcript)
 
 
+def hive_request_body(call: LLMCall, client: dict[str, Any]) -> dict[str, Any]:
+    """Chat-completions body for `call`, with thinking set the way `client` declares.
+
+    `client` is the deployment's `hive.client` entry from the gateway's /v1/models;
+    pi builds its Hive model menu from the same entry.
+    """
+    body: dict[str, Any] = {
+        "model": call.model,
+        "messages": [
+            {"role": "system", "content": call.system_prompt},
+            {"role": "user", "content": call.prompt},
+        ],
+    }
+    if client.get("reasoning"):
+        if client.get("thinking_format") == "qwen-chat-template":
+            body["chat_template_kwargs"] = {"enable_thinking": True}
+            field = client.get("thinking_token_budget_field")
+            if field and call.effort in _HIVE_THINKING_BUDGET:
+                body[field] = _HIVE_THINKING_BUDGET[call.effort]
+        elif client.get("reasoning_effort"):
+            body["reasoning_effort"] = call.effort
+    if call.json_schema is not None:
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "reply", "schema": call.json_schema},
+        }
+    return body
+
+
+def _hive_complete(call: LLMCall, home: Path) -> LLMReply:
+    """No lease header: the gateway reserves a slot for this one request and frees it."""
+    body = hive_request_body(call, _hive_client(call.model))
+    call_id = uuid.uuid4().hex
+    transcript = home / "hive" / f"{call_id}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    with transcript.open("w", encoding="utf-8") as f:
+        record = {
+            "type": "request",
+            "id": call_id,
+            **call.model_dump(),
+            "url": HIVE_FRAME_URL,
+            "body": body,
+        }
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    status, response = _hive_post("/v1/chat/completions", body)
+    with transcript.open("a", encoding="utf-8") as f:
+        record = {"type": "response", "status": status, "body": response}
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    if status != 200:
+        raise LLMError(f"Hive gateway answered {status}: {response!r}; see {transcript}.")
+    choice = response["choices"][0]
+    if choice["finish_reason"] != "stop":
+        raise LLMError(
+            f"{call.model} stopped with {choice['finish_reason']!r}, so the reply is "
+            f"incomplete; see {transcript}."
+        )
+    return LLMReply(
+        text=str(choice["message"]["content"]), session_id=call_id, transcript=transcript
+    )
+
+
+def _hive_client(model: str) -> dict[str, Any]:
+    """Only deployment ids carry a client declaration; a role may route to several."""
+    _, listing = _hive_get("/v1/models")
+    entries = {str(e["id"]): e for e in listing["data"]}
+    if model not in entries or "hive" not in entries[model]:
+        served = sorted(i for i, e in entries.items() if "hive" in e)
+        raise LLMError(
+            f"{model!r} is not a running Hive deployment. Running now: {served}. "
+            "Start one with `hive-frame services apply`."
+        )
+    return cast(dict[str, Any], entries[model]["hive"]["client"])
+
+
+def _hive_get(path: str) -> tuple[int, dict[str, Any]]:
+    return _hive_send(urllib.request.Request(HIVE_FRAME_URL + path), timeout=30)
+
+
+def _hive_post(path: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    request = urllib.request.Request(
+        HIVE_FRAME_URL + path,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "x-hive-client": "intent-aligner"},
+    )
+    # The gateway gives the engine 600 s before it fails the request itself.
+    return _hive_send(request, timeout=660)
+
+
+def _hive_send(request: urllib.request.Request, timeout: float) -> tuple[int, dict[str, Any]]:
+    """Gateway refusals come back as (status, body) so they reach the transcript."""
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, cast(dict[str, Any], json.load(response))
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode(errors="replace")
+        try:
+            return exc.code, cast(dict[str, Any], json.loads(text))
+        except ValueError:
+            return exc.code, {"error": text}
+    except OSError as exc:
+        raise LLMError(
+            f"Hive gateway at {HIVE_FRAME_URL} is unreachable: {exc}. Check "
+            "`systemctl --user status hive-frame-gateway` or set HIVE_FRAME_URL."
+        ) from exc
+
+
 def _single(root: Path, pattern: str) -> Path:
     matches = list(root.glob(pattern))
     if len(matches) != 1:
@@ -255,7 +381,7 @@ def _single(root: Path, pattern: str) -> Path:
 def main() -> None:
     """CLI entry point: prompt on stdin, reply text on stdout, transcript path on stderr."""
     parser = argparse.ArgumentParser(description="One isolated LLM call.")
-    parser.add_argument("--backend", choices=["claude", "codex", "pi"], required=True)
+    parser.add_argument("--backend", choices=["claude", "codex", "pi", "hive"], required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], default="xhigh")
     parser.add_argument("--system", type=Path, required=True, help="file holding the system prompt")

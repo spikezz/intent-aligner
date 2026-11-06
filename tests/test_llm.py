@@ -9,14 +9,18 @@ from __future__ import annotations
 import io
 import json
 import os
+import threading
 import time
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from intent_aligner import llm
-from intent_aligner.llm import LLMCall, LLMError, build_invocation, complete
+from intent_aligner.llm import LLMCall, LLMError, build_invocation, complete, hive_request_body
 
 SCHEMA = {
     "type": "object",
@@ -124,13 +128,146 @@ def test_main_sends_transcripts_to_the_home_flag(
     assert homes == [tmp_path / "rel"], "a relative --home must be resolved before the call"
 
 
+QWEN_CLIENT = {
+    "reasoning": True,
+    "thinking_format": "qwen-chat-template",
+    "thinking_token_budget_field": "reasoning_budget_tokens",
+}
+FLASH_CLIENT = {"reasoning": True, "thinking_format": "openai", "reasoning_effort": True}
+
+
+def _hive_call(effort: llm.Effort = "low", schema: bool = False) -> LLMCall:
+    return _call("hive", "deployment/d", schema).model_copy(update={"effort": effort})
+
+
+def test_hive_body_is_only_system_and_user() -> None:
+    body = hive_request_body(_hive_call(), {"reasoning": False})
+
+    assert body == {
+        "model": "deployment/d",
+        "messages": [
+            {"role": "system", "content": "You are a terse calculator."},
+            {"role": "user", "content": "What is 2+2? Put it in answer."},
+        ],
+    }, body
+
+
+def test_hive_qwen_thinking_uses_pi_budgets_and_xhigh_is_unbounded() -> None:
+    low = hive_request_body(_hive_call("low"), QWEN_CLIENT)
+    xhigh = hive_request_body(_hive_call("xhigh"), QWEN_CLIENT)
+
+    assert low["chat_template_kwargs"] == {"enable_thinking": True}, low
+    assert low["reasoning_budget_tokens"] == 2048, low
+    assert xhigh["chat_template_kwargs"] == {"enable_thinking": True}, xhigh
+    assert "reasoning_budget_tokens" not in xhigh, xhigh
+
+
+def test_hive_openai_thinking_sends_reasoning_effort() -> None:
+    body = hive_request_body(_hive_call("xhigh"), FLASH_CLIENT)
+
+    assert body["reasoning_effort"] == "xhigh", body
+    assert "chat_template_kwargs" not in body, body
+
+
+def test_hive_schema_becomes_response_format() -> None:
+    body = hive_request_body(_hive_call(schema=True), QWEN_CLIENT)
+
+    assert body["response_format"]["json_schema"]["schema"] == SCHEMA, body
+
+
+class _Gateway:
+    """A stand-in Hive gateway: one deployment, a canned chat reply, recorded requests."""
+
+    def __init__(self) -> None:
+        self.models: dict[str, Any] = {
+            "data": [
+                {"id": "chat"},
+                {"id": "deployment/d", "hive": {"client": QWEN_CLIENT}},
+            ]
+        }
+        self.reply: tuple[int, dict[str, Any]] = (
+            200,
+            {"choices": [{"finish_reason": "stop", "message": {"content": '{"answer": 4}'}}]},
+        )
+        self.requests: list[tuple[dict[str, str], dict[str, Any]]] = []
+
+
+@pytest.fixture
+def gateway(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Gateway]:
+    state = _Gateway()
+
+    class Handler(BaseHTTPRequestHandler):
+        def _answer(self, status: int, body: dict[str, Any]) -> None:
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self) -> None:
+            self._answer(200, state.models)
+
+        def do_POST(self) -> None:
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            state.requests.append((dict(self.headers), body))
+            self._answer(*state.reply)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(llm, "HIVE_FRAME_URL", f"http://127.0.0.1:{server.server_port}")
+    yield state
+    server.shutdown()
+
+
+def test_hive_call_records_request_and_response(tmp_path: Path, gateway: _Gateway) -> None:
+    reply = complete(_hive_call(schema=True), tmp_path)
+
+    assert json.loads(reply.text) == {"answer": 4}, reply.text
+    assert reply.transcript == tmp_path / "hive" / f"{reply.session_id}.jsonl", reply.transcript
+    request, response = (json.loads(x) for x in reply.transcript.read_text().splitlines())
+    headers, sent = gateway.requests[0]
+    assert request["body"] == sent, (request, sent)
+    assert response["body"] == gateway.reply[1], response
+    assert "x-hive-lease" not in {k.lower() for k in headers}, "one-shot calls hold no lease"
+
+
+def test_hive_rejects_a_role_without_client_declaration(tmp_path: Path, gateway: _Gateway) -> None:
+    with pytest.raises(LLMError, match=r"Running now: \['deployment/d'\]"):
+        complete(_call("hive", "chat"), tmp_path)
+
+
+def test_hive_truncated_reply_is_an_error_but_still_recorded(
+    tmp_path: Path, gateway: _Gateway
+) -> None:
+    gateway.reply = (200, {"choices": [{"finish_reason": "length", "message": {"content": "{"}}]})
+
+    with pytest.raises(LLMError, match="'length'"):
+        complete(_hive_call(), tmp_path)
+    assert len(list((tmp_path / "hive").iterdir())) == 1
+
+
+def test_hive_gateway_refusal_is_recorded(tmp_path: Path, gateway: _Gateway) -> None:
+    gateway.reply = (409, {"detail": "No verified compatible capacity is available"})
+
+    with pytest.raises(LLMError, match="409"):
+        complete(_hive_call(), tmp_path)
+    (transcript,) = (tmp_path / "hive").iterdir()
+    assert "No verified compatible capacity" in transcript.read_text(), transcript
+
+
 LIVE_MODELS: dict[llm.Backend, str] = {
     "claude": "sonnet",
     "codex": "gpt-6-astra",
     "pi": "fireworks/accounts/fireworks/models/glm-5p3-flash",
+    "hive": "deployment/pc-qwen38-np8",
 }
 
 # Where each CLI keeps transcripts in daily use; an isolated call must leave no trace there.
+# hive has no CLI and so no daily transcripts.
 DAILY_TRANSCRIPTS: dict[llm.Backend, Path] = {
     "claude": Path.home() / ".claude" / "projects",
     "codex": Path.home() / ".codex" / "sessions",
@@ -141,7 +278,7 @@ DAILY_TRANSCRIPTS: dict[llm.Backend, Path] = {
 @pytest.mark.skipif(
     os.environ.get("INTENT_ALIGNER_LIVE") != "1", reason="set INTENT_ALIGNER_LIVE=1"
 )
-@pytest.mark.parametrize("backend", ["claude", "codex", "pi"])
+@pytest.mark.parametrize("backend", ["claude", "codex", "pi", "hive"])
 def test_live_call_stays_isolated(backend: llm.Backend, tmp_path: Path) -> None:
     reply = complete(_call(backend, LIVE_MODELS[backend], schema=backend != "pi"), tmp_path)
 
@@ -151,5 +288,7 @@ def test_live_call_stays_isolated(backend: llm.Backend, tmp_path: Path) -> None:
         assert "4" in reply.text, reply.text
     else:
         assert json.loads(reply.text) == {"answer": 4}, reply.text
+    if backend == "hive":
+        return
     leaked = [p for p in DAILY_TRANSCRIPTS[backend].rglob("*.jsonl") if reply.session_id in p.name]
     assert not leaked, f"{backend} wrote a daily transcript: {leaked}"
