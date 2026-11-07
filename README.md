@@ -2,7 +2,7 @@
 
 意图对齐器由三部分组成：轨迹提取器、可视化，以及后续待定的部分。
 
-轨迹提取器从一段对话的时间线开头开始，依次读取用户说的话、AI 的工具调用和环境返回的结果，提取其中的意图、观测以及它们之间的关系。轨迹提取器的前三步已经实现：把对话按时间顺序切成处理单元、两级压缩工具操作、把用户消息按意图切成段落（见下面“运行”的第 3 到 5 步）；之后建节点和关系的步骤还没有实现。`playground/` 里是手工完成的示范提取，每个 topic 一个文件 `playground/topics/<topic 编号>.yaml`，所有 topic 列在 `playground/topics.yaml` 里。
+轨迹提取器从一段对话的时间线开头开始，依次读取用户说的话、AI 的工具调用和环境返回的结果，提取其中的意图、观测以及它们之间的关系。轨迹提取器已经实现的部分是：把对话按时间顺序切成处理单元、两级压缩工具操作、把用户消息按意图切成段落，以及主循环的开头，即逐个单元判断它属于哪个 topic（见下面“运行”的第 3 到 6 步）；之后建节点和关系的步骤还没有实现。`playground/` 里是手工完成的示范提取，每个 topic 一个文件 `playground/topics/<topic 编号>.yaml`，所有 topic 列在 `playground/topics.yaml` 里。
 
 ## 运行
 
@@ -16,7 +16,8 @@ PY=/home/spikezz/.openclaw/.venv/bin/python
 $PY -m intent_aligner.corpus
 
 # 2. 取出合并文件里第 N 条用户亲手发送的消息（从 0 开始计数）
-$PY -m intent_aligner.turns corpus/merged/claude-5a1f0c1a.jsonl --index 0 --out playground/t
+mkdir -p corpus/turns
+$PY -m intent_aligner.turns corpus/merged/claude-5a1f0c1a.jsonl --index 0 --out corpus/turns/claude-5a1f0c1a-0.json
 
 # 3. 把合并后的对话（Claude 或 Codex，按文件名前缀区分）按时间顺序切成处理单元，
 #    每行一个单元，并打印各类单元的数量
@@ -29,21 +30,32 @@ $PY -m intent_aligner.units corpus/merged/claude-5a1f0c1a.jsonl --out corpus/uni
 #    结果对照调用的意图和全文压成一句话（太长的结果按行切段，每段一句），一个调用和它的结果是一个任务，
 #    任务之间互相独立，--workers 个并行。第二级把一轮里全部的意图、对象和结果压成一段概括。
 #    第二级同时看开启这一轮的用户消息。输出边跑边追加，中断后重跑会从断点继续；--until 在这条用户消息之前停下。
-EXP=corpus/experiments/10-example
-mkdir -p $EXP/digests $EXP/segments
+OUT=corpus/results/claude-5a1f0c1a-qwen38
+mkdir -p $OUT
 $PY -m intent_aligner.compress corpus/merged/claude-5a1f0c1a.jsonl \
     --backend hive --model deployment/pc-qwen38-np8 \
-    --out $EXP/digests/claude-5a1f0c1a.jsonl --until d24611b1-bf6d-4f27-985e-8a614806da2c
+    --out $OUT/digests.jsonl
 
-# 5. 把一条用户消息按意图切成连续的段落，打印每段的字符区间和意图
+# 5. 把对话里的每条用户消息按意图切成连续的段落，每行一条消息。--workers 条消息并行，
+#    输出边跑边追加，中断后重跑会从断点继续。第 4 步必须先对整个对话跑完（不加 --until）
 $PY -m intent_aligner.segment corpus/merged/claude-5a1f0c1a.jsonl \
-    --uuid d24611b1-bf6d-4f27-985e-8a614806da2c --digests $EXP/digests/claude-5a1f0c1a.jsonl \
-    --backend hive --model deployment/pc-qwen38-np8 --out $EXP/segments/d24611b1.json
+    --digests $OUT/digests.jsonl \
+    --backend hive --model deployment/pc-qwen38-np8 --out $OUT/segments.jsonl
+
+# 6. 指针按时间顺序逐个走过单元（用户消息换成第 5 步的段落），判断每个单元属于哪个 topic。
+#    工具结果沿用它的调用的 topic，其余单元各调用一次模型。第 4、5 步都必须先对整个对话跑完
+$PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
+    --digests $OUT/digests.jsonl --segments $OUT/segments.jsonl \
+    --backend hive --model deployment/pc-qwen38-np8 --out $OUT/extract
 ```
 
 第 3 步输出的单元有 `user_message`（用户消息全文，附带图片路径）、`user_signal`、`tool_call` 和 `observation`；另外 `ai_text` 是 AI 对用户说的话，只注入 input，不做处理。
 
 第 5 步的模型除了这条消息，还会看到它之前两轮对话；两轮放不下时只看前一轮。这些对话里，每一轮的工具操作只显示第 4 步写出的那一段概括，所以这条消息之前的对话必须先压缩过。
+
+第 5 步里，模型重试几次仍然定位不到段落结尾，或者连一轮对话都放不进窗口时，剩下的文本成为一段 `needs_review: true`、意图为空的段落，原因打印在标准错误里。
+
+第 6 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（图谱和段落暂时为空），记录新 topic 和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：一轮太长、模型看到的内容放不下时，还没压缩过的工具操作会压缩成一段话，之前压缩出的段落保持不变，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
 
 第 1 步完成后，`corpus/index.json` 会列出每个合并后的对话，包括成员 session、记录条数、丢弃的 fork 复制品数量，以及损坏的行。
 

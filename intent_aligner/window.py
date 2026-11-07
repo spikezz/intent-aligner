@@ -15,7 +15,7 @@ import attrs
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from tokenizers import Tokenizer
 
-from intent_aligner.units import AIText, Item, ToolCall, UserMessage, UserSignal
+from intent_aligner.units import AIText, Item, Observation, ToolCall, UserMessage, UserSignal
 
 # hive-frame qwen38-np8 gives each slot 18,944 tokens; the rest of the slot is left
 # for the 9,216-token thinking budget (llm._HIVE_THINKING_BUDGET) and the answer; the
@@ -117,20 +117,89 @@ def render_items(items: Sequence[Item], digests: Digests) -> str:
     for item in items:
         if isinstance(item, UserMessage):
             round_uuid, round_shown = item.source.uuid, False
-            images = "".join(f"\n[图片] {path}" for path in item.images)
-            entries.append(f"【用户】\n{item.body}{images}")
-        elif isinstance(item, AIText):
-            entries.append(f"【AI】\n{item.text}")
-        elif isinstance(item, UserSignal):
-            entries.append(f"【用户信号】\n{item.text}")
-        elif isinstance(item, ToolCall):
+        if isinstance(item, ToolCall):
             if not round_shown:
                 entries.append(f"【AI 的工具操作】\n{_round_summary(digests, round_uuid)}")
                 round_shown = True
-        elif item.origin != "tool_result":
-            label = "任务通知" if item.origin == "task_notification" else "系统"
-            entries.append(f"【{label}】\n{item.text}")
+        elif not _is_tool_result(item):
+            entries.append(_plain_entry(item))
     return "\n\n".join(entries)
+
+
+class ToolCompression(BaseModel):
+    """The tool calls and results among items[begin:through] of a round, as one level-2 passage.
+
+    `start` is the timeline index where the round's items begin. A round can be
+    compressed several times; each compression covers the records after the one
+    before it, and every passage stays in the window.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    start: int
+    begin: int
+    through: int
+    summary: str
+
+
+def render_round_so_far(
+    items: Sequence[Item],
+    low: int,
+    index: int,
+    digests: Digests,
+    compressions: Sequence[ToolCompression],
+) -> str:
+    """The current round items[low:index], each tool call and result as its level-1 digest.
+
+    The round digest is not used here because it tells how the whole round ended,
+    which the unit in hand must not see yet. The tool records a compression covers
+    are replaced by its passage, put where the first of them was; everything else
+    keeps its place.
+    """
+    entries: list[str] = []
+    placed: set[int] = set()
+    for position in range(low, index):
+        item = items[position]
+        covering = next((c for c in compressions if c.begin <= position < c.through), None)
+        if covering is None or not is_tool_record(item):
+            entries.append(round_entry(item, digests))
+        elif covering.begin not in placed:
+            entries.append(f"【AI 此前的工具操作（已压缩）】\n{covering.summary}")
+            placed.add(covering.begin)
+    return "\n\n".join(entries)
+
+
+def round_entry(item: Item, digests: Digests) -> str:
+    """One item of the current round: a tool call or result as its level-1 digest, the rest verbatim."""
+    if isinstance(item, ToolCall):
+        call = digests.calls[item.tool_use_id]
+        return f"【AI 的工具调用】\n{item.name} 意图：{call.intent} 对象：{call.targets}"
+    if isinstance(item, Observation) and item.tool_use_id is not None:
+        return f"【工具结果】\n{' '.join(digests.results[item.tool_use_id].summaries)}"
+    return _plain_entry(item)
+
+
+def is_tool_record(item: Item) -> bool:
+    """A tool call or its result; a rejection is the user's and is not one."""
+    return isinstance(item, ToolCall) or _is_tool_result(item)
+
+
+def _is_tool_result(item: Item) -> bool:
+    return isinstance(item, Observation) and item.tool_use_id is not None
+
+
+def _plain_entry(item: Item) -> str:
+    """An item shown verbatim: anything but a tool call or a tool result."""
+    if isinstance(item, UserMessage):
+        images = "".join(f"\n[图片] {path}" for path in item.images)
+        return f"【用户】\n{item.body}{images}"
+    if isinstance(item, AIText):
+        return f"【AI】\n{item.text}"
+    if isinstance(item, UserSignal):
+        return f"【用户信号】\n{item.text}"
+    assert isinstance(item, Observation), item
+    label = "任务通知" if item.origin == "task_notification" else "系统"
+    return f"【{label}】\n{item.text}"
 
 
 def _round_summary(digests: Digests, round_uuid: str) -> str:

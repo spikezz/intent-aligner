@@ -254,6 +254,18 @@ def _outcome(tool_use_id: str, digests: Digests, rejections: dict[str, str]) -> 
 def _compress_round(
     round_uuid: str, message: UserMessage | None, trajectory: list[str], ask: Ask, count: Count
 ) -> list[Digest]:
+    summary = summarize_trajectory(message, trajectory, ask, count, round_uuid)
+    return [RoundDigest(round_uuid=round_uuid, summary=summary)]
+
+
+def summarize_trajectory(
+    message: UserMessage | None, trajectory: list[str], ask: Ask, count: Count, where: str
+) -> str:
+    """Level 2: one passage for `trajectory`, the lines of a round's tool work so far.
+
+    `ask` must carry ROUND_SYSTEM_PROMPT and SUMMARY_SCHEMA; `where` names the round
+    in the error raised when the model gives no valid answer.
+    """
     head = _message_block(message, count)
     room = PROMPT_BUDGET - count(ROUND_SYSTEM_PROMPT) - count(head) - FEEDBACK_ROOM - LABEL_ROOM
     lines = trajectory
@@ -263,9 +275,9 @@ def _compress_round(
         for number, part in enumerate(parts, 1):
             label = f"（第 {number}/{len(parts)} 段）" if len(parts) > 1 else ""
             prompt = f"{head}<轨迹>{label}\n{part}\n</轨迹>"
-            summaries.append(_ask_until_valid(ask, prompt, _SummaryAnswer, round_uuid).summary)
+            summaries.append(_ask_until_valid(ask, prompt, _SummaryAnswer, where).summary)
         if len(summaries) == 1:
-            return [RoundDigest(round_uuid=round_uuid, summary=summaries[0])]
+            return summaries[0]
         lines = [" ".join(summary.split()) for summary in summaries]
 
 
