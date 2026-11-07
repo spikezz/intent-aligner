@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import doctest
 import json
+import re
 from datetime import UTC, datetime
 
 import pytest
 
 from intent_aligner import segment
-from intent_aligner.llm import LLMError
-from intent_aligner.segment import AnchorError, locate_end, segment_message
+from intent_aligner.llm import Ask, LLMError
+from intent_aligner.segment import (
+    AnchorError,
+    MessageSegments,
+    locate_end,
+    segment_conversation,
+    segment_message,
+)
 from intent_aligner.units import Source, UserMessage
+from intent_aligner.window import Count
+from tests.test_window import DIGESTS, TIMELINE
 
 # The opening of the playground message (c88f10d9) and its hand-cut boundaries 0, 67, 88.
 BODY = (
@@ -119,8 +128,50 @@ def test_bad_json_is_retried() -> None:
     assert segments[0].attempts == 2, segments
 
 
-def test_unlocatable_segment_stops_the_walk() -> None:
-    script = _Script(*[_answer("不存在")] * segment.MAX_ATTEMPTS)
+def test_unlocatable_segment_takes_the_rest_for_review() -> None:
+    script = _Script(_answer("好的。"), *[_answer("不存在")] * segment.MAX_ATTEMPTS)
+    segments = segment_message("", _message("好的。就这样。"), script)
 
-    with pytest.raises(LLMError, match="not located"):
-        segment_message("", _message("好的。"), script)
+    assert [(s.text, s.needs_review) for s in segments] == [("好的。", False), ("就这样。", True)]
+    assert segments[1].intents == [], segments[1]
+
+
+def _whole_rest(prompt: str) -> str:
+    """A model that makes the whole remaining text one segment."""
+    found = re.search(r"<剩余>\n(.*)\n</剩余>", prompt, re.DOTALL)
+    assert found, prompt
+    return _answer(found.group(1))
+
+
+def _run(ask: Ask, done: set[str], count: Count = len) -> list[MessageSegments]:
+    return list(segment_conversation(TIMELINE, DIGESTS, done, ask, count, 2))
+
+
+def test_every_message_not_done_is_segmented() -> None:
+    made = _run(_whole_rest, {"u2"})
+
+    assert sorted(m.uuid for m in made) == ["u1", "u3"], made
+    assert all(len(m.segments) == 1 and not m.segments[0].needs_review for m in made), made
+
+
+def test_a_window_that_does_not_fit_gives_one_review_segment() -> None:
+    made = _run(_whole_rest, set(), count=lambda text: 1_000 * len(text))
+
+    assert {(m.uuid, len(m.segments), m.segments[0].needs_review) for m in made} == {
+        ("u1", 1, True),
+        ("u2", 1, True),
+        ("u3", 1, True),
+    }, made
+
+
+def test_a_backend_failure_keeps_the_other_messages() -> None:
+    def ask(prompt: str) -> str:
+        if "<剩余>\n第二条" in prompt:
+            raise LLMError("backend down")
+        return _whole_rest(prompt)
+
+    made: list[MessageSegments] = []
+    with pytest.raises(LLMError, match="1 of 3 messages failed"):
+        made.extend(segment_conversation(TIMELINE, DIGESTS, set(), ask, len, 2))
+
+    assert sorted(m.uuid for m in made) == ["u1", "u3"], made

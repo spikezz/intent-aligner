@@ -8,16 +8,22 @@ segment always ends where the next begins.
 The prompt also carries the window before the message (intent_aligner.window),
 so the digests of its conversation must exist first (intent_aligner.compress).
 
-Usage: python -m intent_aligner.segment MERGED.jsonl --uuid UUID
-           --digests DIGESTS.jsonl
-           --backend hive --model deployment/pc-qwen38-np6 --out SEGMENTS.json
+A segment the model cannot place, or a message whose window does not fit, becomes
+one `needs_review` segment running to the end of the body, so the segments of every
+message still tile it.
+
+Usage: python -m intent_aligner.segment MERGED.jsonl --digests DIGESTS.jsonl
+           --backend codex --model gpt-6.1-sol --out SEGMENTS.jsonl [--workers 8]
+Every user message of the conversation is segmented; the output is appended to as
+messages finish, so a stopped run resumes where it was.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-from collections.abc import Sequence
+import sys
+from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -28,6 +34,7 @@ from intent_aligner.window import (
     PROMPT_BUDGET,
     Count,
     Digests,
+    WindowError,
     load_digests,
     qwen_tokens,
     window_text,
@@ -83,6 +90,16 @@ class Segment(BaseModel):
     text: str
     intents: list[str]
     attempts: int
+    needs_review: bool = False
+
+
+class MessageSegments(BaseModel):
+    """One line of the segments file: a user message and the segments that tile its body."""
+
+    model_config = ConfigDict(frozen=True)
+
+    uuid: str
+    segments: list[Segment]
 
 
 class AnchorError(ValueError):
@@ -158,8 +175,8 @@ def build_prompt(window: str, message: UserMessage, start: int, feedback: str) -
 def segment_message(window: str, message: UserMessage, ask: Ask) -> list[Segment]:
     """Walk the pointer through the body; `ask` sends one prompt and returns the reply text.
 
-    Raises LLMError when a segment is still not located after MAX_ATTEMPTS calls,
-    because the pointer cannot move past it.
+    A segment still not located after MAX_ATTEMPTS calls takes the rest of the body
+    as one `needs_review` segment, because the pointer cannot move past it.
     """
     segments: list[Segment] = []
     start = 0
@@ -193,9 +210,23 @@ def _next_segment(window: str, message: UserMessage, start: int, ask: Ask) -> Se
             intents=answer.intents,
             attempts=attempt,
         )
-    raise LLMError(
-        f"Segment at char {start} of message {message.source.uuid} was not located in "
-        f"{MAX_ATTEMPTS} attempts; last feedback: {feedback}"
+    print(
+        f"needs_review: segment at char {start} of message {message.source.uuid} was not "
+        f"located in {MAX_ATTEMPTS} attempts; last feedback: {feedback}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return _review_segment(message, start, MAX_ATTEMPTS)
+
+
+def _review_segment(message: UserMessage, start: int, attempts: int) -> Segment:
+    return Segment(
+        start=start,
+        end=len(message.body),
+        text=message.body[start:],
+        intents=[],
+        attempts=attempts,
+        needs_review=True,
     )
 
 
@@ -207,24 +238,77 @@ def message_window(items: Sequence[Item], index: int, digests: Digests, count: C
     return window_text(items, index, digests, PROMPT_BUDGET - rest - FEEDBACK_ROOM, count)
 
 
-def find_index(items: Sequence[Item], uuid: str) -> int:
-    """Position of the user message with this record uuid."""
-    for index, item in enumerate(items):
-        if isinstance(item, UserMessage) and item.source.uuid == uuid:
-            return index
-    raise ValueError(f"No user message {uuid}; uuids are in corpus/units/*.jsonl.")
+def segment_conversation(
+    items: Sequence[Item],
+    digests: Digests,
+    done: set[str],
+    ask: Ask,
+    count: Count,
+    workers: int,
+) -> Iterator[MessageSegments]:
+    """Yield the segments of every user message whose uuid is not in `done`, as each finishes.
+
+    A backend failure does not stop the other messages, because a long run must keep
+    what it can; LLMError is raised after the last one if any failed.
+    """
+    jobs = {
+        index: item
+        for index, item in enumerate(items)
+        if isinstance(item, UserMessage) and item.source.uuid not in done
+    }
+    failures: list[LLMError] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_segment_at, items, index, message, digests, ask, count)
+            for index, message in jobs.items()
+        ]
+        for future in as_completed(futures):
+            try:
+                yield future.result()
+            except LLMError as error:
+                failures.append(error)
+                print(error, file=sys.stderr, flush=True)
+    if failures:
+        raise LLMError(
+            f"{len(failures)} of {len(jobs)} messages failed, the rest are written; rerun the "
+            f"same command to retry only those. First failure: {failures[0]}"
+        )
+
+
+def _segment_at(
+    items: Sequence[Item],
+    index: int,
+    message: UserMessage,
+    digests: Digests,
+    ask: Ask,
+    count: Count,
+) -> MessageSegments:
+    try:
+        window = message_window(items, index, digests, count)
+    except WindowError as error:
+        print(f"needs_review: {error}", file=sys.stderr, flush=True)
+        segments = [_review_segment(message, 0, 0)]
+    else:
+        segments = segment_message(window, message, ask)
+    return MessageSegments(uuid=message.source.uuid, segments=segments)
+
+
+def load_done(path: Path) -> set[str]:
+    """The uuids of the messages already in a segments file."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return {MessageSegments.model_validate_json(line).uuid for line in lines}
 
 
 def main() -> None:
-    """CLI entry point: segment one message, write the segments as JSON and print them."""
-    parser = argparse.ArgumentParser(description="Segment one user message with an LLM.")
+    """CLI entry point: segment every user message of one conversation, appending to --out."""
+    parser = argparse.ArgumentParser(description="Segment user messages with an LLM.")
     parser.add_argument("merged", type=Path)
-    parser.add_argument("--uuid", required=True)
     parser.add_argument("--digests", type=Path, required=True)
     parser.add_argument("--backend", choices=["claude", "codex", "hive"], required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], default="xhigh")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--workers", type=int, default=8, help="np8 serves 8 slots")
     parser.add_argument(
         "--stream",
         action=argparse.BooleanOptionalAction,
@@ -234,17 +318,16 @@ def main() -> None:
     args = parser.parse_args()
 
     items = list(conversation_units(args.merged))
-    index = find_index(items, args.uuid)
-    message = items[index]
-    assert isinstance(message, UserMessage)
-    window = message_window(items, index, load_digests(args.digests), qwen_tokens)
+    done = load_done(args.out) if args.out.exists() else set()
     ask = asker(args.backend, args.model, args.effort, SYSTEM_PROMPT, SCHEMA, args.stream)
-    segments = segment_message(window, message, ask)
-    args.out.write_text(
-        json.dumps([s.model_dump() for s in segments], ensure_ascii=False, indent=2) + "\n"
+    results = segment_conversation(
+        items, load_digests(args.digests), done, ask, qwen_tokens, args.workers
     )
-    for s in segments:
-        print(f"[{s.start}, {s.end}) attempts={s.attempts} {s.intents}\n  {s.text!r}")
+    with args.out.open("a", encoding="utf-8") as out:
+        for result in results:
+            out.write(result.model_dump_json() + "\n")
+            out.flush()
+            print(f"{result.uuid}: {len(result.segments)} segments", flush=True)
 
 
 if __name__ == "__main__":
