@@ -1,10 +1,11 @@
 """Compress the tool work of a conversation in two levels.
 
-Level 1 reads each tool call and its result: the call becomes what it is for and what
-it acts on, the result one sentence per chunk, read against the call's intent and full
-text. A call
-and its result are one job; jobs read nothing of the conversation around them and run
-in parallel.
+Level 1 reads each tool call and its result: the call becomes its intents and what it
+acts on, the result one sentence per chunk, read against the call's intents and full
+text. The call's intents, each with evidence in the call text, are also the intents
+the main loop records for the call, so it does not ask for them again. A call and its
+result are one job; jobs read nothing of the conversation around them and run in
+parallel.
 
 Level 2 reads the user message that opened a round and the level-1 trajectory of the
 round (intents, targets and results, in order) and writes one passage. That passage is all a window (intent_aligner.window) shows
@@ -26,8 +27,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, model_validator
 
+from intent_aligner.intent import INTENT_SCHEMA, Intent, stray_evidence
 from intent_aligner.llm import Ask, LLMError, asker
 from intent_aligner.units import (
     Item,
@@ -66,7 +68,11 @@ CALL_SYSTEM_PROMPT = """\
 你在提炼 AI 助手一次工具调用的意图，让后面读对话的人不看原文也知道这次调用是做什么的。<调用> 是这次调用的完整原文。
 
 回答两项：
-- intent：这次调用想达成什么，一句话。只写目的，不写具体怎么做。
+- intents：这次调用想达成什么。只写目的，不写具体怎么做。一次调用通常只有一个目的；同时做了几件目的不同的事时（比如一条命令既建目录又读文档），每个目的各写一项。每项回答四项：
+  - text：目的，一句话。
+  - evidence：这个目的在 <调用> 原文里的依据，原样摘录。可以用 … 省略中间的部分，但被 … 分开的每个片段都必须原样出现在 <调用> 里，并且按原文的先后顺序排列。
+  - explicit：调用里写明了这个目的就是 true，比如 Bash 调用的 description 字段、代码里说明用途的注释；目的是从命令、路径和参数推断出来的，就是 false。
+  - note：explicit 为 false 时写推断依据：从调用里的什么推断出这个目的。explicit 为 true 时写空字符串。
 - targets：这次调用针对的具体对象：路径、文件名、命令、关键参数和数值。
 """
 
@@ -84,8 +90,11 @@ ROUND_SYSTEM_PROMPT = """\
 
 CALL_SCHEMA = {
     "type": "object",
-    "properties": {"intent": {"type": "string"}, "targets": {"type": "string"}},
-    "required": ["intent", "targets"],
+    "properties": {
+        "intents": {"type": "array", "items": INTENT_SCHEMA, "minItems": 1},
+        "targets": {"type": "string"},
+    },
+    "required": ["intents", "targets"],
     "additionalProperties": False,
 }
 
@@ -98,10 +107,23 @@ SUMMARY_SCHEMA = {
 
 
 class _CallAnswer(BaseModel):
+    """Validated with the rendered call as context, which every evidence must quote."""
+
     model_config = ConfigDict(frozen=True)
 
-    intent: str
+    intents: list[Intent] = Field(min_length=1)
     targets: str
+
+    @model_validator(mode="after")
+    def _evidence_quotes_the_call(self, info: ValidationInfo) -> _CallAnswer:
+        assert isinstance(info.context, str), "validate with the call text as context"
+        strays = stray_evidence(self.intents, info.context)
+        if strays:
+            raise ValueError(
+                f"这些 evidence 不是 <调用> 原文的摘录：{strays!r}。evidence 被 … 分开的每个片段"
+                "都必须原样出现在 <调用> 里，并且按原文的先后顺序排列。"
+            )
+        return self
 
 
 class _SummaryAnswer(BaseModel):
@@ -203,14 +225,14 @@ def _compress_call(item: ToolCall, ask: Ask, count: Count) -> CallDigest:
             f"Tool call {item.tool_use_id} needs {count(prompt):,} tokens but the prompt budget "
             f"leaves {room:,}; the largest call in the corpus was 6,116, so check its input."
         )
-    answer = _ask_until_valid(ask, prompt, _CallAnswer, item.tool_use_id)
-    return CallDigest(tool_use_id=item.tool_use_id, intent=answer.intent, targets=answer.targets)
+    answer = _ask_until_valid(ask, prompt, _CallAnswer, item.tool_use_id, context=item.text)
+    return CallDigest(tool_use_id=item.tool_use_id, intents=answer.intents, targets=answer.targets)
 
 
 def _compress_result(
     item: Observation, call: ToolCall, digest: CallDigest, ask: Ask, count: Count
 ) -> ResultDigest:
-    head = f"<调用>\n意图：{digest.intent}\n原文：\n{call.text}\n</调用>\n\n"
+    head = f"<调用>\n意图：{digest.purpose}\n原文：\n{call.text}\n</调用>\n\n"
     room = PROMPT_BUDGET - count(RESULT_SYSTEM_PROMPT) - count(head) - FEEDBACK_ROOM - LABEL_ROOM
     if room < MIN_RESULT_ROOM:
         raise LLMError(
@@ -238,7 +260,7 @@ def _trajectories(
         elif isinstance(item, ToolCall):
             digest = digests.calls[item.tool_use_id]
             outcome = _outcome(item.tool_use_id, digests, rejections)
-            line = f"{item.name} 意图：{digest.intent} 对象：{digest.targets} 结果：{outcome}"
+            line = f"{item.name} 意图：{digest.purpose} 对象：{digest.targets} 结果：{outcome}"
             trajectories.setdefault(round_uuid, []).append(" ".join(line.split()))
     return trajectories
 
@@ -330,15 +352,15 @@ def _longest_prefix(line: str, room: int, count: Count) -> int:
 
 
 def _ask_until_valid[Answer: BaseModel](
-    ask: Ask, prompt: str, schema: type[Answer], tool_use_id: str
+    ask: Ask, prompt: str, schema: type[Answer], tool_use_id: str, context: str | None = None
 ) -> Answer:
     feedback = ""
     for _ in range(MAX_ATTEMPTS):
         reply = ask(prompt + feedback)
         try:
-            return schema.model_validate_json(reply)
+            return schema.model_validate_json(reply, context=context)
         except ValidationError as error:
-            feedback = f"\n\n你上一次的回答不是要求的 JSON，请重新回答：{error}"
+            feedback = f"\n\n你上一次的回答不符合要求，请重新回答：{error}"
     raise LLMError(f"No valid digest for {tool_use_id} in {MAX_ATTEMPTS} attempts: {feedback}")
 
 

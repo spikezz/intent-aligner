@@ -23,19 +23,16 @@ from intent_aligner.segment import Segment
 from intent_aligner.units import AIText, Item, UserSignal
 from intent_aligner.window import (
     PROMPT_BUDGET,
-    CallDigest,
     Count,
     Digests,
     ResultDigest,
     ToolCompression,
     render_round_so_far,
 )
-from tests.test_window import DIGESTS, TIMELINE, _call, _result, _source, _user
+from tests.test_window import DIGESTS, TIMELINE, _call, _call_digest, _result, _source, _user
 
 FULL = Digests(
-    calls={
-        c: CallDigest(tool_use_id=c, intent=f"意图{c}", targets=f"对象{c}") for c in ("c1", "c2")
-    },
+    calls={c: _call_digest(c, f"意图{c}", f"对象{c}") for c in ("c1", "c2")},
     results={c: ResultDigest(tool_use_id=c, summaries=[f"结果{c}"]) for c in ("c1", "c2")},
     rounds=DIGESTS.rounds,
 )
@@ -271,10 +268,7 @@ LONG: list[Item] = [_user("u1", "做一件事"), AIText(source=_source("a1"), te
 for _n in range(PAIRS):
     LONG += [_call(f"c{_n}"), _result(f"c{_n}")]
 LONG_DIGESTS = Digests(
-    calls={
-        f"c{n}": CallDigest(tool_use_id=f"c{n}", intent=f"意图{n}", targets="t")
-        for n in range(PAIRS)
-    },
+    calls={f"c{n}": _call_digest(f"c{n}", f"意图{n}") for n in range(PAIRS)},
     results={
         f"c{n}": ResultDigest(tool_use_id=f"c{n}", summaries=[f"结果{n}"]) for n in range(PAIRS)
     },

@@ -15,6 +15,7 @@ import attrs
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from tokenizers import Tokenizer
 
+from intent_aligner.intent import Intent
 from intent_aligner.units import AIText, Item, Observation, ToolCall, UserMessage, UserSignal
 
 # hive-frame qwen38-np8 gives each slot 18,944 tokens; the rest of the slot is left
@@ -30,14 +31,23 @@ Count = Callable[[str], int]
 
 
 class CallDigest(BaseModel):
-    """A tool call compressed to what it is for and the concrete things it acts on."""
+    """A tool call compressed to what it is for and the concrete things it acts on.
+
+    `intents` are the call's intents for the main loop as well, so each carries its
+    evidence in the rendered call text.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     kind: Literal["call"] = "call"
     tool_use_id: str
-    intent: str
+    intents: list[Intent] = Field(min_length=1)
     targets: str
+
+    @property
+    def purpose(self) -> str:
+        """The intents as one line, for windows and trajectories."""
+        return "；".join(i.text for i in self.intents)
 
 
 class ResultDigest(BaseModel):
@@ -173,7 +183,7 @@ def round_entry(item: Item, digests: Digests) -> str:
     """One item of the current round: a tool call or result as its level-1 digest, the rest verbatim."""
     if isinstance(item, ToolCall):
         call = digests.calls[item.tool_use_id]
-        return f"【AI 的工具调用】\n{item.name} 意图：{call.intent} 对象：{call.targets}"
+        return f"【AI 的工具调用】\n{item.name} 意图：{call.purpose} 对象：{call.targets}"
     if isinstance(item, Observation) and item.tool_use_id is not None:
         return f"【工具结果】\n{' '.join(digests.results[item.tool_use_id].summaries)}"
     return _plain_entry(item)

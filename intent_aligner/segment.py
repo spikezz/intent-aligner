@@ -29,8 +29,9 @@ from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError
 
+from intent_aligner.intent import INTENT_SCHEMA, Intent, stray_evidence
 from intent_aligner.llm import Ask, LLMError, asker
 from intent_aligner.units import Item, UserMessage, conversation_units
 from intent_aligner.window import (
@@ -70,42 +71,12 @@ FROM_START_RULE = (
 SCHEMA = {
     "type": "object",
     "properties": {
-        "intents": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "minLength": 1},
-                    "evidence": {"type": "string", "minLength": 1},
-                    "explicit": {"type": "boolean"},
-                    "note": {"type": "string"},
-                },
-                "required": ["text", "evidence", "explicit", "note"],
-                "additionalProperties": False,
-            },
-        },
+        "intents": {"type": "array", "items": INTENT_SCHEMA},
         "segment_end": {"type": "string", "minLength": 1},
     },
     "required": ["intents", "segment_end"],
     "additionalProperties": False,
 }
-
-
-class Intent(BaseModel):
-    """One intent of a segment; `note` gives the grounds whenever `explicit` is false."""
-
-    model_config = ConfigDict(frozen=True)
-
-    text: str = Field(min_length=1)
-    evidence: str = Field(min_length=1)
-    explicit: bool
-    note: str
-
-    @model_validator(mode="after")
-    def _inferred_has_grounds(self) -> Intent:
-        if not self.explicit and not self.note.strip():
-            raise ValueError(f"意图 {self.text!r} 的 explicit 是 false，note 必须写推断依据")
-        return self
 
 
 class SegmentAnswer(BaseModel):
@@ -188,24 +159,6 @@ def locate_end(body: str, start: int, anchor: str, *, from_start: bool) -> int:
     return end
 
 
-def is_excerpt(evidence: str, text: str) -> bool:
-    """Whether every `…`-separated piece of `evidence` occurs in `text`, in order.
-
-    Examples:
-        >>> is_excerpt("调查清楚…使用方法", "调查清楚这个项目的使用方法，")
-        True
-        >>> is_excerpt("使用方法…调查清楚", "调查清楚这个项目的使用方法，")
-        False
-    """
-    position = 0
-    for piece in (p.strip() for p in evidence.split("…")):
-        found = text.find(piece, position)
-        if found < 0:
-            return False
-        position = found + len(piece)
-    return True
-
-
 def _around(rest: str, i: int, length: int) -> str:
     left = max(0, i - CONTEXT_CHARS)
     return (
@@ -259,7 +212,7 @@ def _next_segment(window: str, message: UserMessage, start: int, ask: Ask) -> Se
             feedback = f"你给的 segment_end 是 {answer.segment_end!r}。{error}\n{rule}"
             continue
         text = message.body[start:end]
-        strays = [i.evidence for i in answer.intents if not is_excerpt(i.evidence, text)]
+        strays = stray_evidence(answer.intents, text)
         if strays:
             feedback = (
                 f"这些 evidence 不是这一段的原文摘录：{strays!r}。这一段按你给的 segment_end "

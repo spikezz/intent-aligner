@@ -6,8 +6,16 @@ from datetime import UTC, datetime
 
 import pytest
 
+from intent_aligner.intent import Intent
 from intent_aligner.units import AIText, Item, Observation, Source, ToolCall, UserMessage
-from intent_aligner.window import Digests, RoundDigest, WindowError, render_items, window_text
+from intent_aligner.window import (
+    CallDigest,
+    Digests,
+    RoundDigest,
+    WindowError,
+    render_items,
+    window_text,
+)
 
 
 def _source(uuid: str) -> Source:
@@ -25,6 +33,14 @@ def _call(tool_use_id: str) -> ToolCall:
         name="Bash",
         input={"command": "ls"},
         text="Bash:\ncommand: ls",
+    )
+
+
+def _call_digest(tool_use_id: str, intent: str, targets: str = "t") -> CallDigest:
+    return CallDigest(
+        tool_use_id=tool_use_id,
+        intents=[Intent(text=intent, evidence="Bash", explicit=False, note="从命令推断")],
+        targets=targets,
     )
 
 

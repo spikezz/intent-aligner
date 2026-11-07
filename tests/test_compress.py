@@ -14,7 +14,7 @@ from intent_aligner.llm import Ask, LLMError
 from intent_aligner.units import Item, UserSignal
 from intent_aligner.window import CallDigest, Digest, Digests, ResultDigest, RoundDigest
 from tests.test_segment import _Script
-from tests.test_window import TIMELINE, _call, _result, _user
+from tests.test_window import TIMELINE, _call, _call_digest, _result, _user
 
 
 def test_docstring_examples_hold() -> None:
@@ -23,8 +23,15 @@ def test_docstring_examples_hold() -> None:
     assert result.failed == 0 and result.attempted > 0, result
 
 
+def _intents_answer(prompt: str, text: str, targets: str) -> str:
+    """One inferred intent quoting the first line of the call, which is always in it."""
+    first_line = prompt.split("\n")[1]
+    intent = {"text": text, "evidence": first_line, "explicit": False, "note": "从命令推断"}
+    return json.dumps({"intents": [intent], "targets": targets}, ensure_ascii=False)
+
+
 def _call_answer(prompt: str) -> str:
-    return json.dumps({"intent": "看目录", "targets": "ls"}, ensure_ascii=False)
+    return _intents_answer(prompt, "看目录", "ls")
 
 
 def _result_answer(prompt: str) -> str:
@@ -65,8 +72,32 @@ def test_level_one_then_one_digest_per_round() -> None:
     assert made[-1].kind == "round", made
 
 
+def test_evidence_outside_the_call_is_retried() -> None:
+    stray = {"text": "看目录", "evidence": "rm -rf", "explicit": True, "note": ""}
+    calls = _Script(
+        json.dumps({"intents": [stray], "targets": "ls"}, ensure_ascii=False),
+        _call_answer("<调用>\nBash:"),
+    )
+    made = _run([_call("c1")], Digests(), calls, _result_answer)
+
+    assert "不是 <调用> 原文的摘录" in calls.prompts[1], calls.prompts[1]
+    assert [d.kind for d in made] == ["call", "round"], made
+
+
+def test_a_call_with_two_purposes_keeps_both() -> None:
+    both = [
+        {"text": "建分析目录", "evidence": "Bash", "explicit": False, "note": "mkdir"},
+        {"text": "读文档", "evidence": "ls", "explicit": False, "note": "cat"},
+    ]
+    answer = json.dumps({"intents": both, "targets": "ls"}, ensure_ascii=False)
+    made = _run([_call("c1")], Digests(), lambda _: answer, _result_answer)
+
+    call = next(d for d in made if isinstance(d, CallDigest))
+    assert call.purpose == "建分析目录；读文档", call
+
+
 def test_a_call_is_read_alone() -> None:
-    calls = _Script(*[_call_answer("")] * 2)
+    calls = _Script(*[_call_answer("<调用>\nBash:")] * 2)
     _run(TIMELINE, Digests(), calls, _result_answer)
 
     assert calls.prompts[0] == "<调用>\nBash:\ncommand: ls\n</调用>", calls.prompts[0]
@@ -109,9 +140,8 @@ def test_a_rejected_call_enters_the_trajectory_as_rejected() -> None:
 def test_a_long_trajectory_is_summarized_again() -> None:
     line = "意" * 5_000
     many: list[Item] = [_user("u1", "做"), _call("c1"), _call("c2")]
-    call_answer = json.dumps({"intent": line, "targets": "t"}, ensure_ascii=False)
     rounds = _Script(_round_answer(""), _round_answer(""), _round_answer(""))
-    made = _run(many, Digests(), lambda _: call_answer, _result_answer, rounds)
+    made = _run(many, Digests(), lambda p: _intents_answer(p, line, "t"), _result_answer, rounds)
 
     assert sum(d.kind == "round" for d in made) == 1, made
     assert "（第 2/2 段）" in rounds.prompts[1], rounds.prompts[1][:60]
@@ -151,7 +181,7 @@ def test_a_long_result_is_summarized_chunk_by_chunk() -> None:
 
 def test_existing_digests_are_not_redone() -> None:
     done = Digests(
-        calls={"c1": CallDigest(tool_use_id="c1", intent="i", targets="t")},
+        calls={"c1": _call_digest("c1", "i")},
         results={"c1": ResultDigest(tool_use_id="c1", summaries=["s"])},
         rounds={"u1": RoundDigest(round_uuid="u1", summary="r")},
     )
