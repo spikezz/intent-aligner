@@ -3,7 +3,10 @@
 The model never reports offsets: each call shows the whole message split at the
 pointer and asks for the intents of the next segment plus the segment's closing
 text, copied verbatim. Code locates that text in the rest of the message, so one
-segment always ends where the next begins.
+segment always ends where the next begins. Each intent carries its evidence, an
+excerpt code checks against the located segment, and whether the user said it or
+the model inferred it, so the main loop takes user segments' intents from here and
+does not ask call A for them.
 
 The prompt also carries the window before the message (intent_aligner.window),
 so the digests of its conversation must exist first (intent_aligner.compress).
@@ -26,7 +29,7 @@ from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from intent_aligner.llm import Ask, LLMError, asker
 from intent_aligner.units import Item, UserMessage, conversation_units
@@ -51,7 +54,11 @@ SYSTEM_PROMPT = """\
 一段是一串连续的文本，其中表达的意图集合保持不变；意图集合一变，这一段就结束。一个句子可以被切成几段，几句话也可以是一段。本身没有意图的内容（客套话、粘贴进来的材料、日志、表格、图片标记 [Image #N]）归入用到它、说明它或回应它的那一段，不单独成段。
 
 回答两项：
-- intents：这一段里用户的意图，每项一句话。每项要脱离对话也能看懂：用 <此前的对话> 把“这个”“当前任务”“继续干”这类指代换成具体的事。用户要 AI 做的事不同，才算不同的意图；用户告知的情况（理由、背景、条件、自己接下来的状态）并入它支撑的那个意图，不单独列出。一段里只有告知、没有要 AI 做的事时，告知的内容本身就是意图。
+- intents：这一段里用户的意图。用户要 AI 做的事不同，才算不同的意图；用户告知的情况（理由、背景、条件、自己接下来的状态）并入它支撑的那个意图，不单独列出。一段里只有告知、没有要 AI 做的事时，告知的内容本身就是意图。每个意图回答四项：
+  - text：意图，一句话。要脱离对话也能看懂：用 <此前的对话> 把“这个”“当前任务”“继续干”这类指代换成具体的事。
+  - evidence：这个意图在这一段原文里的依据，原样摘录。可以用 … 省略中间的部分，但被 … 分开的每个片段都必须原样出现在这一段里，并且按原文的先后顺序排列。
+  - explicit：用户在这一段里明说了这个意图，就是 true。text 里有这一段原文没有说出、要靠 <此前的对话> 或常识推断的内容，就是 false，比如原文只有“继续”，要继续做什么来自此前的对话。只把“这个”“那里”换成它明确指向的东西，不算推断。
+  - note：explicit 为 false 时写推断依据：推断出了什么，依据的是此前对话里的哪件事。explicit 为 true 时写空字符串。
 - segment_end：从 <剩余> 里原样抄出这一段末尾的几个字符（不含末尾的空格和换行），一个字符都不能改，包括标点和空格。代码会在 <剩余> 里查找它来确定段落结尾，所以它在 <剩余> 里必须只出现一次；不够唯一就往前多抄几个字。
 """
 
@@ -63,7 +70,20 @@ FROM_START_RULE = (
 SCHEMA = {
     "type": "object",
     "properties": {
-        "intents": {"type": "array", "items": {"type": "string"}},
+        "intents": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "minLength": 1},
+                    "evidence": {"type": "string", "minLength": 1},
+                    "explicit": {"type": "boolean"},
+                    "note": {"type": "string"},
+                },
+                "required": ["text", "evidence", "explicit", "note"],
+                "additionalProperties": False,
+            },
+        },
         "segment_end": {"type": "string", "minLength": 1},
     },
     "required": ["intents", "segment_end"],
@@ -71,12 +91,29 @@ SCHEMA = {
 }
 
 
+class Intent(BaseModel):
+    """One intent of a segment; `note` gives the grounds whenever `explicit` is false."""
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str = Field(min_length=1)
+    evidence: str = Field(min_length=1)
+    explicit: bool
+    note: str
+
+    @model_validator(mode="after")
+    def _inferred_has_grounds(self) -> Intent:
+        if not self.explicit and not self.note.strip():
+            raise ValueError(f"意图 {self.text!r} 的 explicit 是 false，note 必须写推断依据")
+        return self
+
+
 class SegmentAnswer(BaseModel):
     """What the model returns for one segment."""
 
     model_config = ConfigDict(frozen=True)
 
-    intents: list[str]
+    intents: list[Intent]
     segment_end: str
 
 
@@ -88,7 +125,7 @@ class Segment(BaseModel):
     start: int
     end: int
     text: str
-    intents: list[str]
+    intents: list[Intent]
     attempts: int
     needs_review: bool = False
 
@@ -151,6 +188,24 @@ def locate_end(body: str, start: int, anchor: str, *, from_start: bool) -> int:
     return end
 
 
+def is_excerpt(evidence: str, text: str) -> bool:
+    """Whether every `…`-separated piece of `evidence` occurs in `text`, in order.
+
+    Examples:
+        >>> is_excerpt("调查清楚…使用方法", "调查清楚这个项目的使用方法，")
+        True
+        >>> is_excerpt("使用方法…调查清楚", "调查清楚这个项目的使用方法，")
+        False
+    """
+    position = 0
+    for piece in (p.strip() for p in evidence.split("…")):
+        found = text.find(piece, position)
+        if found < 0:
+            return False
+        position = found + len(piece)
+    return True
+
+
 def _around(rest: str, i: int, length: int) -> str:
     left = max(0, i - CONTEXT_CHARS)
     return (
@@ -196,20 +251,23 @@ def _next_segment(window: str, message: UserMessage, start: int, ask: Ask) -> Se
             answer = SegmentAnswer.model_validate_json(reply)
             end = locate_end(message.body, start, answer.segment_end, from_start=from_start)
         except ValidationError as error:
-            feedback = f"回答不是要求的 JSON：{error}"
+            feedback = f"回答不符合要求：{error}"
             continue
         except AnchorError as error:
             from_start = from_start or error.ambiguous
             rule = FROM_START_RULE if from_start else ""
             feedback = f"你给的 segment_end 是 {answer.segment_end!r}。{error}\n{rule}"
             continue
-        return Segment(
-            start=start,
-            end=end,
-            text=message.body[start:end],
-            intents=answer.intents,
-            attempts=attempt,
-        )
+        text = message.body[start:end]
+        strays = [i.evidence for i in answer.intents if not is_excerpt(i.evidence, text)]
+        if strays:
+            feedback = (
+                f"这些 evidence 不是这一段的原文摘录：{strays!r}。这一段按你给的 segment_end "
+                f"定位为：{text!r}。evidence 被 … 分开的每个片段都必须原样出现在这一段里，"
+                "并且按原文的先后顺序排列。"
+            )
+            continue
+        return Segment(start=start, end=end, text=text, intents=answer.intents, attempts=attempt)
     print(
         f"needs_review: segment at char {start} of message {message.source.uuid} was not "
         f"located in {MAX_ATTEMPTS} attempts; last feedback: {feedback}",

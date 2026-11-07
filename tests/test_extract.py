@@ -20,7 +20,7 @@ from intent_aligner.extract import (
 )
 from intent_aligner.llm import Ask
 from intent_aligner.segment import Segment
-from intent_aligner.units import AIText, Item
+from intent_aligner.units import AIText, Item, UserSignal
 from intent_aligner.window import (
     PROMPT_BUDGET,
     CallDigest,
@@ -115,6 +115,22 @@ def test_tool_results_take_their_calls_topic_without_call_t() -> None:
     assert len(prompts) == 6, f"{len(prompts)} calls; results must not reach call T"
     results = [a for a in assignments if a.unit.kind == "observation"]
     assert all(a.attempts == 0 for a in results), results
+
+
+def test_a_rejected_call_is_the_users_decision_and_asks_call_t() -> None:
+    rejection = UserSignal(
+        source=_source("rej-c1"),
+        signal="rejection",
+        text="The user doesn't want to proceed with this tool use.",
+        tool_use_id="c1",
+    )
+    prompts: list[str] = []
+    items: list[Item] = [_user("u1", "第一条"), _call("c1"), rejection]
+    assignments = _assignments(items, {"u1": [_segment(0, 3)]}, FULL, _new_then_first(prompts))
+
+    got = [(a.unit.kind, a.attempts) for a in assignments]
+    assert got == [("user_segment", 1), ("tool_call", 1), ("user_signal", 1)], got
+    assert len(prompts) == 3, f"{len(prompts)} calls; the rejection must reach call T"
 
 
 def test_a_new_topic_is_listed_for_the_next_unit() -> None:

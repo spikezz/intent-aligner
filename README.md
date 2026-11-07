@@ -36,7 +36,8 @@ $PY -m intent_aligner.compress corpus/merged/claude-5a1f0c1a.jsonl \
     --backend hive --model deployment/pc-qwen38-np8 \
     --out $OUT/digests.jsonl
 
-# 5. 把对话里的每条用户消息按意图切成连续的段落，每行一条消息。--workers 条消息并行，
+# 5. 把对话里的每条用户消息按意图切成连续的段落，每行一条消息。每个意图附带原文摘录 evidence、
+#    是明说还是推断（explicit）和推断依据 note。--workers 条消息并行，
 #    输出边跑边追加，中断后重跑会从断点继续。第 4 步必须先对整个对话跑完（不加 --until）
 $PY -m intent_aligner.segment corpus/merged/claude-5a1f0c1a.jsonl \
     --digests $OUT/digests.jsonl \

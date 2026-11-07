@@ -91,8 +91,9 @@ class _Script:
         return self.answers.pop(0)
 
 
-def _answer(end: str) -> str:
-    return json.dumps({"intents": ["i"], "segment_end": end}, ensure_ascii=False)
+def _answer(end: str, evidence: str | None = None, *, explicit: bool = True, note: str = "") -> str:
+    intent = {"text": "i", "evidence": evidence or end, "explicit": explicit, "note": note}
+    return json.dumps({"intents": [intent], "segment_end": end}, ensure_ascii=False)
 
 
 def test_segments_tile_the_body() -> None:
@@ -126,6 +127,33 @@ def test_bad_json_is_retried() -> None:
     segments = segment_message("", _message("好的。"), _Script("not json", _answer("好的。")))
 
     assert segments[0].attempts == 2, segments
+
+
+def test_evidence_outside_the_segment_is_retried() -> None:
+    script = _Script(_answer("好的。", evidence="就这样"), _answer("好的。"), _answer("就这样。"))
+    segments = segment_message("", _message("好的。就这样。"), script)
+
+    assert segments[0].attempts == 2, segments[0]
+    assert "不是这一段的原文摘录" in script.prompts[1], script.prompts[1]
+
+
+def test_evidence_may_skip_the_middle_with_an_ellipsis() -> None:
+    script = _Script(_answer("就这样。", evidence="好的…就这样"))
+    segments = segment_message("", _message("好的。就这样。"), script)
+
+    assert segments[0].attempts == 1, segments[0]
+
+
+def test_an_inferred_intent_without_grounds_is_retried() -> None:
+    script = _Script(
+        _answer("继续", explicit=False),
+        _answer("继续", explicit=False, note="此前 AI 在排查 blocked 任务"),
+    )
+    segments = segment_message("", _message("继续"), script)
+
+    assert segments[0].attempts == 2, segments[0]
+    assert segments[0].intents[0].note == "此前 AI 在排查 blocked 任务", segments[0]
+    assert "note 必须写推断依据" in script.prompts[1], script.prompts[1]
 
 
 def test_unlocatable_segment_takes_the_rest_for_review() -> None:
