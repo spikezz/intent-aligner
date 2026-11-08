@@ -26,7 +26,7 @@ A run writes these files under --out:
     tool_compressions.jsonl  one line per compression of a current round's tool records
     topics.yaml            the topic list (format in docs/trajectory-extractor.md)
     topics/<id>.yaml       one store per topic; topics/unassigned.yaml for units without one
-    run.log                new topics, intentless messages and needs_review units
+    run.log                new topics and needs_review units
 
 topics.yaml and the stores are rebuilt from assignments.jsonl, the only record of
 what the models decided, so they always agree with it.

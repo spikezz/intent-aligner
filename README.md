@@ -58,7 +58,7 @@ $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
 
 第 5 步里，模型重试几次仍然定位不到段落结尾，或者连一轮对话都放不进窗口时，剩下的文本成为一段 `needs_review: true`、意图为空的段落，原因打印在标准错误里。
 
-第 6 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（用户意图节点、工具调用的意图聚合节点和段落，暂时还没有边和观测节点）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic、整条没有意图的用户消息和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：一轮太长、模型看到的内容放不下时，还没压缩过的工具操作会压缩成一段话，之前压缩出的段落保持不变，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
+第 6 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（用户意图节点、工具调用的意图聚合节点和段落，暂时还没有边和观测节点）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic 和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：一轮太长、模型看到的内容放不下时，还没压缩过的工具操作会压缩成一段话，之前压缩出的段落保持不变，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
 
 第 1 步完成后，`corpus/index.json` 会列出每个合并后的对话，包括成员 session、记录条数、丢弃的 fork 复制品数量，以及损坏的行。
 
