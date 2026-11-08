@@ -37,9 +37,13 @@ Qwen：
 - topic 归属（只判断 topic 的那次运行，结果已经不在目录里）：299 个单元，296 个归到 T001，3 个归到 T002“记录 Claude Code 因 Opus 5.5 安全护栏拦截消息而返回 API 错误……”。T002 的三个单元都是对话末尾的观测：一条被拦截后合成的 AI 回复和之后的两条观测；sol 把它们归在 T001。没有 `needs_review`，调用 T 调用 162 次，每次第一次回答就通过。
 - 工具记录压缩：3 次，和 sol 相同。
 
-## 提取流程动画
+## 回放
 
-`claude-5a1f0c1a-qwen/animation/extraction-flow.html` 以一次模型端点调用为单位，逐帧回放 Qwen 主循环的提取过程，用浏览器直接打开即可。它由同目录的 `build.py` 根据 `extract/`、`digests.jsonl` 和 `segments.jsonl` 生成，重新生成时在这个目录运行 `python build.py`。提示词、校验规则和重问反馈等由代码确定的内容，由 `fixed.py` 在生成时从 `intent_aligner/` 的源码解析出来，或调用其中的函数渲染出来；代码结构改动后 `fixed.py` 对不上时，生成会报 `CodeChanged` 并指出是哪个函数的哪一处，这时要先改 `fixed.py`。
+每个结果目录都可以用 `intent_aligner.replay` 回放成一个本地 HTML 页面，用法见项目根目录 `README.md` 的“回放一次运行”：
+
+```bash
+$PY -m intent_aligner.replay corpus/results/claude-87eeb4bd-sol --out replay.html
+```
 
 ## 重跑
 

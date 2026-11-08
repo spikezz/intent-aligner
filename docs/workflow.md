@@ -91,6 +91,7 @@ Codex 的工具结果没有错误标记，所以观测的 `is_error` 都是 fals
 - `topics.yaml` 和 `topics/<topic 编号>.yaml`：格式见 `docs/trajectory-extractor.md`。topic 列表从 `assignments.jsonl` 里开启新 topic 的行重建；存储文件由 `assignments.jsonl` 逐行折叠得到，重跑时重放已有的行，得到和中断前相同的文件。topic 无法确定的单元写进未归属文件 `topics/unassigned.yaml`。
 - `tool_compressions.jsonl`：当前这一轮工具记录的每一次压缩，一次一行，记录这一轮从时间线第几项开始、这次压缩的时间线范围和压缩结果。重跑时读回来，不重新压缩。
 - `run.log`：运行日志，见下面“运行日志”一节。
+- `calls.jsonl`：这一步每次模型调用一行，记录调用种类、所属单元、起止时间和对话记录路径，`intent_aligner.replay` 用它回放这次运行。
 
 ## 流程图
 

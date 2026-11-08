@@ -70,6 +70,18 @@ $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
 
 第 4 到 6 步重跑时都从已经写出的结果继续，只补缺少的部分，所以结果齐全时重跑不调用模型。续跑不检查模型是否和之前相同，所以换模型时要换一个目录，否则同一份结果里会混着两个模型的回答。第 6 步发现对话或切分结果和 `assignments.jsonl` 对不上时会报错停止，这时也要换一个 `--out` 目录。要完全重跑，先把这个目录里的 `digests.jsonl`、`segments.jsonl` 和 `extract/` 移走。
 
+第 4、5 步在结果目录下、第 6 步在 `extract/` 下各写一份 `calls.jsonl`，每次模型调用一行：调用的是哪一种（`call`、`segment`、`topic` 等）、为哪个任务调用（`tool:<tool_use_id>`、`round:<轮的 uuid>`、`message:<消息 uuid>`、`unit:<单元序号>`）、开始和结束时间、对话记录的路径，失败时还有错误信息。
+
+### 回放一次运行
+
+```bash
+$PY -m intent_aligner.replay corpus/results/claude-87eeb4bd-sol --out replay.html
+```
+
+`intent_aligner.replay` 读结果目录的 `run.sh`，找到对话、模型和三步写出的文件，再把这次运行的每一次模型调用连同 `llm-home/` 里的原始请求和回答写成一个自包含的 HTML 页面，用浏览器直接打开。页面按时间顺序逐帧回放每次调用：提示词（重问时附上的反馈会标出来）、回答、推理、system、schema 和用量，这次调用是第几次尝试、是被接受还是被驳回，以及任务最终写下的记录；第 6 步的调用还能看到提示词 header 里 topic 当时的图谱。左边的图按轮次画出全部任务和它们的先后关系，随播放显示每个任务已经调用过、正在调用还是还没轮到，不需要调用模型的任务（例如工具结果）也画出来。页面顶部的表按阶段统计真实的调用次数、重试、驳回和失败。
+
+有 `calls.jsonl` 的运行直接按它找到每次调用。更早的运行没有这个文件，回放会在 `llm-home/` 里按模型、system prompt 和提示词里引用的对话原文把调用对应到任务上，并且只取这次运行最后一次写结果之前、中间没有超过 30 分钟停顿的那一段时间，因为同一个对话更早的运行也会留下一模一样的提示词。这段时间里同一个模型的调用如果对不上任何任务（发出它们的代码后来改过），页面会把这些记录列出来，不会猜着填进回放。另一个结果目录跑过同一个对话和同一个模型时，必须用 `--since` 和 `--until` 给出这次运行的时间范围。
+
 ### 调用 LLM
 
 轨迹提取器可以通过 Claude Code、Codex 或 pi 的命令行调用模型，也可以直接通过 HTTP 调用 Hive Frame 网关上的本地模型。`compress`、`segment` 和 `extract` 的 `--backend` 只接受 `claude`、`codex` 和 `hive`，`pi` 只能在下面的 `intent_aligner.llm` 和手动测试工具里使用。每次调用都是独立的一问一答，prompt 从标准输入读入，回复打印到标准输出，对话记录的路径打印到标准错误。

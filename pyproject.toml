@@ -31,7 +31,7 @@ build-backend = "setuptools.build_meta"
 packages = ["intent_aligner"]
 
 [tool.setuptools.package-data]
-intent_aligner = ["py.typed"]
+intent_aligner = ["py.typed", "replay.html"]
 
 # ================================================================
 # Ruff
