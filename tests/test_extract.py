@@ -99,6 +99,10 @@ def _one_aggregate(prompt: str) -> str:
     return json.dumps({"answers": [answer for _ in _unit_intents(prompt)]})
 
 
+def _no_repeats(prompt: str) -> str:
+    return json.dumps({"answers": [{"match": "NEW"} for _ in _unit_intents(prompt)]})
+
+
 def _no_signal_intents(prompt: str) -> str:
     return json.dumps({"intents": []})
 
@@ -114,9 +118,17 @@ def _assignments(
     signal: Ask = _no_signal_intents,
     registry: Ask = _all_new,
     aggregate: Ask = _one_aggregate,
+    tool_intent: Ask = _no_repeats,
     stores: Stores | None = None,
 ) -> list[Assignment]:
-    asks = Asks(topic=ask, signal=signal, registry=registry, aggregate=aggregate, round=_no_round)
+    asks = Asks(
+        topic=ask,
+        signal=signal,
+        registry=registry,
+        aggregate=aggregate,
+        tool_intent=tool_intent,
+        round=_no_round,
+    )
     stores = stores or Stores(merged_file="merged.jsonl", items=items)
     events = extract_units(items, segments, digests, done or [], [], asks, count, stores)
     return [event for event in events if isinstance(event, Assignment)]
@@ -316,9 +328,9 @@ def test_topic_files_follow_the_store_format(tmp_path: Path) -> None:
     assert spans == [
         ("S001", "user_text", (0, 2), []),
         ("S002", "user_text", (2, 3), []),
-        ("S003", "tool_calls", None, ["G001"]),
+        ("S003", "tool_calls", None, ["L001"]),
         ("S004", "user_text", (0, 3), []),
-        ("S005", "tool_calls", None, ["G001"]),
+        ("S005", "tool_calls", None, ["L002"]),
         ("S006", "user_text", (0, 3), []),
     ], spans
     assert not (tmp_path / "topics" / UNASSIGNED_FILE).exists(), "nothing went unassigned"
@@ -440,8 +452,10 @@ def test_call_g_files_tool_intents_and_only_aggregates_enter_the_graph() -> None
     assert _header(prompts[1])["candidates"] == ["G001"], prompts[1]
     assert list(stores.topic_nodes("T001")) == ["G001"], stores.topic_nodes("T001")
     span = next(s for s in stores.stores["T001"].spans if s.kind == "tool_calls")
-    got = [(i.id, i.text, i.note) for i in span.intents]
-    assert got == [("G001", "操作1", "推断"), ("G001", "操作2", "推断")], got
+    got = [(i.id, i.note) for i in span.intents]
+    assert got == [("L001", "推断"), ("L002", "推断")], got
+    mapping = stores.stores["T001"].meta.tool_intents
+    assert mapping == {"G001": {"L001": "操作1", "L002": "操作2", "L003": "意图c2"}}, mapping
 
 
 def test_new_aggregates_with_one_title_are_one_and_others_are_separate() -> None:
@@ -457,8 +471,8 @@ def test_new_aggregates_with_one_title_are_one_and_others_are_separate() -> None
     )
     by_id = {a.unit.uuid: a for a in records}
 
-    assert [(i.id, i.label) for i in by_id["c1"].intents] == [("G001", "甲"), ("G001", None)]
-    assert [(i.id, i.label) for i in by_id["c2"].intents] == [("G002", "乙")]
+    assert [(i.aggregate, i.label) for i in by_id["c1"].intents] == [("G001", "甲"), ("G001", None)]
+    assert [(i.aggregate, i.label) for i in by_id["c2"].intents] == [("G002", "乙")]
 
 
 def test_call_g_rejects_an_unknown_aggregate_and_an_empty_title() -> None:
@@ -490,6 +504,56 @@ def test_call_g_rejects_an_unknown_aggregate_and_an_empty_title() -> None:
     assert "'G999'" in prompts[1] and "title 不能为空" in prompts[2], prompts
     assert (got.topic, got.needs_review, got.intents) == ("T001", True, []), got
     assert "call G" in (got.review_reason or ""), got
+
+
+def test_a_repeated_tool_intent_keeps_its_id_and_the_mapping_stays_one_entry() -> None:
+    prompts: list[str] = []
+
+    def tool_intent(prompt: str) -> str:
+        prompts.append(prompt)
+        return json.dumps({"answers": [{"match": "L001"}]})
+
+    items: list[Item] = _same_intent_calls([])
+    stores = Stores(merged_file="merged.jsonl", items=items)
+    _assignments(
+        items,
+        {"u1": [_segment(0, 3)]},
+        FULL,
+        _new_then_first([]),
+        tool_intent=tool_intent,
+        stores=stores,
+    )
+
+    assert len(prompts) == 1, "the call that opened the aggregate has nothing to match"
+    assert _header(prompts[0])["candidates"] == ["L001"], prompts[0]
+    assert "L001：意图c1" in prompts[0], prompts[0]
+    mapping = stores.stores["T001"].meta.tool_intents
+    assert mapping == {"G001": {"L001": "意图c1"}}, mapping
+    span = stores.stores["T001"].spans[-1]
+    assert [i.id for i in span.intents] == ["L001", "L001"], span.intents
+
+
+def test_call_l_answers_that_never_fit_leave_the_call_for_review() -> None:
+    prompts: list[str] = []
+
+    def tool_intent(prompt: str) -> str:
+        prompts.append(prompt)
+        return json.dumps({"answers": [{"match": "L999"}]})
+
+    items: list[Item] = [_user("u1", "第一条"), _call("c1"), _result("c1"), _call("c2")]
+    stores = Stores(merged_file="merged.jsonl", items=items)
+    got = _assignments(
+        items,
+        {"u1": [_segment(0, 3)]},
+        FULL,
+        _new_then_first([]),
+        tool_intent=tool_intent,
+        stores=stores,
+    )[-1]
+
+    assert len(prompts) == CALL_ATTEMPTS and "'L999'" in prompts[1], prompts
+    assert (got.topic, got.needs_review, got.intents) == ("T001", True, []), got
+    assert "call L" in (got.review_reason or ""), got
 
 
 def _same_intent_calls(between: list[Item]) -> list[Item]:
@@ -541,7 +605,7 @@ def test_a_merged_span_carries_both_calls_text() -> None:
     span = stores.stores["T001"].spans[-1]
 
     assert span.text == "Bash:\ncommand: ls\n\nBash:\ncommand: ls", span.text
-    assert [i.text for i in span.intents] == ["意图c1", "意图c2"], span.intents
+    assert [i.id for i in span.intents] == ["L001", "L002"], span.intents
 
 
 def test_segments_that_leave_a_gap_fail_the_coverage_check() -> None:
@@ -629,8 +693,8 @@ def test_a_rerun_rebuilds_the_same_stores() -> None:
     _assignments(TIMELINE, SEGMENTS, FULL, _new_then_first([]), done=done, stores=resumed)
 
     assert resumed.stores == whole.stores
-    got = (resumed.intents, resumed.aggregates, resumed.spans)
-    assert got == (whole.intents, whole.aggregates, whole.spans), got
+    got = (resumed.intents, resumed.aggregates, resumed.tool_intents, resumed.spans)
+    assert got == (whole.intents, whole.aggregates, whole.tool_intents, whole.spans), got
 
 
 PAIRS = 20
@@ -663,6 +727,7 @@ def _long_run(
         signal=_no_signal_intents,
         registry=_all_new,
         aggregate=_one_aggregate,
+        tool_intent=_no_repeats,
         round=ask_round,
     )
     stores = Stores(merged_file="merged.jsonl", items=LONG)

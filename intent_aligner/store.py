@@ -39,8 +39,8 @@ class IntentNode(BaseModel):
 class AggregateNode(BaseModel):
     """What a run of tool calls is doing, at the level of what the user says.
 
-    Tool-call intents are too low-level for the graph; they stay in the spans, each
-    naming its aggregate.
+    Tool-call intents are too low-level for the graph; `Meta.tool_intents` lists them
+    under their aggregate.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -94,12 +94,17 @@ class Graph(BaseModel):
 
 
 class Meta(BaseModel):
-    """`topic` is None for the unassigned file."""
+    """`topic` is None for the unassigned file.
+
+    `tool_intents` maps aggregate id -> tool-call intent id -> its text. It sits outside
+    `graph` because the graph goes into every call's header and these do not.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     topic: str | None
     graph: Graph = Field(default_factory=Graph)
+    tool_intents: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
 class SpanSource(BaseModel):
@@ -120,16 +125,11 @@ class SpanSource(BaseModel):
 
 
 class SpanIntent(BaseModel):
-    """How intent `id` shows up in one span; `note` gives the grounds of an inferred one.
-
-    In a tool call span `id` is an aggregate, which may recur, and `text` is the
-    tool-call intent itself, which has no node of its own.
-    """
+    """How intent `id` shows up in one span; `note` gives the grounds of an inferred one."""
 
     model_config = ConfigDict(frozen=True)
 
     id: str
-    text: str | None = None
     evidence: str = Field(min_length=1)
     explicit: bool
     note: str | None = None
@@ -169,6 +169,8 @@ def dump_store(store: TopicStore) -> str:
     data = store.model_dump(by_alias=True, exclude_none=True)
     # The unassigned file says `topic: null` rather than leaving the key out.
     data["meta"] = {"topic": store.meta.topic, **data["meta"]}
+    if not store.meta.tool_intents:
+        del data["meta"]["tool_intents"]
     return STORE_HEADER + yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
 
 
@@ -178,7 +180,7 @@ class _OpenToolSpan:
 
     topic: str | None
     position: int
-    intent_ids: frozenset[str]
+    aggregates: frozenset[str]
     item_index: int
 
 
@@ -195,6 +197,7 @@ class Stores:
     stores: dict[str | None, TopicStore] = attrs.field(factory=dict)
     intents: int = 0
     aggregates: int = 0
+    tool_intents: int = 0
     spans: int = 0
     _open_tool_span: _OpenToolSpan | None = None
 
@@ -214,6 +217,10 @@ class Stores:
         """The id the aggregate registered `offset` places after the next one will take."""
         return f"G{self.aggregates + offset + 1:03d}"
 
+    def next_tool_intent_id(self, offset: int = 0) -> str:
+        """The id the tool-call intent registered `offset` places after the next will take."""
+        return f"L{self.tool_intents + offset + 1:03d}"
+
     def register_intent(self, topic: str, node_id: str, label: str) -> None:
         """Add user intent `node_id` to `topic`'s registry; it must be the next global id."""
         if node_id != self.next_intent_id():
@@ -231,6 +238,20 @@ class Stores:
             )
         self._add_node(topic, node_id, AggregateNode(label=label))
         self.aggregates += 1
+
+    def register_tool_intent(self, topic: str, aggregate: str, intent_id: str, text: str) -> None:
+        """List tool-call intent `intent_id` under `aggregate`; it must be the next global id."""
+        if intent_id != self.next_tool_intent_id():
+            raise AssertionError(
+                f"Registering {intent_id} when the next id is {self.next_tool_intent_id()}."
+            )
+        store = self.stores[topic]
+        members = store.meta.tool_intents.get(aggregate, {})
+        mapping = {**store.meta.tool_intents, aggregate: {**members, intent_id: text}}
+        self.stores[topic] = store.model_copy(
+            update={"meta": store.meta.model_copy(update={"tool_intents": mapping})}
+        )
+        self.tool_intents += 1
 
     def _add_node(self, topic: str, node_id: str, node: IntentNode | AggregateNode) -> None:
         store = self.stores[topic]
@@ -285,20 +306,20 @@ class Stores:
         call: ToolCall,
         item_index: int,
         intents: list[SpanIntent],
+        aggregates: frozenset[str],
         needs_review: bool,
     ) -> None:
         """Join the span before when docs/workflow.md's four merge conditions hold, else open one.
 
-        `intents` name aggregates, so the merge compares aggregates; a joined call adds
-        its id, its text and every one of its tool-call intents.
+        The merge compares `aggregates`, the level of what the user says; a joined call
+        adds its id, its text and every one of its tool-call intents.
         """
-        ids = frozenset(i.id for i in intents)
         last = self._open_tool_span
         if (
             last is not None
             and not needs_review
             and last.topic == topic
-            and last.intent_ids == ids
+            and last.aggregates == aggregates
             and self._adjacent(last.item_index, item_index)
         ):
             spans = list(self.stores[topic].spans)
@@ -330,7 +351,7 @@ class Stores:
             None
             if needs_review
             else _OpenToolSpan(
-                topic=topic, position=position, intent_ids=ids, item_index=item_index
+                topic=topic, position=position, aggregates=aggregates, item_index=item_index
             )
         )
 
