@@ -456,8 +456,8 @@ for f in frames:
     if f["call"] == "代码":
         f["spec"] = None
         continue
-    key = "|".join((f["call"], f.get("unitKey", ""), f.get("kind", "")))
-    specs.setdefault(key, fixed.call_spec(f["call"], f.get("unitKey", ""), f.get("kind", "")))
+    key = "|".join((f["call"], f.get("unitKey", "")))
+    specs.setdefault(key, fixed.call_spec(f["call"], f.get("unitKey", "")))
     f["spec"] = key
     f.pop("parts", None)
     f.pop("checks", None)

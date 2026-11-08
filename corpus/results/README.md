@@ -39,7 +39,7 @@ Qwen：
 
 ## 提取流程动画
 
-`claude-5a1f0c1a-qwen/animation/extraction-flow.html` 以一次模型端点调用为单位，逐帧回放 Qwen 主循环的提取过程，用浏览器直接打开即可。它由同目录的 `build.py` 根据 `extract/`、`digests.jsonl` 和 `segments.jsonl` 生成，重新生成时在这个目录运行 `python build.py`。提示词、校验规则等由代码确定的内容来自 `fixed.py`。
+`claude-5a1f0c1a-qwen/animation/extraction-flow.html` 以一次模型端点调用为单位，逐帧回放 Qwen 主循环的提取过程，用浏览器直接打开即可。它由同目录的 `build.py` 根据 `extract/`、`digests.jsonl` 和 `segments.jsonl` 生成，重新生成时在这个目录运行 `python build.py`。提示词、校验规则和重问反馈等由代码确定的内容，由 `fixed.py` 在生成时从 `intent_aligner/` 的源码解析出来，或调用其中的函数渲染出来；代码结构改动后 `fixed.py` 对不上时，生成会报 `CodeChanged` 并指出是哪个函数的哪一处，这时要先改 `fixed.py`。
 
 ## 重跑
 
