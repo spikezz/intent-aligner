@@ -7,6 +7,8 @@ from pathlib import Path
 
 import fixed
 
+from intent_aligner.window import ROUNDS
+
 ROOT = Path(__file__).parent
 RUN = ROOT.parent
 OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "extraction-flow.html"
@@ -41,11 +43,8 @@ def graph_note(g):
 
 
 frames = []
-origins = {
-    i.source.uuid: i.origin
-    for i in fixed.X.conversation_units(next(RUN.parents[1].glob("merged/claude-5a1f0c1a*.jsonl")))
-    if type(i).__name__ == "Observation"
-}
+items = list(fixed.X.conversation_units(next(RUN.parents[1].glob("merged/claude-5a1f0c1a*.jsonl"))))
+origins = {i.source.uuid: i.origin for i in items if type(i).__name__ == "Observation"}
 
 
 def frame(**kw):
@@ -451,6 +450,39 @@ for n, r in enumerate(records, 1):
             fail=r["review_reason"] if r["needs_review"] else None,
         )
 
+# The DAG panel: one column per round, in the order compress._trajectories groups tool calls.
+round_of, columns = {}, []
+for item in items:
+    if type(item).__name__ == "UserMessage" or not columns:
+        uuid = item.source.uuid if type(item).__name__ == "UserMessage" else ""
+        columns.append({"uuid": uuid, "pairs": [], "segments": 0, "units": []})
+    round_of.setdefault(item.source.uuid, len(columns) - 1)
+    if type(item).__name__ == "ToolCall":
+        result = results.get(item.tool_use_id)
+        columns[-1]["pairs"].append([item.tool_use_id, len(result["summaries"]) if result else 0])
+for column in columns:
+    column["segments"] = len(segments.get(column["uuid"], []))
+    column["round"] = any(d["round_uuid"] == column["uuid"] for d in rounds)
+seq_of = {}
+for k, f in enumerate(frames):
+    if f["phase"] == "L1":
+        f["dag"] = f"p:{f['record']['tool_use_id']}:{f['record']['kind'][0]}"
+    elif f["phase"] == "L2":
+        f["dag"] = f"r:{round_of[f['record']['round_uuid']]}"
+    elif f["phase"] == "SEG":
+        f["dag"] = f"s:{round_of[first_uuid]}:{segments[first_uuid].index(f['record'])}"
+    else:
+        calls_so_far = seq_of.setdefault(f["unitNo"], [])
+        f["dag"] = f"u:{f['unitNo']}:{len(calls_so_far)}"
+        calls_so_far.append([f["call"], k])
+for n, r in enumerate(records, 1):
+    columns[round_of[r["unit"]["uuid"]]]["units"].append([n, seq_of[n]])
+dag = {
+    "columns": columns,
+    "window": ROUNDS[0],
+    "l1Total": len(calls) + len(results),
+}
+
 specs = {}
 for f in frames:
     if f["call"] == "代码":
@@ -469,6 +501,7 @@ data = {
     "graphs": graphs,
     "units": len(records),
     "overflow": len(overflow),
+    "dag": dag,
 }
 html = (
     (ROOT / "template.html")

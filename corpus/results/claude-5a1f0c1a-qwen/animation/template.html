@@ -68,6 +68,22 @@ svg text{font-family:var(--sans);fill:var(--ink)}
 .legend{display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:var(--dim);margin-top:6px}
 .notice{background:var(--panel);border:1px solid var(--line);border-radius:3px;padding:8px 12px;color:var(--dim);font-size:13px}
 .skip{color:var(--wait);font-size:13px}
+.dagbox{background:var(--panel);border:1px solid var(--line);border-radius:3px;padding:10px 12px;min-width:0}
+.dagbox summary{font-size:14px;font-weight:500;cursor:pointer}
+.dagbox p{color:var(--dim);font-size:13px;margin:6px 0;max-width:110ch}
+#dag{overflow:auto;max-height:430px;margin-top:6px}
+#dag svg{font-size:11px}
+#dag .faint{opacity:.45}
+#dag [data-f]{cursor:pointer}
+#dag .dot{fill:var(--panel);stroke:var(--dim);stroke-width:1.2}
+#dag .dot[data-f]{stroke:var(--ink);fill:var(--line)}
+#dag .box{fill:var(--panel);stroke:var(--line);stroke-width:1.2}
+#dag .box[data-f],#dag .box.played{stroke:var(--dim)}
+#dag .hot{stroke:var(--signal)!important;stroke-width:2.6!important;fill:color-mix(in srgb,var(--signal) 30%,var(--panel))!important}
+#dag tspan.hot{fill:var(--signal)!important;font-weight:700;stroke:none!important}
+#dag .bar{stroke:var(--wait);stroke-dasharray:6 4;stroke-width:1.4}
+#dag .bartext{fill:var(--wait)}
+#dag .edge{fill:none;stroke:var(--dim);stroke-width:1}
 @media (max-width:900px){.stage{grid-template-columns:minmax(0,1fr);gap:8px}.wire{height:88px}.wire::before{display:none}.pkt{display:none}}
 @media (prefers-reduced-motion:reduce){.pkt{display:none}.wire.busy .node{animation:none}*{transition:none!important}}
 </style>
@@ -78,6 +94,7 @@ svg text{font-family:var(--sans);fill:var(--ink)}
 <div class="controls"><button id="prev" type="button">上一次</button><button id="play" type="button">播放</button><button id="next" type="button">下一次</button>
 <input id="scrub" type="range" min="0" value="0" aria-label="调用序号"><span id="count"></span>
 <select id="speed" aria-label="速度"><option value="1400">慢</option><option value="800" selected>中</option><option value="350">快</option></select></div>
+<details class="dagbox" open><summary>依赖图：哪些调用并行、哪些必须等前面的结果</summary><p id="dagnote"></p><div id="dag"></div></details>
 <section class="head"><span class="badge" id="badge"></span><span class="ftitle" id="ftitle"></span><span class="meta" id="meta"></span></section>
 <div class="unit"><b id="ulabel"></b><span id="utext"></span></div>
 <section class="stage" id="stage">
@@ -118,6 +135,62 @@ function drawGraph(f){
     return `<g class="n"><title>${esc(n.id+" "+n.label)}</title><rect x="${x}" y="${yy}" width="${W}" height="${H}" rx="3" stroke="${color(n.kind)}" ${p?'stroke-dasharray="5 4"':""}/><text x="${x+8}" y="${yy+21}" font-size="12" font-weight="700">${n.id}</text><text x="${x+8}" y="${yy+42}" font-size="12">${esc(clip(n.label,22))}</text></g>`}).join("");
   $("scroller").innerHTML=`<svg width="1040" height="${h}" viewBox="0 0 1040 ${h}" role="img" aria-label="当前 topic 的图谱">${edges}${nodes}</svg>`;
 }
+
+const D=DATA.dag,CW=150,SVGW=Math.max(1050,CW*D.columns.length);
+function buildDag(){
+  const at={};F.forEach((f,k)=>{if(!(f.dag in at))at[f.dag]=k});
+  const fa=id=>id in at?` data-f="${at[id]}"`:"";
+  const out=[],cols=D.columns,PR=6,RH=14;
+  const rows=Math.max(1,...cols.map(c=>Math.ceil(c.pairs.length/PR)));
+  const y1=40,h1=rows*RH+8,bar1=y1+h1+24,y2=bar1+16,bar2=y2+44,y3=bar2+16,bar3=y3+42,y4=bar3+14;
+  const bar=(y,t)=>out.push(`<line class="bar" x1="0" x2="${SVGW}" y1="${y}" y2="${y}"/><text class="bartext" x="4" y="${y-4}">${esc(t)}</text>`);
+  cols.forEach((c,ci)=>{
+    const x=ci*CW;
+    out.push(`<text x="${x+6}" y="14" font-weight="700">第 ${ci+1} 轮</text><text x="${x+6}" y="28" class="faint">${c.pairs.length} 个工具调用</text>`);
+    out.push(`<rect class="box faint" x="${x+3}" y="${y1-5}" width="${CW-8}" height="${Math.max(1,Math.ceil(c.pairs.length/PR))*RH+6}" rx="3"/>`);
+    c.pairs.forEach(([id,chunks],j)=>{
+      const cx=x+11+(j%PR)*23,cy=y1+Math.floor(j/PR)*RH+4;
+      out.push(`<g><title>${esc(id)}：先压调用，再压结果${chunks>1?`（结果分 ${chunks} 段，逐段串行）`:chunks?"":"（没有结果）"}</title>`);
+      if(chunks)out.push(`<line class="edge" x1="${cx}" y1="${cy}" x2="${cx+10}" y2="${cy}"/>`);
+      out.push(`<circle class="dot" data-id="p:${id}:c"${fa(`p:${id}:c`)} cx="${cx}" cy="${cy}" r="3.6"/>`);
+      if(chunks)out.push(`<circle class="dot" data-id="p:${id}:r"${fa(`p:${id}:r`)} cx="${cx+10}" cy="${cy}" r="${chunks>1?4.6:3.6}" ${chunks>1?'stroke-width="2.4"':""}/>`);
+      out.push(`</g>`);
+    });
+    if(c.round){
+      out.push(`<path class="edge" d="M${x+CW/2} ${y1+Math.ceil(c.pairs.length/PR)*RH+1}V${y2}"/>`);
+      out.push(`<rect class="box" data-id="r:${ci}"${fa(`r:${ci}`)} x="${x+14}" y="${y2}" width="${CW-30}" height="22" rx="3"/><text x="${x+22}" y="${y2+15}" pointer-events="none">L2 第 ${ci+1} 轮</text>`);
+    }
+    for(let back=1;back<=D.window;back++){const pc=ci-back;if(pc<0||!cols[pc].round)continue;
+      const sx=pc*CW+CW/2,ex=x+20;out.push(`<path class="edge faint" d="M${sx} ${y2+22}C${sx} ${y3-8} ${ex} ${y2+40} ${ex} ${y3}"/>`)}
+    for(let k=0;k<c.segments;k++){const sx=x+8+k*40;
+      if(k)out.push(`<line class="edge" x1="${sx-10}" y1="${y3+10}" x2="${sx}" y2="${y3+10}"/>`);
+      out.push(`<rect class="box" data-id="s:${ci}:${k}"${fa(`s:${ci}:${k}`)} x="${sx}" y="${y3}" width="30" height="20" rx="3"/><text x="${sx+6}" y="${y3+14}" pointer-events="none">段${k+1}</text>`)}
+  });
+  bar(bar1,"全部第一级任务结束后，第二级压缩才开始（compress.py 先后两次 _run_jobs）");
+  bar(bar2,`compress 命令结束后才运行 segment；每条消息的窗口读它前面 ${D.window} 轮的第二级压缩（细线）`);
+  bar(bar3,"segment 命令结束后才运行 extract；下面的单元严格一个接一个，每个单元读前面单元写好的图谱");
+  const units=cols.flatMap((c,ci)=>c.units.map(u=>[ci,...u])),PER=8,BW=118,BH=26,GX=12,GY=18;
+  units.forEach(([ci,n,calls],k)=>{
+    const ux=(k%PER)*(BW+GX)+2,uy=y4+Math.floor(k/PER)*(BH+GY);
+    if(k%PER)out.push(`<line class="edge" x1="${ux-GX}" y1="${uy+BH/2}" x2="${ux}" y2="${uy+BH/2}"/>`);
+    else if(k)out.push(`<path class="edge" d="M${(PER-1)*(BW+GX)+2+BW/2} ${uy-GY}V${uy-GY/2}H${ux+BW/2}V${uy}"/>`);
+    const letters=calls.map(([c],j)=>`<tspan data-id="u:${n}:${j}">${esc(c)}</tspan>`).join('<tspan class="faint">→</tspan>');
+    out.push(`<g data-unit="${n}"><rect class="box played" data-f="${calls[0][1]}" x="${ux}" y="${uy}" width="${BW}" height="${BH}" rx="3"/><text x="${ux+6}" y="${uy+17}" pointer-events="none"><tspan class="faint">${n}·轮${ci+1} </tspan>${letters}</text></g>`);
+  });
+  const h=y4+Math.ceil(Math.max(1,units.length)/PER)*(BH+GY);
+  $("dag").innerHTML=`<svg width="${SVGW}" height="${h}" viewBox="0 0 ${SVGW} ${h}" role="img" aria-label="调用依赖图">${out.join("")}</svg>`;
+  $("dag").onclick=e=>{const t=e.target.closest("[data-f]");if(t)go(+t.dataset.f)};
+  const pairs=cols.reduce((a,c)=>a+c.pairs.length,0),multi=cols.reduce((a,c)=>a+c.pairs.filter(p=>p[1]>1).length,0),segs=cols.reduce((a,c)=>a+c.segments,0);
+  $("dagnote").textContent=`第一级压缩：${pairs} 个工具调用各是一个任务，${D.l1Total} 次压缩在这些任务里完成。任务内部是串行的：先压调用，再压结果，因为压结果的 prompt 要带上调用的意图；其中 ${multi} 个结果太长，被分成几段逐段压（粗圈）。任务之间互不依赖，8 个线程并行。第二级压缩要等全部第一级任务结束才开始，${cols.filter(c=>c.round).length} 轮各是一个任务，也是 8 路并行。切分在 compress 命令之后运行：${cols.filter(c=>c.segments).length} 条用户消息并行，一共切出 ${segs} 段；同一条消息里的段只能按指针顺序一段接一段地切，因为下一段从上一段的结尾开始。主循环在切分之后运行：${units.length} 个单元严格串行，单元内部的调用也串行（T→B→C、T→G→L…→C、工具结果只调 D）。点图里实心的点或框可以跳到对应的那次调用；空心的点是这次回放没有播放的调用。`;
+}
+function hotDag(f){
+  document.querySelectorAll("#dag .hot").forEach(e=>e.classList.remove("hot"));
+  const el=document.querySelector(`#dag [data-id="${f.dag}"]`);if(!el)return;el.classList.add("hot");
+  const unit=el.closest("[data-unit]");if(unit)unit.querySelector("rect").classList.add("hot");
+  const pane=$("dag"),b=(el.tagName==="tspan"?unit:el).getBoundingClientRect(),v=pane.getBoundingClientRect();
+  if(b.top<v.top||b.bottom>v.bottom)pane.scrollTop+=b.top-v.top-v.height/2;
+  if(b.left<v.left||b.right>v.right)pane.scrollLeft+=b.left-v.left-v.width/2;
+}
 function draw(){
   const f=F[i];
   $("scrub").value=i;$("count").textContent=`第 ${i+1} / ${F.length} 次调用`;
@@ -145,12 +218,12 @@ function draw(){
   $("w1").classList.toggle("busy",beat===1&&!!sp);
   const p=$("pkt");p.className="pkt";void p.offsetWidth;if(sp&&beat===1)p.classList.add("go");if(sp&&beat===2)p.classList.add("back");
   document.documentElement.style.setProperty("--beat",$("speed").value+"ms");
-  drawGraph(f);
+  drawGraph(f);hotDag(f);
 }
 function stop(){clearTimeout(timer);timer=null;$("play").textContent="播放"}
 function tick(){beat++;if(beat>3){if(i>=F.length-1){stop();beat=3;draw();return}i++;beat=0}draw();timer=setTimeout(tick,+$("speed").value)}
 function go(n){stop();i=Math.max(0,Math.min(F.length-1,n));beat=3;draw()}
 $("play").onclick=()=>{if(timer)return stop();if(i>=F.length-1&&beat>=3){i=0;beat=0;draw()}$("play").textContent="暂停";timer=setTimeout(tick,+$("speed").value)};
 $("prev").onclick=()=>go(i-1);$("next").onclick=()=>go(i+1);$("scrub").oninput=e=>go(+e.target.value);
-beat=3;draw();
+buildDag();beat=3;draw();
 </script>
