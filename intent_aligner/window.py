@@ -1,4 +1,4 @@
-"""The conversation window an LLM call sees before a user message.
+"""The conversation window an LLM call sees around the unit it judges.
 
 The tool work of a round enters the window only as that round's one digest (see
 intent_aligner.compress), so the window is mostly what the user and the AI said.
@@ -26,6 +26,10 @@ PROMPT_BUDGET = 9_000
 # within 7% of the qwen38 server's /tokenize, which PROMPT_BUDGET's slack absorbs.
 TOKENIZER = "Qwen/Qwen3-0.6B"
 ROUNDS = (2, 1)
+# How far call G looks past the unit it files. Both aggregates misfiled before this
+# existed were settled within two units; the limits keep room for the earlier rounds.
+FOLLOWING_ITEMS = 8
+FOLLOWING_BUDGET = 3_000
 
 Count = Callable[[str], int]
 
@@ -187,6 +191,22 @@ def round_entry(item: Item, digests: Digests) -> str:
     if isinstance(item, Observation) and item.tool_use_id is not None:
         return f"【工具结果】\n{' '.join(digests.results[item.tool_use_id].summaries)}"
     return _plain_entry(item)
+
+
+def render_following(items: Sequence[Item], index: int, digests: Digests, count: Count) -> str:
+    """What comes after items[index], at most FOLLOWING_ITEMS entries in FOLLOWING_BUDGET tokens.
+
+    Entries are whole and in order, so the first one over the budget ends the text.
+    """
+    entries: list[str] = []
+    used = 0
+    for item in items[index + 1 : index + 1 + FOLLOWING_ITEMS]:
+        entry = round_entry(item, digests)
+        used += count(entry)
+        if used > FOLLOWING_BUDGET:
+            break
+        entries.append(entry)
+    return "\n\n".join(entries)
 
 
 def is_tool_record(item: Item) -> bool:

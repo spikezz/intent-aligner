@@ -710,6 +710,12 @@ LONG_DIGESTS = Digests(
 LONG_SEGMENTS = {"u1": [_segment(0, 4)]}
 
 
+@pytest.fixture
+def no_following(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Call G's look-ahead also spends budget, which would hide where a compression is due."""
+    monkeypatch.setattr("intent_aligner.extract.render_following", lambda *_: "")
+
+
 def _heavy_results(text: str) -> int:
     """Each level-1 result costs 1,000 tokens, so the round outgrows the budget after a few."""
     return len(text) + 1000 * text.count("【工具结果】")
@@ -737,7 +743,7 @@ def _long_run(
     return list(events)
 
 
-def test_a_round_is_compressed_only_when_the_prompt_would_not_fit() -> None:
+def test_a_round_is_compressed_only_when_the_prompt_would_not_fit(no_following: None) -> None:
     t_prompts: list[str] = []
     events = _long_run([], t_prompts)
     first = next(e for e in events if isinstance(e, ToolCompression))
@@ -790,7 +796,7 @@ def test_a_rerun_reuses_the_compressions_in_force() -> None:
     assert next(e for e in again if isinstance(e, ToolCompression)).begin == first.through, again
 
 
-def test_earlier_passages_count_against_the_budget() -> None:
+def test_earlier_passages_count_against_the_budget(no_following: None) -> None:
     t_prompts: list[str] = []
     _long_run([], t_prompts)
     budget = PROMPT_BUDGET - FEEDBACK_ROOM
@@ -801,3 +807,42 @@ def test_earlier_passages_count_against_the_budget() -> None:
     assert used + 1000 > budget - 100, (
         f"second compression too early: {used:,} of {budget:,} used with passage 1 counted"
     )
+
+
+def test_what_call_g_sees_ahead_counts_against_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_through = [next(e for e in _long_run([], []) if isinstance(e, ToolCompression)).through]
+    monkeypatch.setattr("intent_aligner.extract.render_following", lambda *_: "")
+    first_through.append(
+        next(e for e in _long_run([], []) if isinstance(e, ToolCompression)).through
+    )
+
+    assert first_through[0] < first_through[1], first_through
+
+
+def test_call_g_alone_sees_what_follows_the_unit() -> None:
+    aggregate_prompts: list[str] = []
+    match_prompts: list[str] = []
+
+    def aggregate(prompt: str) -> str:
+        aggregate_prompts.append(prompt)
+        return _one_aggregate(prompt)
+
+    def tool_intent(prompt: str) -> str:
+        match_prompts.append(prompt)
+        return _no_repeats(prompt)
+
+    _assignments(
+        TIMELINE,
+        SEGMENTS,
+        _two_intents(),
+        _new_then_first([]),
+        aggregate=aggregate,
+        tool_intent=tool_intent,
+    )
+
+    following = aggregate_prompts[0].split("<此后的对话>")[1]
+    assert "意图c2" in following, aggregate_prompts[0]
+    assert match_prompts, "c2 joins an aggregate that has members"
+    assert all("<此后的对话>" not in p for p in match_prompts), match_prompts

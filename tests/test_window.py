@@ -9,10 +9,13 @@ import pytest
 from intent_aligner.intent import Intent
 from intent_aligner.units import AIText, Item, Observation, Source, ToolCall, UserMessage
 from intent_aligner.window import (
+    FOLLOWING_BUDGET,
+    FOLLOWING_ITEMS,
     CallDigest,
     Digests,
     RoundDigest,
     WindowError,
+    render_following,
     render_items,
     window_text,
 )
@@ -106,3 +109,28 @@ def test_one_round_too_long_raises() -> None:
 def test_missing_round_digest_names_the_fix() -> None:
     with pytest.raises(ValueError, match=r"run intent_aligner\.compress"):
         render_items([_user("u9", "新"), _call("c9")], DIGESTS)
+
+
+def _many_calls(n: int) -> tuple[list[Item], Digests]:
+    ids = [f"c{i}" for i in range(n)]
+    return [_call(i) for i in ids], Digests(calls={i: _call_digest(i, f"意图{i}") for i in ids})
+
+
+def test_following_starts_after_the_unit_and_stops_at_the_item_limit() -> None:
+    items, digests = _many_calls(FOLLOWING_ITEMS + 3)
+
+    text = render_following(items, 0, digests, len)
+
+    assert "意图c0" not in text, text
+    assert f"意图c{FOLLOWING_ITEMS} " in text, text
+    assert f"意图c{FOLLOWING_ITEMS + 1} " not in text, text
+
+
+def test_following_keeps_whole_entries_within_its_budget() -> None:
+    items, digests = _many_calls(4)
+
+    text = render_following(
+        items, 0, digests, lambda entry: FOLLOWING_BUDGET // 2 + 1 if entry else 0
+    )
+
+    assert "意图c1 " in text and "意图c2 " not in text, text

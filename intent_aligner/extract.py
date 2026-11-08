@@ -13,8 +13,9 @@ against that aggregate's tool-call intents, so a repeated one keeps its id. The 
 global ids, and the unit's span goes into the topic's store (intent_aligner.store).
 Calls C and D, and so edges and observation nodes, are not built yet.
 
-The current round enters call T's window as level-1 digests, one per tool call and
-result. When the prompt would not fit the budget even with one earlier round, the
+The current round enters the window as level-1 digests, one per tool call and result.
+Call G alone also sees what follows its unit (window.render_following), because an
+aggregate names what a run of operations adds up to. When the prompt would not fit the budget even with one earlier round, the
 round's tool records not yet compressed become one more level-2 passage, which stands
 in for them from then on; the passages of earlier compressions stay as they are.
 
@@ -71,6 +72,7 @@ from intent_aligner.window import (
     is_tool_record,
     load_digests,
     qwen_tokens,
+    render_following,
     render_round_so_far,
     round_entry,
     window_text,
@@ -143,11 +145,11 @@ G_SYSTEM_PROMPT = """\
 
 <header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个工具调用所属的 topic；unit 是这个单元的类型和时间；graph 是这个 topic 的意图图谱，type 为 intent 的节点是用户的意图，type 为 aggregate 的节点是已有的意图聚合，label 是它们的标准文本；candidates 是可以回答的已有聚合编号，可以是空列表。
 
-<此前的对话> 是这个工具调用之前的对话。<当前单元> 是这个工具调用的意图和操作对象的概括。<本单元的意图> 按顺序列出这个调用的每个底层意图：编号、文本和原文依据。
+<此前的对话> 是这个工具调用之前的对话。<当前单元> 是这个工具调用的意图和操作对象的概括。<本单元的意图> 按顺序列出这个调用的每个底层意图：编号、文本和原文依据。<此后的对话> 是这个工具调用之后接着发生的事，用来看清这个操作最终是为了做成什么；要回答的只有 <本单元的意图> 里的意图。
 
 按 <本单元的意图> 的顺序，每个底层意图回答一项：
 - aggregate：这个操作是在继续某个已有聚合做的事时，回答那个聚合的编号；它在做一件已有聚合都没有覆盖的事时，回答 NEW。一个聚合对应用户会用一句话提出的一件事，也就是要做成的一样东西：为做成同一样东西进行的准备、编写、提交、运行和检查结果，都属于同一个聚合。比如写任务分发脚本、提交小规模测试、查看测试输出，合起来是“跑通关键帧生成流程”这一个聚合。换一个文件、换一条命令、换到下一个步骤，只要还在做成同一样东西，就继续用同一个聚合。
-- title：aggregate 是 NEW 时，写这个聚合的标准文本：一句完整的话，说明这一串操作要做成什么，脱离对话也能看懂，只写要做成的目标，类名、参数名、文件名、行号和命令都留在底层意图里。aggregate 是已有编号时写空字符串。同一个调用里多个底层意图做的是同一件新事时，title 写成完全相同的文本，它们会归入同一个新聚合。
+- title：aggregate 是 NEW 时，写这个聚合的标准文本：一句完整的话，说明这一串操作最终要做成什么，要涵盖 <此后的对话> 里为做成同一样东西继续进行的操作，比如先检查依赖、再安装、再运行分析，标题写“完成歌曲结构分析”；<此后的对话> 里开始做成另一样东西的操作不算在内。标题要脱离对话也能看懂，只写要做成的目标，类名、参数名、文件名、行号和命令都留在底层意图里。aggregate 是已有编号时写空字符串。同一个调用里多个底层意图做的是同一件新事时，title 写成完全相同的文本，它们会归入同一个新聚合。
 """
 
 L_SYSTEM_PROMPT = """\
@@ -664,7 +666,9 @@ def _file_under_aggregates(
     candidates = [i for i, n in stores.topic_nodes(topic).items() if n.type == "aggregate"]
     head = _graph_header(step, context, topic, stores, candidates)
     try:
-        prompt = _fitted_prompt(step, context, G_SYSTEM_PROMPT, head, window, _listed(intents))
+        following = render_following(context.items, step.index, context.digests, context.count)
+        tail = f"{_listed(intents)}\n\n<此后的对话>\n{following}\n</此后的对话>"
+        prompt = _fitted_prompt(step, context, G_SYSTEM_PROMPT, head, window, tail)
     except WindowError as error:
         return _review(record, str(error))
     allowed = {*candidates, NEW}
