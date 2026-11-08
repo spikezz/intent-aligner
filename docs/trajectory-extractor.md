@@ -176,7 +176,7 @@ spans:
 | `blocks` | observation → intent | from 这个观测表明 to 这个意图没有达成，或者遇到了障碍 |
 | `triggers` | observation → intent | from 这个观测引出了 to 这个新意图 |
 
-意图从 A 转向 B 时，如果转向是由某个观测引起的，图谱里要同时记录两条边：从 A 指向 B 的 `supersedes` 边，以及从这个观测指向 B 的 `triggers` 边。用户拒绝工具调用时，通常有一条从被拒绝调用的意图指向用户信号意图的 `supersedes` 边。
+意图从 A 转向 B 时，如果转向是由某个观测引起的，图谱里要同时记录两条边：从 A 指向 B 的 `supersedes` 边，以及从这个观测指向 B 的 `triggers` 边。用户拒绝工具调用时，通常有一条从被拒绝调用所属的聚合指向用户信号意图的 `supersedes` 边。
 
 `satisfies` 和 `blocks` 记录的是环境给出的事实。用户对 AI 工作的评价，比如打分或者说“这个不对”，在性质上是评价信号，不属于观测；这类评价是否单独建节点类型，等语料里读到时再定。
 
