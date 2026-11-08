@@ -209,8 +209,7 @@ def call_spec(call, unit_key="", kind=""):
         )
     if call == "G":
         tail = (
-            LISTED
-            + f"\n\n<此后的对话>\n{{{{当前单元之后最多 {W.FOLLOWING_ITEMS} 个条目，"
+            LISTED + f"\n\n<此后的对话>\n{{{{当前单元之后最多 {W.FOLLOWING_ITEMS} 个条目，"
             f"最多 {W.FOLLOWING_BUDGET:,} token}}}}\n</此后的对话>"
         )
         return spec(
