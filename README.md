@@ -44,8 +44,9 @@ $PY -m intent_aligner.segment corpus/merged/claude-5a1f0c1a.jsonl \
     --digests $OUT/digests.jsonl \
     --backend hive --model deployment/pc-qwen38-np8 --out $OUT/segments.jsonl
 
-# 6. 指针按时间顺序逐个走过单元（用户消息换成第 5 步的段落），判断每个单元属于哪个 topic。
-#    工具结果沿用它的调用的 topic，其余单元各调用一次模型。第 4、5 步都必须先对整个对话跑完
+# 6. 指针按时间顺序逐个走过单元（用户消息换成第 5 步的段落），判断每个单元属于哪个 topic，再把用户的意图
+#    对照 topic 的已有意图，把工具调用的底层意图归入聚合并在聚合内去重。工具结果沿用它的调用的 topic，
+#    不调用模型；其余单元每个都要调用模型，次数取决于单元类型。第 4、5 步都必须先对整个对话跑完
 $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
     --digests $OUT/digests.jsonl --segments $OUT/segments.jsonl \
     --backend hive --model deployment/pc-qwen38-np8 --out $OUT/extract
@@ -57,7 +58,7 @@ $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
 
 第 5 步里，模型重试几次仍然定位不到段落结尾，或者连一轮对话都放不进窗口时，剩下的文本成为一段 `needs_review: true`、意图为空的段落，原因打印在标准错误里。
 
-第 6 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（用户意图节点、工具调用的意图聚合节点和段落，暂时还没有边和观测节点）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic 和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：一轮太长、模型看到的内容放不下时，还没压缩过的工具操作会压缩成一段话，之前压缩出的段落保持不变，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
+第 6 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（用户意图节点、工具调用的意图聚合节点和段落，暂时还没有边和观测节点）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic、整条没有意图的用户消息和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：一轮太长、模型看到的内容放不下时，还没压缩过的工具操作会压缩成一段话，之前压缩出的段落保持不变，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
 
 第 1 步完成后，`corpus/index.json` 会列出每个合并后的对话，包括成员 session、记录条数、丢弃的 fork 复制品数量，以及损坏的行。
 
@@ -65,7 +66,7 @@ $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
 
 ### 调用 LLM
 
-轨迹提取器可以通过 Claude Code、Codex 或 pi 的命令行调用模型，也可以直接通过 HTTP 调用 Hive Frame 网关上的本地模型。每次调用都是独立的一问一答，prompt 从标准输入读入，回复打印到标准输出，对话记录的路径打印到标准错误。
+轨迹提取器可以通过 Claude Code、Codex 或 pi 的命令行调用模型，也可以直接通过 HTTP 调用 Hive Frame 网关上的本地模型。`compress`、`segment` 和 `extract` 的 `--backend` 只接受 `claude`、`codex` 和 `hive`，`pi` 只能在下面的 `intent_aligner.llm` 和手动测试工具里使用。每次调用都是独立的一问一答，prompt 从标准输入读入，回复打印到标准输出，对话记录的路径打印到标准错误。
 
 ```bash
 echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.llm \
@@ -76,13 +77,13 @@ echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.ll
 - `--backend` 可以是 `claude`、`codex`、`pi` 或 `hive`。`--model` 按对应命令行的写法给出，pi 的写法是 `provider/model-id`，hive 的写法是网关 `/v1/models` 列出的 `deployment/<部署名>`。
 - `hive` 不经过任何 agent 命令行，发给网关的请求里只有系统提示和用户 prompt。网关地址默认是 `http://127.0.0.1:8790`，可以用环境变量 `HIVE_FRAME_URL` 改。思考参数按网关为这个部署声明的模型协议设置：Qwen 模板的模型打开思考，`low` 给 2048 个思考 token 的预算，`medium`、`high`、`xhigh` 都给 9216 个，这样单槽 18,944 token 里还放得下 prompt 和答案。
 - `--effort` 可以是 `low`、`medium`、`high` 或 `xhigh`，默认是 `xhigh`。
-- `--stream` 和 `--no-stream` 决定 `hive` 用流式还是整块接收回复，默认是流式，对其他后端没有影响。`--no-stream` 的请求如果超过网关 1200 秒的读取超时，这个槽位就会一直被占着，直到部署重启。`compress` 和 `segment` 也有这两个选项。
+- `--stream` 和 `--no-stream` 决定 `hive` 用流式还是整块接收回复，默认是流式，对其他后端没有影响。`--no-stream` 的请求如果超过网关 1200 秒的读取超时，这个槽位就会一直被占着，直到部署重启。`compress`、`segment` 和 `extract` 也有这两个选项。
 - `--schema` 是可选的 JSON schema，给出时回复就是满足它的 JSON。pi 不支持这个参数。
 - 调用产生的对话记录只写进 `--home` 指定的目录，默认是工具根目录下的 `llm-home/`。对话记录不会出现在日常使用的 `~/.claude/projects`、`~/.codex/sessions` 或 `~/.pi/agent/sessions` 里。
 
 ### 手动测试端点
 
-`scripts/llm-chat.sh` 是一个交互式的小工具，用来手动给三个端点发消息。每条消息都是一次独立的调用，不会带上之前的消息。
+`scripts/llm-chat.sh` 是一个交互式的小工具，用来手动给四个端点发消息。每条消息都是一次独立的调用，不会带上之前的消息。
 
 ```bash
 PY=$PY scripts/llm-chat.sh                     # 默认从 claude 开始，也可以写 codex、pi 或 hive
