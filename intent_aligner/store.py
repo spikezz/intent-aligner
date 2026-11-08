@@ -73,14 +73,18 @@ Node = Annotated[IntentNode | AggregateNode | ObservationNode, Field(discriminat
 
 
 class Edge(BaseModel):
-    """A relation between two nodes of one topic, set up in span `span`."""
+    """A relation between two nodes of one topic.
+
+    `span` is the span that set it up; satisfies and blocks come from an observation,
+    which has no span, so theirs is None.
+    """
 
     model_config = ConfigDict(frozen=True, populate_by_name=True)
 
     from_: str = Field(alias="from")
     to: str
     relation: Relation
-    span: str
+    span: str | None = None
     evidence: str = Field(min_length=1)
 
 
@@ -166,6 +170,7 @@ def load_store(path: Path) -> TopicStore:
 
 def dump_store(store: TopicStore) -> str:
     """The store as YAML in the field order of the format, leaving out unset fields."""
+    TopicStore.model_validate(store.model_dump(by_alias=True))
     data = store.model_dump(by_alias=True, exclude_none=True)
     # The unassigned file says `topic: null` rather than leaving the key out.
     data["meta"] = {"topic": store.meta.topic, **data["meta"]}
@@ -184,6 +189,23 @@ class _OpenToolSpan:
     item_index: int
 
 
+@attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
+class _CallSpan:
+    """The span a tool call ended up in and the aggregates its produces edges start from."""
+
+    span: str
+    aggregates: frozenset[str]
+
+
+@attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
+class PendingObservation:
+    """An observation without a node, still a candidate for a later triggers edge."""
+
+    topic: str
+    text: str
+    source: ObservationSource
+
+
 @attrs.define(slots=True, kw_only=True)
 class Stores:
     """Every store of one run, filled unit by unit; ids are global across topics.
@@ -199,6 +221,9 @@ class Stores:
     aggregates: int = 0
     tool_intents: int = 0
     spans: int = 0
+    observations: int = 0
+    pending: dict[int, PendingObservation] = attrs.field(factory=dict)
+    _call_spans: dict[str, _CallSpan] = attrs.field(factory=dict)
     _open_tool_span: _OpenToolSpan | None = None
 
     def next_intent_id(self, offset: int = 0) -> str:
@@ -220,6 +245,57 @@ class Stores:
     def next_tool_intent_id(self, offset: int = 0) -> str:
         """The id the tool-call intent registered `offset` places after the next will take."""
         return f"L{self.tool_intents + offset + 1:03d}"
+
+    def next_observation_id(self, offset: int = 0) -> str:
+        """The observation id `offset` places after the last one given out."""
+        return f"O{self.observations + 1 + offset:03d}"
+
+    def add_observation(
+        self,
+        topic: str | None,
+        node_id: str,
+        label: str,
+        source: ObservationSource,
+        *,
+        review: bool,
+    ) -> None:
+        """Add an observation node and, for a tool result, one produces edge per aggregate."""
+        if node_id != self.next_observation_id():
+            raise AssertionError(
+                f"Registering {node_id} when the next id is {self.next_observation_id()}."
+            )
+        node = ObservationNode(label=label, source=source, needs_review=True if review else None)
+        self._add_node(topic, node_id, node)
+        self.observations += 1
+        call = self._call_spans.get(source.tool_use_id) if source.tool_use_id else None
+        if call is not None:
+            produced = [
+                Edge.model_validate(
+                    {
+                        "from": aggregate,
+                        "to": node_id,
+                        "relation": "produces",
+                        "span": call.span,
+                        "evidence": label,
+                    }
+                )
+                for aggregate in sorted(call.aggregates)
+            ]
+            self.add_edges(topic, produced)
+
+    def add_edges(self, topic: str | None, edges: Sequence[Edge]) -> None:
+        """Append `edges`, leaving out any whose ends and relation are already recorded."""
+        store = self._store(topic)
+        kept = list(store.meta.graph.edges)
+        seen = {(e.from_, e.to, e.relation) for e in kept}
+        for edge in edges:
+            if (edge.from_, edge.to, edge.relation) not in seen:
+                seen.add((edge.from_, edge.to, edge.relation))
+                kept.append(edge)
+        graph = store.meta.graph.model_copy(update={"edges": kept})
+        self.stores[topic] = store.model_copy(
+            update={"meta": store.meta.model_copy(update={"graph": graph})}
+        )
 
     def register_intent(self, topic: str, node_id: str, label: str) -> None:
         """Add user intent `node_id` to `topic`'s registry; it must be the next global id."""
@@ -253,8 +329,11 @@ class Stores:
         )
         self.tool_intents += 1
 
-    def _add_node(self, topic: str, node_id: str, node: IntentNode | AggregateNode) -> None:
-        store = self.stores[topic]
+    def _store(self, topic: str | None) -> TopicStore:
+        return self.stores.get(topic) or TopicStore(meta=Meta(topic=topic))
+
+    def _add_node(self, topic: str | None, node_id: str, node: Node) -> None:
+        store = self._store(topic)
         nodes = {**store.meta.graph.nodes, node_id: node}
         graph = store.meta.graph.model_copy(update={"nodes": nodes})
         self.stores[topic] = store.model_copy(
@@ -268,8 +347,8 @@ class Stores:
         chars: tuple[int, int],
         intents: list[SpanIntent],
         needs_review: bool,
-    ) -> None:
-        """A span for one user segment; the last segment of a message triggers its coverage check."""
+    ) -> str:
+        """A span for one user segment, returning its id; the last segment of a message triggers its coverage check."""
         source = self._source(message.source.session, message.source.timestamp.isoformat())
         span = self._span(
             kind="user_text",
@@ -283,11 +362,12 @@ class Stores:
         self._open_tool_span = None
         if chars[1] == len(message.body):
             self.check_coverage(message)
+        return span.id
 
     def add_user_signal(
         self, topic: str | None, signal: UserSignal, intents: list[SpanIntent], needs_review: bool
-    ) -> None:
-        """A user signal always stands alone."""
+    ) -> str:
+        """A user signal always stands alone; returns its span's id."""
         source = self._source(signal.source.session, signal.source.timestamp.isoformat())
         update = {"uuid": signal.source.uuid, "tool_use_id": signal.tool_use_id}
         span = self._span(
@@ -299,6 +379,7 @@ class Stores:
         )
         self._append(topic, span)
         self._open_tool_span = None
+        return span.id
 
     def add_tool_call(
         self,
@@ -308,8 +389,8 @@ class Stores:
         intents: list[SpanIntent],
         aggregates: frozenset[str],
         needs_review: bool,
-    ) -> None:
-        """Join the span before when docs/workflow.md's four merge conditions hold, else open one.
+    ) -> str:
+        """The id of the span the call lands in: join the span before when docs/workflow.md's four merge conditions hold, else open one.
 
         The merge compares `aggregates`, the level of what the user says; a joined call
         adds its id, its text and every one of its tool-call intents.
@@ -337,7 +418,8 @@ class Stores:
             )
             self.stores[topic] = self.stores[topic].model_copy(update={"spans": spans})
             self._open_tool_span = attrs.evolve(last, item_index=item_index)
-            return
+            self._call_spans[call.tool_use_id] = _CallSpan(span=joined.id, aggregates=aggregates)
+            return joined.id
         source = self._source(call.source.session, call.source.timestamp.isoformat())
         span = self._span(
             kind="tool_calls",
@@ -354,6 +436,8 @@ class Stores:
                 topic=topic, position=position, aggregates=aggregates, item_index=item_index
             )
         )
+        self._call_spans[call.tool_use_id] = _CallSpan(span=span.id, aggregates=aggregates)
+        return span.id
 
     def check_coverage(self, message: UserMessage) -> None:
         """Raise when the message's spans across all stores do not tile its body exactly."""
@@ -388,7 +472,7 @@ class Stores:
         )
 
     def _append(self, topic: str | None, span: Span) -> int:
-        store = self.stores.get(topic) or TopicStore(meta=Meta(topic=topic))
+        store = self._store(topic)
         self.stores[topic] = store.model_copy(update={"spans": [*store.spans, span]})
         return len(store.spans)
 
