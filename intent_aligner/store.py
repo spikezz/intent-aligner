@@ -27,12 +27,25 @@ Relation = Literal[
 
 
 class IntentNode(BaseModel):
-    """An intent in a topic's registry; `label` is its one standard text."""
+    """A user intent in a topic's registry; `label` is its one standard text."""
 
     model_config = ConfigDict(frozen=True)
 
     type: Literal["intent"] = "intent"
-    actor: Literal["user", "ai"]
+    actor: Literal["user"] = "user"
+    label: str = Field(min_length=1)
+
+
+class AggregateNode(BaseModel):
+    """What a run of tool calls is doing, at the level of what the user says.
+
+    Tool-call intents are too low-level for the graph; they stay in the spans, each
+    naming its aggregate.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    type: Literal["aggregate"] = "aggregate"
     label: str = Field(min_length=1)
 
 
@@ -56,7 +69,7 @@ class ObservationNode(BaseModel):
     needs_review: Literal[True] | None = None
 
 
-Node = Annotated[IntentNode | ObservationNode, Field(discriminator="type")]
+Node = Annotated[IntentNode | AggregateNode | ObservationNode, Field(discriminator="type")]
 
 
 class Edge(BaseModel):
@@ -107,11 +120,16 @@ class SpanSource(BaseModel):
 
 
 class SpanIntent(BaseModel):
-    """How intent `id` shows up in one span; `note` gives the grounds of an inferred one."""
+    """How intent `id` shows up in one span; `note` gives the grounds of an inferred one.
+
+    In a tool call span `id` is an aggregate, which may recur, and `text` is the
+    tool-call intent itself, which has no node of its own.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     id: str
+    text: str | None = None
     evidence: str = Field(min_length=1)
     explicit: bool
     note: str | None = None
@@ -176,6 +194,7 @@ class Stores:
     items: Sequence[Item]
     stores: dict[str | None, TopicStore] = attrs.field(factory=dict)
     intents: int = 0
+    aggregates: int = 0
     spans: int = 0
     _open_tool_span: _OpenToolSpan | None = None
 
@@ -191,19 +210,35 @@ class Stores:
         """Start the empty store of a newly opened topic."""
         self.stores[topic] = TopicStore(meta=Meta(topic=topic))
 
-    def register(self, topic: str, node_id: str, actor: Literal["user", "ai"], label: str) -> None:
-        """Add intent `node_id` to `topic`'s registry; it must be the next global id."""
+    def next_aggregate_id(self, offset: int = 0) -> str:
+        """The id the aggregate registered `offset` places after the next one will take."""
+        return f"G{self.aggregates + offset + 1:03d}"
+
+    def register_intent(self, topic: str, node_id: str, label: str) -> None:
+        """Add user intent `node_id` to `topic`'s registry; it must be the next global id."""
         if node_id != self.next_intent_id():
             raise AssertionError(
                 f"Registering {node_id} when the next id is {self.next_intent_id()}."
             )
+        self._add_node(topic, node_id, IntentNode(label=label))
+        self.intents += 1
+
+    def register_aggregate(self, topic: str, node_id: str, label: str) -> None:
+        """Add aggregate `node_id` to `topic`'s graph; it must be the next global id."""
+        if node_id != self.next_aggregate_id():
+            raise AssertionError(
+                f"Registering {node_id} when the next id is {self.next_aggregate_id()}."
+            )
+        self._add_node(topic, node_id, AggregateNode(label=label))
+        self.aggregates += 1
+
+    def _add_node(self, topic: str, node_id: str, node: IntentNode | AggregateNode) -> None:
         store = self.stores[topic]
-        nodes = {**store.meta.graph.nodes, node_id: IntentNode(actor=actor, label=label)}
+        nodes = {**store.meta.graph.nodes, node_id: node}
         graph = store.meta.graph.model_copy(update={"nodes": nodes})
         self.stores[topic] = store.model_copy(
             update={"meta": store.meta.model_copy(update={"graph": graph})}
         )
-        self.intents += 1
 
     def add_user_text(
         self,
@@ -254,8 +289,8 @@ class Stores:
     ) -> None:
         """Join the span before when docs/workflow.md's four merge conditions hold, else open one.
 
-        A joined call adds its id and text; the span keeps the evidence of the call
-        that opened it, since the intent set and so the ids are the same.
+        `intents` name aggregates, so the merge compares aggregates; a joined call adds
+        its id, its text and every one of its tool-call intents.
         """
         ids = frozenset(i.id for i in intents)
         last = self._open_tool_span
@@ -273,7 +308,11 @@ class Stores:
                 update={"tool_use_ids": [*joined.source.tool_use_ids, call.tool_use_id]}
             )
             spans[last.position] = joined.model_copy(
-                update={"source": source, "text": f"{joined.text}\n\n{call.text}"}
+                update={
+                    "source": source,
+                    "text": f"{joined.text}\n\n{call.text}",
+                    "intents": [*joined.intents, *intents],
+                }
             )
             self.stores[topic] = self.stores[topic].model_copy(update={"spans": spans})
             self._open_tool_span = attrs.evolve(last, item_index=item_index)

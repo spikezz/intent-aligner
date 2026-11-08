@@ -6,10 +6,11 @@ never a unit. A tool result takes the topic of the call that produced it; every
 other unit goes to call T, which picks a registered topic or opens a new one.
 
 A unit on the intent path then gets its intents: a user segment's from segmentation,
-a tool call's from level-1 compression, a user signal's from call A. Call B matches
-them against the topic's registry, the code gives the new ones global ids, and the
-unit's span goes into the topic's store (intent_aligner.store). Calls C and D, and
-so edges and observation nodes, are not built yet.
+a tool call's from level-1 compression, a user signal's from call A. Call B matches a
+user's intents against the topic's registry; call G files each tool-call intent under
+an aggregate, the only form tool calls take in the graph. The code gives new nodes
+global ids, and the unit's span goes into the topic's store (intent_aligner.store).
+Calls C and D, and so edges and observation nodes, are not built yet.
 
 The current round enters call T's window as level-1 digests, one per tool call and
 result. When the prompt would not fit the budget even with one earlier round, the
@@ -136,6 +137,35 @@ B_SYSTEM_PROMPT = """\
 - complete：match 是已有编号时回答，已有意图的文本是否完整包含了这个单元关于这个意图的信息。这个单元给已有意图补充了新的信息，比如指定了具体用哪个文件、加了限定条件，就回答 false。match 是 NEW 时回答 true。
 """
 
+G_SYSTEM_PROMPT = """\
+你在把 AI 一个工具调用的底层意图归入意图聚合。底层意图是具体操作，比如读某个文件的某几行；意图聚合说明一串操作合起来在做什么，它和用户说出来的意图在同一个层级，比如“调查 somnia-farm 的文档和目录结构”“搭建音频分析环境”。
+
+<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个工具调用所属的 topic；unit 是这个单元的类型和时间；graph 是这个 topic 的意图图谱，type 为 intent 的节点是用户的意图，type 为 aggregate 的节点是已有的意图聚合，label 是它们的标准文本；candidates 是可以回答的已有聚合编号，可以是空列表。
+
+<此前的对话> 是这个工具调用之前的对话。<当前单元> 是这个工具调用的意图和操作对象的概括。<本单元的意图> 按顺序列出这个调用的每个底层意图：编号、文本和原文依据。
+
+按 <本单元的意图> 的顺序，每个底层意图回答一项：
+- aggregate：这个操作是在继续某个已有聚合做的事时，回答那个聚合的编号；它在做一件已有聚合都没有覆盖的事时，回答 NEW。换一个文件、换几行、换一条命令去做同一件事，仍然是同一个聚合。
+- title：aggregate 是 NEW 时，写这个聚合的标准文本：一句完整的话，说明这一串操作要做成什么，脱离对话也能看懂，写目标，具体的文件、行号和命令留在底层意图里。aggregate 是已有编号时写空字符串。同一个调用里多个底层意图做的是同一件新事时，title 写成完全相同的文本，它们会归入同一个新聚合。
+"""
+
+G_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"aggregate": {"type": "string"}, "title": {"type": "string"}},
+                "required": ["aggregate", "title"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["answers"],
+    "additionalProperties": False,
+}
+
 B_SCHEMA = {
     "type": "object",
     "properties": {
@@ -181,13 +211,15 @@ class UnitRef(BaseModel):
 class UnitIntent(BaseModel):
     """One intent of a unit under its registry id, with how it shows up in the unit.
 
-    `label` is set when this unit registered the intent. `refines` is the existing
-    intent call B found incomplete, which call C will link to this new one.
+    `label` is set when this unit registered the node. `refines` is the existing
+    intent call B found incomplete, which call C will link to this new one. For a tool
+    call `id` is the aggregate and `text` the tool-call intent, which has no node.
     """
 
     model_config = ConfigDict(frozen=True)
 
     id: str
+    text: str | None = None
     evidence: str
     explicit: bool
     note: str
@@ -243,6 +275,19 @@ class _Match(BaseModel):
     complete: bool
 
 
+class _Filed(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    aggregate: str
+    title: str
+
+
+class _GAnswer(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    answers: list[_Filed]
+
+
 class _BAnswer(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -256,6 +301,7 @@ class Asks:
     topic: Ask
     signal: Ask
     registry: Ask
+    aggregate: Ask
     round: Ask
 
 
@@ -515,7 +561,10 @@ def _with_intents(
     if isinstance(unit, UserSegment):
         intents = unit.segment.intents
     elif isinstance(unit, ToolCall):
-        intents = context.digests.calls[unit.tool_use_id].intents
+        filed = context.digests.calls[unit.tool_use_id].intents
+        return _file_under_aggregates(
+            step, record, topic, filed, context, window, asks.aggregate, stores
+        )
     else:
         try:
             head = _graph_header(step, context, topic, stores)
@@ -545,6 +594,68 @@ def _with_intents(
     return _match_intents(step, record, topic, intents, context, window, asks.registry, stores)
 
 
+def _listed(intents: list[Intent]) -> str:
+    lines = "\n".join(
+        f"{n}. {i.text}（依据：{i.evidence}）" for n, i in enumerate(intents, start=1)
+    )
+    return f"<本单元的意图>\n{lines}\n</本单元的意图>"
+
+
+def _file_under_aggregates(
+    step: _Step,
+    record: Assignment,
+    topic: str,
+    intents: list[Intent],
+    context: _Context,
+    window: _Round,
+    ask: Ask,
+    stores: Stores,
+) -> Assignment:
+    """Call G, then the ids: NEW answers with the same title share one new aggregate."""
+    candidates = [i for i, n in stores.topic_nodes(topic).items() if n.type == "aggregate"]
+    head = _graph_header(step, context, topic, stores, candidates)
+    try:
+        prompt = _fitted_prompt(step, context, G_SYSTEM_PROMPT, head, window, _listed(intents))
+    except WindowError as error:
+        return _review(record, str(error))
+    allowed = {*candidates, NEW}
+
+    def parse(reply: str) -> list[_Filed]:
+        got = _GAnswer.model_validate_json(reply).answers
+        if len(got) != len(intents):
+            raise ValueError(
+                f"answers 有 {len(got)} 项，但 <本单元的意图> 有 {len(intents)} 个，"
+                "要按顺序给每个意图回答一项。"
+            )
+        wrong = [f.aggregate for f in got if f.aggregate not in allowed]
+        if wrong:
+            raise ValueError(
+                f"{wrong!r} 不在 candidates 里，aggregate 只能是 candidates 里的编号或 NEW。"
+            )
+        if any(f.aggregate == NEW and not f.title.strip() for f in got):
+            raise ValueError("aggregate 为 NEW 时 title 不能为空。")
+        return got
+
+    answered, _, feedback = _ask_until_valid(ask, prompt, parse, CALL_ATTEMPTS)
+    if answered is None:
+        return _review(
+            record, f"call G gave no valid answer in {CALL_ATTEMPTS} attempts: {feedback}"
+        )
+    opened: dict[str, str] = {}
+    resolved: list[UnitIntent] = []
+    for intent, answer in zip(intents, answered, strict=True):
+        found = intent.model_dump()
+        title = answer.title.strip()
+        if answer.aggregate != NEW:
+            resolved.append(UnitIntent(id=answer.aggregate, **found))
+        elif title in opened:
+            resolved.append(UnitIntent(id=opened[title], **found))
+        else:
+            opened[title] = stores.next_aggregate_id(len(opened))
+            resolved.append(UnitIntent(id=opened[title], label=title, **found))
+    return record.model_copy(update={"intents": resolved})
+
+
 def _match_intents(
     step: _Step,
     record: Assignment,
@@ -557,19 +668,16 @@ def _match_intents(
 ) -> Assignment:
     """Call B, then the ids: a registered intent keeps its id once per unit, others get new ones.
 
-    A topic with no intents yet has nothing to match, so call B is skipped.
+    Only a user's intents come here; a tool call's go to call G. A topic with no
+    intents yet has nothing to match, so call B is skipped.
     """
     candidates = [i for i, node in stores.topic_nodes(topic).items() if node.type == "intent"]
     if not candidates:
         matches = [_Match(match=NEW, complete=True) for _ in intents]
     else:
-        listed = "\n".join(
-            f"{n}. {i.text}（依据：{i.evidence}）" for n, i in enumerate(intents, start=1)
-        )
         head = _graph_header(step, context, topic, stores, candidates)
         try:
-            tail = f"<本单元的意图>\n{listed}\n</本单元的意图>"
-            prompt = _fitted_prompt(step, context, B_SYSTEM_PROMPT, head, window, tail)
+            prompt = _fitted_prompt(step, context, B_SYSTEM_PROMPT, head, window, _listed(intents))
         except WindowError as error:
             return _review(record, str(error))
         allowed = {*candidates, NEW}
@@ -623,13 +731,15 @@ def _into_stores(stores: Stores, step: _Step, record: Assignment) -> None:
         stores.open_topic(topic)
     if isinstance(unit, Observation):
         return
-    actor: Literal["user", "ai"] = "ai" if isinstance(unit, ToolCall) else "user"
+    register = stores.register_aggregate if isinstance(unit, ToolCall) else stores.register_intent
     for intent in record.intents:
         if intent.label is not None:
             assert topic is not None
-            stores.register(topic, intent.id, actor, intent.label)
+            register(topic, intent.id, intent.label)
     spans = [
-        SpanIntent(id=i.id, evidence=i.evidence, explicit=i.explicit, note=i.note or None)
+        SpanIntent(
+            id=i.id, text=i.text, evidence=i.evidence, explicit=i.explicit, note=i.note or None
+        )
         for i in record.intents
     ]
     if isinstance(unit, UserSegment):
@@ -800,6 +910,7 @@ def main() -> None:
         topic=asker(*llm, T_SYSTEM_PROMPT, T_SCHEMA, args.stream),
         signal=asker(*llm, A_SYSTEM_PROMPT, A_SCHEMA, args.stream),
         registry=asker(*llm, B_SYSTEM_PROMPT, B_SCHEMA, args.stream),
+        aggregate=asker(*llm, G_SYSTEM_PROMPT, G_SCHEMA, args.stream),
         round=asker(*llm, ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream),
     )
     stores = Stores(merged_file=str(args.merged), items=items)
