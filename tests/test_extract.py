@@ -18,7 +18,7 @@ from intent_aligner.extract import (
     topics_from,
     write_topic_files,
 )
-from intent_aligner.llm import Ask
+from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, TruncatedReply
 from intent_aligner.segment import Segment
 from intent_aligner.units import AIText, Item, UserSignal
 from intent_aligner.window import (
@@ -212,6 +212,21 @@ def test_retry_feedback_reaches_the_model() -> None:
 
     assert first.attempts == 2, first
     assert "不是要求的 JSON" in prompts[1], prompts[1]
+
+
+def test_a_truncated_reply_is_retried() -> None:
+    prompts: list[str] = []
+
+    def ask(prompt: str) -> str:
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            raise TruncatedReply("length")
+        return json.dumps({"topic": "NEW", "title": "事"})
+
+    first = _run(ask)[0]
+
+    assert first.attempts == 2, first
+    assert TRUNCATED_FEEDBACK in prompts[1], prompts[1]
 
 
 def test_a_window_that_does_not_fit_needs_review_without_a_call() -> None:

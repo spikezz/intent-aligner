@@ -30,7 +30,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, model_validator
 
 from intent_aligner.intent import INTENT_SCHEMA, Intent, stray_evidence
-from intent_aligner.llm import Ask, LLMError, asker
+from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, LLMError, TruncatedReply, asker
 from intent_aligner.units import (
     Item,
     Observation,
@@ -356,9 +356,10 @@ def _ask_until_valid[Answer: BaseModel](
 ) -> Answer:
     feedback = ""
     for _ in range(MAX_ATTEMPTS):
-        reply = ask(prompt + feedback)
         try:
-            return schema.model_validate_json(reply, context=context)
+            return schema.model_validate_json(ask(prompt + feedback), context=context)
+        except TruncatedReply:
+            feedback = f"\n\n{TRUNCATED_FEEDBACK}"
         except ValidationError as error:
             feedback = f"\n\n你上一次的回答不符合要求，请重新回答：{error}"
     raise LLMError(f"No valid digest for {tool_use_id} in {MAX_ATTEMPTS} attempts: {feedback}")

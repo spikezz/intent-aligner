@@ -10,7 +10,7 @@ import pytest
 
 from intent_aligner import compress
 from intent_aligner.compress import compress_conversation
-from intent_aligner.llm import Ask, LLMError
+from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, LLMError, TruncatedReply
 from intent_aligner.units import Item, UserSignal
 from intent_aligner.window import CallDigest, Digest, Digests, ResultDigest, RoundDigest
 from tests.test_segment import _Script
@@ -81,6 +81,14 @@ def test_evidence_outside_the_call_is_retried() -> None:
     made = _run([_call("c1")], Digests(), calls, _result_answer)
 
     assert "不是 <调用> 原文的摘录" in calls.prompts[1], calls.prompts[1]
+    assert [d.kind for d in made] == ["call", "round"], made
+
+
+def test_a_truncated_reply_is_retried() -> None:
+    calls = _Script(TruncatedReply("length"), _call_answer("<调用>\nBash:"))
+    made = _run([_call("c1")], Digests(), calls, _result_answer)
+
+    assert TRUNCATED_FEEDBACK in calls.prompts[1], calls.prompts[1]
     assert [d.kind for d in made] == ["call", "round"], made
 
 

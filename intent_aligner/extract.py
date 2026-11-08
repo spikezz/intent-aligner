@@ -38,7 +38,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from intent_aligner.compress import ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, summarize_trajectory
-from intent_aligner.llm import Ask, asker
+from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, TruncatedReply, asker
 from intent_aligner.segment import MessageSegments, Segment
 from intent_aligner.units import (
     AIText,
@@ -336,6 +336,9 @@ def _assign(
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             answer = _TAnswer.model_validate_json(ask(prompt + feedback))
+        except TruncatedReply:
+            feedback = f"\n\n{TRUNCATED_FEEDBACK}"
+            continue
         except ValidationError as error:
             feedback = f"\n\n你上一次的回答不是要求的 JSON，请重新回答：{error}"
             continue

@@ -115,6 +115,15 @@ class LLMError(RuntimeError):
     """The backend CLI failed or returned no usable reply."""
 
 
+class TruncatedReply(LLMError):
+    """The model ran out of room before finishing; callers count it as one failed attempt."""
+
+
+TRUNCATED_FEEDBACK = (
+    "你上一次的思考和回答超出了长度上限，没有写完。请直接给出答案，不要反复核对同一处细节。"
+)
+
+
 def complete(call: LLMCall, home: Path = LLM_HOME) -> LLMReply:
     """Run `call` once and return its reply; raises LLMError on any backend failure."""
     if call.backend == "pi" and call.json_schema is not None:
@@ -368,6 +377,10 @@ def _hive_complete(call: LLMCall, home: Path) -> LLMReply:
     if status != 200:
         raise LLMError(f"Hive gateway answered {status}: {response!r}; see {transcript}.")
     choice = response["choices"][0]
+    if choice["finish_reason"] == "length":
+        raise TruncatedReply(
+            f"{call.model} stopped with 'length', so the reply is incomplete; see {transcript}."
+        )
     if choice["finish_reason"] != "stop":
         raise LLMError(
             f"{call.model} stopped with {choice['finish_reason']!r}, so the reply is "

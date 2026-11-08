@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 import pytest
 
 from intent_aligner import segment
-from intent_aligner.llm import Ask, LLMError
+from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, LLMError, TruncatedReply
 from intent_aligner.segment import (
     AnchorError,
     MessageSegments,
@@ -80,15 +80,18 @@ def _message(body: str) -> UserMessage:
 
 
 class _Script:
-    """A fake model that replays canned answers and keeps the prompts it was sent."""
+    """A fake model that replays canned answers, raising the ones that are errors."""
 
-    def __init__(self, *answers: str) -> None:
+    def __init__(self, *answers: str | LLMError) -> None:
         self.answers = list(answers)
         self.prompts: list[str] = []
 
     def __call__(self, prompt: str) -> str:
         self.prompts.append(prompt)
-        return self.answers.pop(0)
+        answer = self.answers.pop(0)
+        if isinstance(answer, LLMError):
+            raise answer
+        return answer
 
 
 def _answer(end: str, evidence: str | None = None, *, explicit: bool = True, note: str = "") -> str:
@@ -127,6 +130,14 @@ def test_bad_json_is_retried() -> None:
     segments = segment_message("", _message("好的。"), _Script("not json", _answer("好的。")))
 
     assert segments[0].attempts == 2, segments
+
+
+def test_a_truncated_reply_is_retried() -> None:
+    script = _Script(TruncatedReply("length"), _answer("好的。"))
+    segments = segment_message("", _message("好的。"), script)
+
+    assert segments[0].attempts == 2, segments
+    assert TRUNCATED_FEEDBACK in script.prompts[1], script.prompts[1]
 
 
 def test_evidence_outside_the_segment_is_retried() -> None:

@@ -32,7 +32,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from intent_aligner.intent import INTENT_SCHEMA, Intent, stray_evidence
-from intent_aligner.llm import Ask, LLMError, asker
+from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, LLMError, TruncatedReply, asker
 from intent_aligner.units import Item, UserMessage, conversation_units
 from intent_aligner.window import (
     PROMPT_BUDGET,
@@ -199,10 +199,14 @@ def _next_segment(window: str, message: UserMessage, start: int, ask: Ask) -> Se
     feedback = ""
     from_start = False
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        reply = ask(build_prompt(window, message, start, feedback))
         try:
-            answer = SegmentAnswer.model_validate_json(reply)
+            answer = SegmentAnswer.model_validate_json(
+                ask(build_prompt(window, message, start, feedback))
+            )
             end = locate_end(message.body, start, answer.segment_end, from_start=from_start)
+        except TruncatedReply:
+            feedback = TRUNCATED_FEEDBACK
+            continue
         except ValidationError as error:
             feedback = f"回答不符合要求：{error}"
             continue
