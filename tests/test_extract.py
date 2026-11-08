@@ -883,7 +883,7 @@ ONE_SEGMENT = {"u1": [_segment(0, 3)]}
 
 
 def _one_round(
-    relation: Ask = _no_edges, outcome: Ask = _no_outcomes
+    relation: Ask = _no_edges, outcome: Ask = _no_outcomes, aggregate: Ask = _one_aggregate
 ) -> tuple[list[Assignment], Stores]:
     stores = Stores(merged_file="merged.jsonl", items=ONE_ROUND)
     got = _assignments(
@@ -891,6 +891,7 @@ def _one_round(
         ONE_SEGMENT,
         FULL,
         _new_then_first([]),
+        aggregate=aggregate,
         stores=stores,
         relation=relation,
         outcome=outcome,
@@ -920,20 +921,41 @@ def test_call_d_builds_the_node_and_the_produces_edge() -> None:
 
 def test_call_c_gives_a_picked_observation_its_node() -> None:
     prompts: list[str] = []
+    titles = iter(["甲", "乙"])
+
+    def aggregate(prompt: str) -> str:
+        return json.dumps({"answers": [{"aggregate": "NEW", "title": next(titles)}]})
 
     def relation(prompt: str) -> str:
         prompts.append(prompt)
         if len(prompts) == 1:
             return '{"edges": []}'
-        edge = {"from": "P2", "to": "G001", "relation": "triggers", "evidence": "结果c1"}
+        edge = {"from": "P2", "to": "G002", "relation": "triggers", "evidence": "结果c1"}
         return json.dumps({"edges": [edge]})
 
-    _, stores = _one_round(relation=relation)
+    _, stores = _one_round(relation=relation, aggregate=aggregate)
 
     assert {"id": "P2", "text": "结果c1"} in _header(prompts[1])["candidates"], prompts[1]  # type: ignore[operator]
     got = _edges(stores)
-    assert got == [("G001", "O001", "produces", "S002"), ("O001", "G001", "triggers", "S002")], got
+    assert got == [("G001", "O001", "produces", "S002"), ("O001", "G002", "triggers", "S003")], got
     assert list(stores.pending) == [4], "a picked observation stops being pending"
+
+
+def test_call_c_retries_a_trigger_into_the_aggregate_that_produced_the_observation() -> None:
+    prompts: list[str] = []
+
+    def relation(prompt: str) -> str:
+        prompts.append(prompt)
+        if "P2" not in prompt or len(prompts) > 2:
+            return '{"edges": []}'
+        edge = {"from": "P2", "to": "G001", "relation": "triggers", "evidence": "结果c1"}
+        return json.dumps({"edges": [edge]})
+
+    got, stores = _one_round(relation=relation)
+
+    assert "自己的工具调用产生的结果" in prompts[2], prompts[2]
+    assert not any(a.needs_review for a in got), got
+    assert _edges(stores) == [], "the rejected edge must not be stored"
 
 
 def test_call_c_retries_an_edge_against_the_direction_of_its_relation() -> None:

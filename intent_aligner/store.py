@@ -250,6 +250,11 @@ class Stores:
         """The observation id `offset` places after the last one given out."""
         return f"O{self.observations + 1 + offset:03d}"
 
+    def producers(self, source: ObservationSource) -> frozenset[str]:
+        """The aggregates of the tool call behind an observation; empty if no call produced it."""
+        call = self._call_spans.get(source.tool_use_id) if source.tool_use_id else None
+        return call.aggregates if call is not None else frozenset()
+
     def add_observation(
         self,
         topic: str | None,

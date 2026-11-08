@@ -178,7 +178,7 @@ spans:
 | `produces` | intent → observation | from 这个动作的执行产生了 to 这个观测；工具调用属于几个聚合，就从每个聚合各连一条 |
 | `satisfies` | observation → intent | from 这个观测表明 to 这个意图已经达成 |
 | `blocks` | observation → intent | from 这个观测表明 to 这个意图没有达成，或者遇到了障碍 |
-| `triggers` | observation → intent | from 这个观测引出了 to 这个新意图 |
+| `triggers` | observation → intent | from 这个观测引出了 to 这个新意图；to 不能是产生这个观测的聚合 |
 
 意图从 A 转向 B 时，如果转向是由某个观测引起的，图谱里要同时记录两条边：从 A 指向 B 的 `supersedes` 边，以及从这个观测指向 B 的 `triggers` 边。用户拒绝工具调用时，通常有一条从被拒绝调用所属的聚合指向用户信号意图的 `supersedes` 边。
 

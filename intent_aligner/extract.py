@@ -58,6 +58,7 @@ from intent_aligner.segment import MessageSegments, Segment
 from intent_aligner.store import (
     STORE_HEADER,
     Edge,
+    ObservationNode,
     ObservationSource,
     PendingObservation,
     SpanIntent,
@@ -237,7 +238,7 @@ C_SYSTEM_PROMPT = """\
 - relation：关系类型，含义见 relations。
 - evidence：这条关系的依据，从 <当前单元> 或 <此前的对话> 原样摘录。可以用 … 省略中间的部分，但被 … 分开的每个片段都必须原样出现，并且按原文的先后顺序排列。
 
-unit_intents 里带 refines 的意图补充了那个已有意图，必须有一条从已有意图指向它的 refines 边。意图从 A 转向 B 时，记 A 到 B 的 supersedes 边；转向由某个观测引起时，再记这个观测到 B 的 triggers 边。只记录这个单元实际表现出来的关系。
+unit_intents 里带 refines 的意图补充了那个已有意图，必须有一条从已有意图指向它的 refines 边。意图从 A 转向 B 时，记 A 到 B 的 supersedes 边；转向由某个观测引起时，再记这个观测到 B 的 triggers 边。triggers 的 to 是用户意图，或者产生这个观测的聚合之外的聚合；同一个聚合内部，结果引出下一步操作属于这个聚合本身的推进。只记录这个单元实际表现出来的关系。
 """
 
 _C_RELATIONS: dict[str, tuple[str, str, str]] = {
@@ -1089,7 +1090,9 @@ def _relate(
     except WindowError as error:
         return _review(record, str(error))
     pending = _visible_pending(step, topic, window.in_force, context, stores)
-    observations = {i for i, node in known.items() if node.type == "observation"} | set(pending)
+    origins = {i: node.source for i, node in known.items() if isinstance(node, ObservationNode)}
+    origins |= {handle: observation.source for handle, observation in pending.items()}
+    observations = set(origins)
     allowed = {*known, *unit_nodes, *pending}
     source = _unit_source(step.unit)
     shown_input = prompt[prompt.index("<此前的对话>") :]
@@ -1107,6 +1110,10 @@ def _relate(
             kinds = tuple("observation" if e in observations else "intent" for e in ends)
             if kinds != (start, end):
                 raise ValueError(f"{edge.relation} 的方向必须是 {start} -> {end}，{ends!r} 不是。")
+            if edge.relation == "triggers" and edge.to in stores.producers(origins[edge.from_]):
+                raise ValueError(
+                    f"{edge.from_} 是 {edge.to} 自己的工具调用产生的结果。同一个聚合内部，结果引出下一步操作属于这个聚合本身的推进，去掉这条 triggers 边。"
+                )
             if not is_excerpt(edge.evidence, source) and not is_excerpt(edge.evidence, shown_input):
                 raise ValueError(f"evidence {edge.evidence!r} 不是当前单元或此前对话的原文摘录。")
         linked = {(e.from_, e.to) for e in got if e.relation == "refines"}
