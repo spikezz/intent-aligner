@@ -1,23 +1,32 @@
-"""The main loop of trajectory extraction: the pointer and call T (topic assignment).
+"""The main loop of trajectory extraction: the pointer, call T, the intents and the stores.
 
 The pointer walks the units of a conversation in timeline order, a user message
 replaced by its segments (intent_aligner.segment); AI text is context only and is
 never a unit. A tool result takes the topic of the call that produced it; every
 other unit goes to call T, which picks a registered topic or opens a new one.
 
+A unit on the intent path then gets its intents: a user segment's from segmentation,
+a tool call's from level-1 compression, a user signal's from call A. Call B matches
+them against the topic's registry, the code gives the new ones global ids, and the
+unit's span goes into the topic's store (intent_aligner.store). Calls C and D, and
+so edges and observation nodes, are not built yet.
+
 The current round enters call T's window as level-1 digests, one per tool call and
 result. When the prompt would not fit the budget even with one earlier round, the
 round's tool records not yet compressed become one more level-2 passage, which stands
 in for them from then on; the passages of earlier compressions stay as they are.
 
-Calls A to D are not built yet, so a run writes these files under --out:
+A run writes these files under --out:
 
-    assignments.jsonl      one line per unit in pointer order; a rerun resumes after the last
+    assignments.jsonl      one line per unit in pointer order: its topic and its intents
+                           with their ids; a rerun resumes after the last line
     tool_compressions.jsonl  one line per compression of a current round's tool records
-    topics.yaml            the topic list (format in docs/trajectory-extractor.md), rebuilt
-                           from assignments.jsonl, which is the only record of new topics
-    topics/<id>.yaml       one per topic, with an empty graph until calls A to D fill it
-    run.log                new topics and needs_review units, for a human to look over
+    topics.yaml            the topic list (format in docs/trajectory-extractor.md)
+    topics/<id>.yaml       one store per topic; topics/unassigned.yaml for units without one
+    run.log                new topics, intentless messages and needs_review units
+
+topics.yaml and the stores are rebuilt from assignments.jsonl, the only record of
+what the models decided, so they always agree with it.
 
 Usage: python -m intent_aligner.extract MERGED.jsonl --digests DIGESTS.jsonl
            --segments SEGMENTS.jsonl --backend codex --model gpt-6.1-sol --out DIR
@@ -29,17 +38,19 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Literal
 
 import attrs
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from intent_aligner.compress import ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, summarize_trajectory
+from intent_aligner.intent import INTENT_SCHEMA, Intent, stray_evidence
 from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, TruncatedReply, asker
 from intent_aligner.segment import MessageSegments, Segment
+from intent_aligner.store import STORE_HEADER, SpanIntent, Stores, write_stores
 from intent_aligner.units import (
     AIText,
     Item,
@@ -63,11 +74,11 @@ from intent_aligner.window import (
     window_text,
 )
 
-MAX_ATTEMPTS = 2
+T_ATTEMPTS = 2
+CALL_ATTEMPTS = 3
 # Room kept free for retry feedback, which quotes a pydantic error at most.
 FEEDBACK_ROOM = 500
 NEW = "NEW"
-STORE_HEADER = "# 结构和填写规则见 docs/trajectory-extractor.md（路径相对于工具根目录）\n"
 
 T_SYSTEM_PROMPT = """\
 你在判断对话里的一个单元属于哪个 topic。topic 是对话里一件独立的事情：一个 session 里可以穿插几件互不相干的事，一件事也可以延续好几个 session。
@@ -87,6 +98,58 @@ T_SCHEMA = {
     "type": "object",
     "properties": {"topic": {"type": "string"}, "title": {"type": "string"}},
     "required": ["topic", "title"],
+    "additionalProperties": False,
+}
+
+A_SYSTEM_PROMPT = """\
+你在判断用户的一个信号表达了什么意图。用户信号是用户不通过打字表达的表态：用户按 ESC 中断 AI，记录里留下 [Request interrupted by user]；或者用户拒绝 AI 的一个工具调用，记录里留下以 The user doesn't want to 开头的信息，用户写了话时，话附在 the user said: 后面。
+
+<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个信号所属的 topic；unit 是这个信号的类型和时间；graph 是这个 topic 的意图图谱，nodes 是已经登记的意图（编号、发出者、标准文本），edges 是它们之间的关系。
+
+<此前的对话> 是这个信号之前的对话。更早的轮次里，AI 的工具操作压成了每轮一段概括；当前这一轮已经发生的工具调用和工具结果逐条列出，每条是一句概括。
+
+<当前单元> 是这个信号的原文。
+
+回答 intents：用户通过这个信号表达的意图，每个意图一项，没有意图时是空列表。信号本身通常只说明用户要 AI 停下或不要这样做，停下来针对的是什么、为什么，要靠此前的对话推断。用户在信号之后接着发的消息另外处理，这里只写这个信号本身表达的意图。每项回答四项：
+- text：意图，一句完整的话，用此前的对话把“这个”“那里”换成具体的事，脱离对话也能看懂。
+- evidence：这个意图在 <当前单元> 原文里的依据，原样摘录。可以用 … 省略中间的部分，但被 … 分开的每个片段都必须原样出现在原文里，并且按原文的先后顺序排列。
+- explicit：用户写的话里说出了这个意图就是 true；意图要靠此前的对话或常识推断时是 false。
+- note：explicit 为 false 时写推断出了什么、依据的是哪件事；explicit 为 true 时写空字符串。
+"""
+
+A_SCHEMA = {
+    "type": "object",
+    "properties": {"intents": {"type": "array", "items": INTENT_SCHEMA}},
+    "required": ["intents"],
+    "additionalProperties": False,
+}
+
+B_SYSTEM_PROMPT = """\
+你在把对话里一个单元的意图对照意图注册表：判断每个意图是这个 topic 已经登记的哪一个意图，还是新意图。
+
+<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个单元所属的 topic；unit 是这个单元的类型、发出者和时间；graph 是这个 topic 的意图图谱，nodes 是已经登记的意图（编号、发出者、标准文本），也就是注册表，edges 是它们之间的关系；candidates 是可以回答的已有编号。
+
+<此前的对话> 是这个单元之前的对话。<当前单元> 是这个单元：用户段落给出整条消息，用 <当前段落> 和 </当前段落> 标出这一段；工具调用给出它的意图和操作对象的概括。<本单元的意图> 按顺序列出这个单元的每个意图：编号、文本和原文依据。
+
+按 <本单元的意图> 的顺序，每个意图回答一项：
+- match：这个意图和注册表里的某个意图是同一个意图时，回答那个意图的编号；和注册表里的意图都不同时，回答 NEW。判断看意图本身是否相同，不看措辞是否相似：同一个意图换一种说法再出现，仍然回答原来的编号；措辞相近但要做的事不同，就是不同的意图。
+- complete：match 是已有编号时回答，已有意图的文本是否完整包含了这个单元关于这个意图的信息。这个单元给已有意图补充了新的信息，比如指定了具体用哪个文件、加了限定条件，就回答 false。match 是 NEW 时回答 true。
+"""
+
+B_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"match": {"type": "string"}, "complete": {"type": "boolean"}},
+                "required": ["match", "complete"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["answers"],
     "additionalProperties": False,
 }
 
@@ -115,11 +178,28 @@ class UnitRef(BaseModel):
     chars: tuple[int, int] | None = None
 
 
+class UnitIntent(BaseModel):
+    """One intent of a unit under its registry id, with how it shows up in the unit.
+
+    `label` is set when this unit registered the intent. `refines` is the existing
+    intent call B found incomplete, which call C will link to this new one.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    evidence: str
+    explicit: bool
+    note: str
+    label: str | None = None
+    refines: str | None = None
+
+
 class Assignment(BaseModel):
     """One line of assignments.jsonl; `topic` is None when the unit is unassigned.
 
     `new_title` is set on the unit that opened its topic. `review_reason` says why a
-    unit needs review; `attempts` is 0 when no call T was made.
+    unit needs review; `attempts` counts call T's calls and is 0 when none was made.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -127,6 +207,7 @@ class Assignment(BaseModel):
     unit: UnitRef
     topic: str | None
     new_title: str | None = None
+    intents: list[UnitIntent] = Field(default_factory=list)
     needs_review: bool = False
     review_reason: str | None = None
     attempts: int
@@ -147,6 +228,35 @@ class _TAnswer(BaseModel):
 
     topic: str
     title: str
+
+
+class _AAnswer(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    intents: list[Intent]
+
+
+class _Match(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    match: str
+    complete: bool
+
+
+class _BAnswer(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    answers: list[_Match]
+
+
+@attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
+class Asks:
+    """The model behind each call; `round` must carry the level-2 prompt of intent_aligner.compress."""
+
+    topic: Ask
+    signal: Ask
+    registry: Ask
+    round: Ask
 
 
 @attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
@@ -203,21 +313,22 @@ def topics_from(assignments: Sequence[Assignment], out: Path) -> list[TopicEntry
     ]
 
 
-def assign_topics(
+def extract_units(
     items: Sequence[Item],
     segments: dict[str, list[Segment]],
     digests: Digests,
     done: Sequence[Assignment],
     compressed: Sequence[ToolCompression],
-    ask: Ask,
-    ask_round: Ask,
+    asks: Asks,
     count: Count,
+    stores: Stores,
 ) -> Iterator[Assignment | ToolCompression]:
-    """Yield an assignment for every unit after the `done` ones, and each new compression.
+    """Yield a record for every unit after the `done` ones, and each new compression.
 
-    The units run one at a time because each call T sees the topics opened before it.
-    A compression is yielded before the assignment whose prompt needed it. `ask_round`
-    must carry the level-2 prompt of intent_aligner.compress.
+    The units run one at a time because each call sees the topics and intents
+    registered before it. `stores` takes every record, the `done` ones replayed
+    first, so it holds the stores as of the last record yielded. A compression is
+    yielded before the record whose prompt needed it.
     Raises ValueError when `done` no longer lines up with the conversation's units.
     """
     compressions: dict[int, list[ToolCompression]] = {}
@@ -230,29 +341,29 @@ def assign_topics(
     for position, step in enumerate(walk(items, segments)):
         ref = unit_ref(step.unit)
         if position < len(done):
-            assignment = done[position]
-            if assignment.unit != ref:
+            record = done[position]
+            if record.unit != ref:
                 raise ValueError(
-                    f"Unit {position} is {ref} but assignments.jsonl has {assignment.unit}; "
+                    f"Unit {position} is {ref} but assignments.jsonl has {record.unit}; "
                     "the conversation or its segments changed, so start a new --out."
                 )
+            _into_stores(stores, step, record)
         else:
             hint = round_hint if isinstance(step.unit, ToolCall) else None
-            in_force = compressions.setdefault(_round_low(step), [])
-            compression = _fit_round(step, context, hint, in_force, ask_round)
-            if compression is not None:
-                in_force.append(compression)
-                yield compression
-            assignment = _assign(step, ref, context, hint, in_force, call_topics, ask)
-            if assignment.new_title is not None:
-                assert assignment.topic is not None
-                topics.append((assignment.topic, assignment.new_title))
-            yield assignment
+            window = _Round(in_force=compressions.setdefault(_round_low(step), []), ask=asks.round)
+            record = _assign(step, ref, context, hint, window, call_topics, asks.topic)
+            if record.new_title is not None:
+                assert record.topic is not None
+                topics.append((record.topic, record.new_title))
+            record = _with_intents(step, record, context, window, asks, stores)
+            _into_stores(stores, step, record)
+            yield from window.fresh
+            yield record
         if isinstance(step.unit, UserSegment):
             round_hint = None
         elif isinstance(step.unit, ToolCall):
-            call_topics[step.unit.tool_use_id] = assignment.topic
-            round_hint = assignment.topic
+            call_topics[step.unit.tool_use_id] = record.topic
+            round_hint = record.topic
 
 
 @attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
@@ -272,44 +383,46 @@ def _round_low(step: _Step) -> int:
     return step.round_start or 0
 
 
-def _fit_round(
-    step: _Step,
-    context: _Context,
-    hint: str | None,
-    in_force: Sequence[ToolCompression],
-    ask_round: Ask,
-) -> ToolCompression | None:
-    """A new compression of `step`'s round if its prompt needs one, else None.
+@attrs.define(slots=True, kw_only=True)
+class _Round:
+    """The compressions of the round shown before one unit; `fresh` are the ones made for it.
 
-    The detector is the prompt itself: call T's prompt for this unit, with one earlier
-    round, must fit the budget. A tool result never calls T, so records it adds are
-    checked at the next unit that does; the round is compressed only when there is no
-    other way to fit, and the next prompt is built at once from the new passage.
+    `in_force` is the run's own list for the round, so a compression made for one
+    call of a unit is in force for its later calls and for the units after it.
     """
-    if not _needs_tool_call_t(step.unit):
-        return None
+
+    in_force: list[ToolCompression]
+    ask: Ask
+    fresh: list[ToolCompression] = attrs.field(factory=list)
+
+
+def _fitted_prompt(
+    step: _Step, context: _Context, system: str, head: str, window: _Round, tail: str = ""
+) -> str:
+    """The prompt of one call, compressing the round first when it would not fit otherwise.
+
+    The detector is the prompt itself: with one earlier round, it must fit the budget.
+    A tool result calls nothing, so the records it adds are checked at the next unit
+    that does. Raises WindowError when the prompt does not fit even after compressing.
+    """
     try:
-        t_prompt(step, context, hint, in_force)
+        return _prompt(step, context, system, head, window.in_force, tail)
     except WindowError:
-        pass
-    else:
-        return None
-    low = _round_low(step)
-    begin = in_force[-1].through if in_force else low
-    pending = [item for item in context.items[begin : step.index] if is_tool_record(item)]
-    if not pending:
-        return None
+        low = _round_low(step)
+        begin = window.in_force[-1].through if window.in_force else low
+        pending = [item for item in context.items[begin : step.index] if is_tool_record(item)]
+        if not pending:
+            raise
     lines = [" ".join(round_entry(item, context.digests).split()) for item in pending]
     opening = context.items[low]
     message = opening if isinstance(opening, UserMessage) else None
     summary = summarize_trajectory(
-        message, lines, ask_round, context.count, f"round at item {low} up to item {step.index}"
+        message, lines, window.ask, context.count, f"round at item {low} up to item {step.index}"
     )
-    return ToolCompression(start=low, begin=begin, through=step.index, summary=summary)
-
-
-def _needs_tool_call_t(unit: Unit) -> bool:
-    return not (isinstance(unit, Observation) and unit.tool_use_id is not None)
+    compression = ToolCompression(start=low, begin=begin, through=step.index, summary=summary)
+    window.in_force.append(compression)
+    window.fresh.append(compression)
+    return _prompt(step, context, system, head, window.in_force, tail)
 
 
 def _assign(
@@ -317,67 +430,255 @@ def _assign(
     ref: UnitRef,
     context: _Context,
     hint: str | None,
-    in_force: Sequence[ToolCompression],
+    window: _Round,
     call_topics: dict[str, str | None],
     ask: Ask,
 ) -> Assignment:
     unit = step.unit
     if isinstance(unit, Observation) and unit.tool_use_id is not None:
         return Assignment(unit=ref, topic=call_topics[unit.tool_use_id], attempts=0)
+    head = _header(unit, context.topics, {"round_topic_hint": hint})
     try:
-        prompt = t_prompt(step, context, hint, in_force)
+        prompt = _fitted_prompt(step, context, T_SYSTEM_PROMPT, head, window)
     except WindowError as error:
         return Assignment(
             unit=ref, topic=None, needs_review=True, review_reason=str(error), attempts=0
         )
     topics = context.topics
     ids = {topic_id for topic_id, _ in topics}
+
+    def parse(reply: str) -> _TAnswer:
+        answer = _TAnswer.model_validate_json(reply)
+        if answer.topic == NEW and not answer.title.strip():
+            raise ValueError("topic 为 NEW 时 title 不能为空。")
+        if answer.topic != NEW and answer.topic not in ids:
+            raise ValueError(f"{answer.topic!r} 不在 topics 列表里，只能回答列表里的编号或 NEW。")
+        return answer
+
+    answer, attempts, feedback = _ask_until_valid(ask, prompt, parse, T_ATTEMPTS)
+    if answer is None:
+        return Assignment(
+            unit=ref,
+            topic=None,
+            needs_review=True,
+            review_reason=f"call T gave no valid answer in {T_ATTEMPTS} attempts: {feedback}",
+            attempts=attempts,
+        )
+    if answer.topic == NEW:
+        topic_id = f"T{len(topics) + 1:03d}"
+        return Assignment(
+            unit=ref, topic=topic_id, new_title=answer.title.strip(), attempts=attempts
+        )
+    return Assignment(unit=ref, topic=answer.topic, attempts=attempts)
+
+
+def _ask_until_valid[Answer](
+    ask: Ask, prompt: str, parse: Callable[[str], Answer], attempts: int
+) -> tuple[Answer | None, int, str]:
+    """The first reply `parse` accepts, the calls made, and the last feedback.
+
+    `parse` raises ValueError with what is wrong (a pydantic ValidationError when the
+    reply is not the schema); that message goes back to the model with the prompt. A truncated reply counts
+    as a failed call too.
+    """
     feedback = ""
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
-            answer = _TAnswer.model_validate_json(ask(prompt + feedback))
+            return parse(ask(prompt + feedback)), attempt, ""
         except TruncatedReply:
             feedback = f"\n\n{TRUNCATED_FEEDBACK}"
-            continue
         except ValidationError as error:
             feedback = f"\n\n你上一次的回答不是要求的 JSON，请重新回答：{error}"
-            continue
-        title = answer.title.strip()
-        if answer.topic == NEW and title:
-            topic_id = f"T{len(topics) + 1:03d}"
-            return Assignment(unit=ref, topic=topic_id, new_title=title, attempts=attempt)
-        if answer.topic in ids:
-            return Assignment(unit=ref, topic=answer.topic, attempts=attempt)
-        problem = (
-            "topic 为 NEW 时 title 不能为空。"
-            if answer.topic == NEW
-            else f"{answer.topic!r} 不在 topics 列表里，只能回答列表里的编号或 NEW。"
+        except ValueError as error:
+            feedback = f"\n\n你上一次的回答有问题，请重新回答：{error}"
+    return None, attempts, feedback.strip()
+
+
+def _with_intents(
+    step: _Step,
+    record: Assignment,
+    context: _Context,
+    window: _Round,
+    asks: Asks,
+    stores: Stores,
+) -> Assignment:
+    """`record` with the unit's intents under their registry ids, or marked needs_review.
+
+    Observations wait for call D, and a unit without a topic has no registry to
+    match against, so both pass through unchanged.
+    """
+    unit, topic = step.unit, record.topic
+    if isinstance(unit, Observation) or topic is None:
+        return record
+    if record.new_title is not None:
+        stores.open_topic(topic)
+    if isinstance(unit, UserSegment):
+        intents = unit.segment.intents
+    elif isinstance(unit, ToolCall):
+        intents = context.digests.calls[unit.tool_use_id].intents
+    else:
+        try:
+            head = _graph_header(step, context, topic, stores)
+            prompt = _fitted_prompt(step, context, A_SYSTEM_PROMPT, head, window)
+        except WindowError as error:
+            return _review(record, str(error))
+        signal_text = unit.text
+
+        def parse_a(reply: str) -> list[Intent]:
+            found = _AAnswer.model_validate_json(reply).intents
+            strays = stray_evidence(found, signal_text)
+            if strays:
+                raise ValueError(
+                    f"这些 evidence 不是 <当前单元> 原文的摘录：{strays!r}。evidence 被 … 分开的"
+                    "每个片段都必须原样出现在原文里，并且按原文的先后顺序排列。"
+                )
+            return found
+
+        answered, _, feedback = _ask_until_valid(asks.signal, prompt, parse_a, CALL_ATTEMPTS)
+        if answered is None:
+            return _review(
+                record, f"call A gave no valid answer in {CALL_ATTEMPTS} attempts: {feedback}"
+            )
+        intents = answered
+    if not intents:
+        return record
+    return _match_intents(step, record, topic, intents, context, window, asks.registry, stores)
+
+
+def _match_intents(
+    step: _Step,
+    record: Assignment,
+    topic: str,
+    intents: list[Intent],
+    context: _Context,
+    window: _Round,
+    ask: Ask,
+    stores: Stores,
+) -> Assignment:
+    """Call B, then the ids: a registered intent keeps its id once per unit, others get new ones.
+
+    A topic with no intents yet has nothing to match, so call B is skipped.
+    """
+    candidates = [i for i, node in stores.topic_nodes(topic).items() if node.type == "intent"]
+    if not candidates:
+        matches = [_Match(match=NEW, complete=True) for _ in intents]
+    else:
+        listed = "\n".join(
+            f"{n}. {i.text}（依据：{i.evidence}）" for n, i in enumerate(intents, start=1)
         )
-        feedback = f"\n\n你上一次的回答有问题，请重新回答：{problem}"
-    return Assignment(
-        unit=ref,
-        topic=None,
-        needs_review=True,
-        review_reason=f"call T gave no valid answer in {MAX_ATTEMPTS} attempts:{feedback}",
-        attempts=MAX_ATTEMPTS,
-    )
+        head = _graph_header(step, context, topic, stores, candidates)
+        try:
+            tail = f"<本单元的意图>\n{listed}\n</本单元的意图>"
+            prompt = _fitted_prompt(step, context, B_SYSTEM_PROMPT, head, window, tail)
+        except WindowError as error:
+            return _review(record, str(error))
+        allowed = {*candidates, NEW}
+
+        def parse_b(reply: str) -> list[_Match]:
+            got = _BAnswer.model_validate_json(reply).answers
+            if len(got) != len(intents):
+                raise ValueError(
+                    f"answers 有 {len(got)} 项，但 <本单元的意图> 有 {len(intents)} 个，"
+                    "要按顺序给每个意图回答一项。"
+                )
+            wrong = [m.match for m in got if m.match not in allowed]
+            if wrong:
+                raise ValueError(
+                    f"{wrong!r} 不在 candidates 里，match 只能是 candidates 里的编号或 NEW。"
+                )
+            return got
+
+        answered, _, feedback = _ask_until_valid(ask, prompt, parse_b, CALL_ATTEMPTS)
+        if answered is None:
+            return _review(
+                record, f"call B gave no valid answer in {CALL_ATTEMPTS} attempts: {feedback}"
+            )
+        matches = answered
+    resolved: list[UnitIntent] = []
+    new = 0
+    for intent, matched in zip(intents, matches, strict=True):
+        found = intent.model_dump(exclude={"text"})
+        if matched.match != NEW and matched.complete:
+            if all(r.id != matched.match for r in resolved):
+                resolved.append(UnitIntent(id=matched.match, **found))
+            continue
+        refines = None if matched.match == NEW else matched.match
+        node_id = stores.next_intent_id(new)
+        new += 1
+        resolved.append(UnitIntent(id=node_id, label=intent.text, refines=refines, **found))
+    return record.model_copy(update={"intents": resolved})
 
 
-def t_prompt(
-    step: _Step, context: _Context, hint: str | None, in_force: Sequence[ToolCompression]
+def _review(record: Assignment, reason: str) -> Assignment:
+    return record.model_copy(update={"needs_review": True, "review_reason": reason})
+
+
+def _into_stores(stores: Stores, step: _Step, record: Assignment) -> None:
+    """Register the record's new intents and put the unit's span in its store.
+
+    Observations get no span; they become nodes once call D is built.
+    """
+    unit, topic = step.unit, record.topic
+    if topic is not None and topic not in stores.stores:
+        stores.open_topic(topic)
+    if isinstance(unit, Observation):
+        return
+    actor: Literal["user", "ai"] = "ai" if isinstance(unit, ToolCall) else "user"
+    for intent in record.intents:
+        if intent.label is not None:
+            assert topic is not None
+            stores.register(topic, intent.id, actor, intent.label)
+    spans = [
+        SpanIntent(id=i.id, evidence=i.evidence, explicit=i.explicit, note=i.note or None)
+        for i in record.intents
+    ]
+    if isinstance(unit, UserSegment):
+        segment = unit.segment
+        review = record.needs_review or segment.needs_review
+        stores.add_user_text(topic, unit.message, (segment.start, segment.end), spans, review)
+    elif isinstance(unit, UserSignal):
+        stores.add_user_signal(topic, unit, spans, record.needs_review)
+    else:
+        stores.add_tool_call(topic, unit, step.index, spans, record.needs_review)
+
+
+def _graph_header(
+    step: _Step,
+    context: _Context,
+    topic: str,
+    stores: Stores,
+    candidates: list[str] | None = None,
 ) -> str:
-    """The call T prompt for `step`; raises WindowError when even one earlier round does not fit.
+    """The header of calls after T: the current topic and its whole graph."""
+    graph = stores.stores[topic].meta.graph.model_dump(by_alias=True, exclude_none=True)
+    extra: dict[str, object] = {"current_topic": topic, "graph": graph}
+    if candidates is not None:
+        extra["candidates"] = candidates
+    return _header(step.unit, context.topics, extra)
+
+
+def _prompt(
+    step: _Step,
+    context: _Context,
+    system: str,
+    head: str,
+    in_force: Sequence[ToolCompression],
+    tail: str,
+) -> str:
+    """The prompt of one call for `step`; raises WindowError when even one earlier round does not fit.
 
     The window is the earlier rounds (as in segmentation) followed by the current
     round up to this unit, so the unit sees what led to it but not how the round ended.
+    `tail` follows the current unit; `system` only counts against the budget.
     """
     items, digests, count = context.items, context.digests, context.count
     round_start = step.round_start
     low = _round_low(step)
     so_far = render_round_so_far(items, low, step.index, digests, in_force)
-    head = _header(step.unit, context.topics, hint)
     current = f"<当前单元>\n{_render_unit(step.unit, digests)}\n</当前单元>"
-    rest = count(T_SYSTEM_PROMPT) + count(head) + count(so_far) + count(current)
+    if tail:
+        current = f"{current}\n\n{tail}"
+    rest = count(system) + count(head) + count(so_far) + count(current)
     room = PROMPT_BUDGET - rest - FEEDBACK_ROOM
     if room < 0:
         raise WindowError(
@@ -389,7 +690,7 @@ def t_prompt(
     return f"{head}\n\n<此前的对话>\n{window}\n</此前的对话>\n\n{current}"
 
 
-def _header(unit: Unit, topics: Sequence[tuple[str, str]], hint: str | None) -> str:
+def _header(unit: Unit, topics: Sequence[tuple[str, str]], extra: dict[str, object]) -> str:
     ref = unit_ref(unit)
     source = unit.message.source if isinstance(unit, UserSegment) else unit.source
     actor = {"user_segment": "user", "user_signal": "user", "tool_call": "ai"}.get(
@@ -406,9 +707,8 @@ def _header(unit: Unit, topics: Sequence[tuple[str, str]], hint: str | None) -> 
     header: dict[str, object] = {
         "topics": [{"id": topic_id, "title": title} for topic_id, title in topics],
         "unit": described,
+        **{key: value for key, value in extra.items() if value is not None},
     }
-    if hint is not None:
-        header["round_topic_hint"] = hint
     return f"<header>\n{json.dumps(header, ensure_ascii=False, indent=2)}\n</header>"
 
 
@@ -424,20 +724,15 @@ def _render_unit(unit: Unit, digests: Digests) -> str:
     return f"【用户】\n{marked}{images}"
 
 
-def write_topic_files(out: Path, topics: Sequence[TopicEntry]) -> None:
-    """Rewrite topics.yaml and create the store file of every topic that has none yet."""
-    (out / "topics").mkdir(parents=True, exist_ok=True)
+def write_topic_files(out: Path, topics: Sequence[TopicEntry], stores: Stores) -> None:
+    """Rewrite topics.yaml and every store file, the unassigned one included."""
     listing = {"topics": [topic.model_dump() for topic in topics]}
-    (out / "topics.yaml").write_text(STORE_HEADER + _yaml(listing), encoding="utf-8")
-    for topic in topics:
-        path = Path(topic.file)
-        if not path.exists():
-            store = {"meta": {"topic": topic.id, "graph": {"nodes": {}, "edges": []}}, "spans": []}
-            path.write_text(STORE_HEADER + _yaml(store), encoding="utf-8")
-
-
-def _yaml(data: object) -> str:
-    return yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "topics.yaml").write_text(
+        STORE_HEADER + yaml.safe_dump(listing, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    write_stores(out / "topics", stores, {topic.id: Path(topic.file) for topic in topics})
 
 
 def load_assignments(path: Path) -> list[Assignment]:
@@ -472,7 +767,8 @@ def log_line(assignment: Assignment) -> str | None:
     if assignment.new_title is not None:
         return f"new topic {assignment.topic}: {assignment.new_title} (opened by {where})"
     if assignment.review_reason is not None:
-        return f"needs_review, unassigned: {where}: {assignment.review_reason}"
+        place = assignment.topic or "unassigned"
+        return f"needs_review in {place}: {where}: {assignment.review_reason}"
     return None
 
 
@@ -498,18 +794,24 @@ def main() -> None:
     assignments_path = args.out / "assignments.jsonl"
     done = load_assignments(assignments_path)
     topics = topics_from(done, args.out)
-    write_topic_files(args.out, topics)
     compressions_path = args.out / "tool_compressions.jsonl"
     llm = (args.backend, args.model, args.effort)
-    results = assign_topics(
+    asks = Asks(
+        topic=asker(*llm, T_SYSTEM_PROMPT, T_SCHEMA, args.stream),
+        signal=asker(*llm, A_SYSTEM_PROMPT, A_SCHEMA, args.stream),
+        registry=asker(*llm, B_SYSTEM_PROMPT, B_SCHEMA, args.stream),
+        round=asker(*llm, ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream),
+    )
+    stores = Stores(merged_file=str(args.merged), items=items)
+    results = extract_units(
         items,
         load_segments(args.segments),
         load_digests(args.digests),
         done,
         load_compressions(compressions_path),
-        asker(*llm, T_SYSTEM_PROMPT, T_SCHEMA, args.stream),
-        asker(*llm, ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream),
+        asks,
         qwen_tokens,
+        stores,
     )
     position = len(done)
     with (
@@ -531,7 +833,7 @@ def main() -> None:
             out.flush()
             if assignment.new_title is not None:
                 topics = [*topics, *topics_from([assignment], args.out)]
-                write_topic_files(args.out, topics)
+            write_topic_files(args.out, topics, stores)
             line = log_line(assignment)
             if line is not None:
                 log.write(line + "\n")
