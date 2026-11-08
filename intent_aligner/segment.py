@@ -32,7 +32,16 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from intent_aligner.intent import INTENT_SCHEMA, Intent, stray_evidence
-from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, LLMError, TruncatedReply, asker
+from intent_aligner.llm import (
+    CALL_SUBJECT,
+    CALLS_FILE,
+    TRUNCATED_FEEDBACK,
+    Ask,
+    CallLog,
+    LLMError,
+    TruncatedReply,
+    asker,
+)
 from intent_aligner.units import Item, UserMessage, conversation_units
 from intent_aligner.window import (
     PROMPT_BUDGET,
@@ -298,6 +307,7 @@ def _segment_at(
     ask: Ask,
     count: Count,
 ) -> MessageSegments:
+    CALL_SUBJECT.set(f"message:{message.source.uuid}")
     try:
         window = message_window(items, index, digests, count)
     except WindowError as error:
@@ -334,7 +344,10 @@ def main() -> None:
 
     items = list(conversation_units(args.merged))
     done = load_done(args.out) if args.out.exists() else set()
-    ask = asker(args.backend, args.model, args.effort, SYSTEM_PROMPT, SCHEMA, args.stream)
+    log = CallLog(path=args.out.parent / CALLS_FILE)
+    ask = asker(
+        args.backend, args.model, args.effort, SYSTEM_PROMPT, SCHEMA, args.stream, log, "segment"
+    )
     results = segment_conversation(
         items, load_digests(args.digests), done, ask, qwen_tokens, args.workers
     )

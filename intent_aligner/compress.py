@@ -30,7 +30,16 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, model_validator
 
 from intent_aligner.intent import INTENT_SCHEMA, Intent, stray_evidence
-from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, LLMError, TruncatedReply, asker
+from intent_aligner.llm import (
+    CALL_SUBJECT,
+    CALLS_FILE,
+    TRUNCATED_FEEDBACK,
+    Ask,
+    CallLog,
+    LLMError,
+    TruncatedReply,
+    asker,
+)
 from intent_aligner.units import (
     Item,
     Observation,
@@ -207,6 +216,7 @@ def _compress_pair(
     count: Count,
 ) -> list[Digest]:
     """A call (unless done) then its result; a rejected or unanswered call has no result."""
+    CALL_SUBJECT.set(f"tool:{call.tool_use_id}")
     made: list[Digest] = []
     digest = done.calls.get(call.tool_use_id)
     if digest is None:
@@ -276,6 +286,7 @@ def _outcome(tool_use_id: str, digests: Digests, rejections: dict[str, str]) -> 
 def _compress_round(
     round_uuid: str, message: UserMessage | None, trajectory: list[str], ask: Ask, count: Count
 ) -> list[Digest]:
+    CALL_SUBJECT.set(f"round:{round_uuid}")
     summary = summarize_trajectory(message, trajectory, ask, count, round_uuid)
     return [RoundDigest(round_uuid=round_uuid, summary=summary)]
 
@@ -396,9 +407,10 @@ def main() -> None:
     items = _until(list(conversation_units(args.merged)), args.until)
     done = load_digests(args.out) if args.out.exists() else Digests()
     llm_args = (args.backend, args.model, args.effort)
-    ask_call = asker(*llm_args, CALL_SYSTEM_PROMPT, CALL_SCHEMA, args.stream)
-    ask_result = asker(*llm_args, RESULT_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream)
-    ask_round = asker(*llm_args, ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream)
+    log = CallLog(path=args.out.parent / CALLS_FILE)
+    ask_call = asker(*llm_args, CALL_SYSTEM_PROMPT, CALL_SCHEMA, args.stream, log, "call")
+    ask_result = asker(*llm_args, RESULT_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream, log, "result")
+    ask_round = asker(*llm_args, ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream, log, "round")
     digests = compress_conversation(
         items, done, ask_call, ask_result, ask_round, qwen_tokens, args.workers
     )

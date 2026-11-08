@@ -407,3 +407,33 @@ def test_live_call_stays_isolated(backend: llm.Backend, tmp_path: Path) -> None:
         return
     leaked = [p for p in DAILY_TRANSCRIPTS[backend].rglob("*.jsonl") if reply.session_id in p.name]
     assert not leaked, f"{backend} wrote a daily transcript: {leaked}"
+
+
+def test_asker_logs_every_call_with_its_subject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replies = iter(
+        [
+            llm.LLMReply(text="{}", session_id="s1", transcript=tmp_path / "s1.jsonl"),
+            LLMError("truncated", tmp_path / "s2.jsonl"),
+        ]
+    )
+
+    def fake_complete(call: LLMCall, home: Path = llm.LLM_HOME) -> llm.LLMReply:
+        reply = next(replies)
+        if isinstance(reply, LLMError):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(llm, "complete", fake_complete)
+    log = llm.CallLog(path=tmp_path / llm.CALLS_FILE)
+    ask = llm.asker("hive", "m", "xhigh", "system", {}, True, log, "topic")
+    llm.CALL_SUBJECT.set("unit:3")
+    assert ask("p") == "{}"
+    with pytest.raises(LLMError):
+        ask("p")
+    got = [llm.CallRecord.model_validate_json(line) for line in log.path.read_text().splitlines()]
+    assert [(r.ask, r.subject, r.transcript, r.error) for r in got] == [
+        ("topic", "unit:3", str(tmp_path / "s1.jsonl"), None),
+        ("topic", "unit:3", str(tmp_path / "s2.jsonl"), "truncated"),
+    ], got

@@ -25,11 +25,14 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Iterable
+from contextvars import ContextVar
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -112,7 +115,14 @@ class Invocation:
 
 
 class LLMError(RuntimeError):
-    """The backend CLI failed or returned no usable reply."""
+    """The backend CLI failed or returned no usable reply.
+
+    `transcript` is the file the failed call left, when the backend got far enough to write one.
+    """
+
+    def __init__(self, message: str, transcript: Path | None = None) -> None:
+        super().__init__(message)
+        self.transcript = transcript
 
 
 class TruncatedReply(LLMError):
@@ -154,6 +164,46 @@ def complete(call: LLMCall, home: Path = LLM_HOME) -> LLMReply:
 
 Ask = Callable[[str], str]
 
+# Each pipeline command logs its calls to this file next to its --out.
+CALLS_FILE = "calls.jsonl"
+
+# The job or unit the current call serves, e.g. "tool:<tool_use_id>" or "unit:<position>".
+# It is a ContextVar and not an Ask argument because the job that knows it sits several
+# calls above the Ask, in code that must not care whether calls are logged. Each job
+# sets it in the thread that runs the job.
+CALL_SUBJECT: ContextVar[str] = ContextVar("CALL_SUBJECT")
+
+
+class CallRecord(BaseModel):
+    """One endpoint call of a pipeline command, as a line of its calls.jsonl.
+
+    `ask` is the asker's role in the command (e.g. "topic", "call"). A retry is a
+    separate record; its prompt in the transcript is the first prompt plus the feedback.
+    `transcript` is None only when the backend failed before writing one.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    ask: str
+    subject: str
+    started: datetime
+    ended: datetime
+    transcript: str | None
+    error: str | None = None
+
+
+@attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
+class CallLog:
+    """Appends CallRecords to one file; the asks of all worker threads share it."""
+
+    path: Path
+    lock: threading.Lock = attrs.field(factory=threading.Lock)
+
+    def write(self, record: CallRecord) -> None:
+        """Append one record as a line."""
+        with self.lock, self.path.open("a", encoding="utf-8") as f:
+            f.write(record.model_dump_json() + "\n")
+
 
 def asker(
     backend: Backend,
@@ -162,8 +212,13 @@ def asker(
     system_prompt: str,
     schema: dict[str, Any],
     stream: bool,
+    log: CallLog,
+    name: str,
 ) -> Ask:
-    """An Ask: one isolated call per prompt under a fixed system prompt and reply schema."""
+    """An Ask: one isolated call per prompt under a fixed system prompt and reply schema.
+
+    Every call, failed or not, is logged under `name` and the caller's CALL_SUBJECT.
+    """
 
     def ask(prompt: str) -> str:
         call = LLMCall(
@@ -175,7 +230,33 @@ def asker(
             json_schema=schema,
             stream=stream,
         )
-        return complete(call).text
+        subject = CALL_SUBJECT.get()
+        started = datetime.now(UTC)
+        try:
+            reply = complete(call)
+        except LLMError as error:
+            transcript = None if error.transcript is None else str(error.transcript)
+            log.write(
+                CallRecord(
+                    ask=name,
+                    subject=subject,
+                    started=started,
+                    ended=datetime.now(UTC),
+                    transcript=transcript,
+                    error=str(error),
+                )
+            )
+            raise
+        log.write(
+            CallRecord(
+                ask=name,
+                subject=subject,
+                started=started,
+                ended=datetime.now(UTC),
+                transcript=str(reply.transcript),
+            )
+        )
+        return reply.text
 
     return ask
 
@@ -301,7 +382,9 @@ def _codex_reply(call: LLMCall, stdout: str, home: Path) -> LLMReply:
         for event in events:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     if failures or not messages:
-        raise LLMError(f"codex returned no reply; see {transcript}. Failures: {failures!r}")
+        raise LLMError(
+            f"codex returned no reply; see {transcript}. Failures: {failures!r}", transcript
+        )
     return LLMReply(text=str(messages[-1]), session_id=thread_id, transcript=transcript)
 
 
@@ -313,7 +396,8 @@ def _pi_reply(stdout: str, home: Path) -> LLMReply:
     if final["role"] != "assistant" or final["stopReason"] != "stop":
         raise LLMError(
             f"pi stopped with {final.get('stopReason')!r}: {final.get('errorMessage')!r}; "
-            f"see {transcript}."
+            f"see {transcript}.",
+            transcript,
         )
     text = "".join(part["text"] for part in final["content"] if part["type"] == "text")
     return LLMReply(text=text, session_id=session_id, transcript=transcript)
@@ -375,16 +459,20 @@ def _hive_complete(call: LLMCall, home: Path) -> LLMReply:
         record = {"type": "response", "status": status, "body": response}
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     if status != 200:
-        raise LLMError(f"Hive gateway answered {status}: {response!r}; see {transcript}.")
+        raise LLMError(
+            f"Hive gateway answered {status}: {response!r}; see {transcript}.", transcript
+        )
     choice = response["choices"][0]
     if choice["finish_reason"] == "length":
         raise TruncatedReply(
-            f"{call.model} stopped with 'length', so the reply is incomplete; see {transcript}."
+            f"{call.model} stopped with 'length', so the reply is incomplete; see {transcript}.",
+            transcript,
         )
     if choice["finish_reason"] != "stop":
         raise LLMError(
             f"{call.model} stopped with {choice['finish_reason']!r}, so the reply is "
-            f"incomplete; see {transcript}."
+            f"incomplete; see {transcript}.",
+            transcript,
         )
     return LLMReply(
         text=str(choice["message"]["content"]), session_id=call_id, transcript=transcript

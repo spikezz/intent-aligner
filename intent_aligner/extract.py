@@ -45,7 +45,7 @@ import json
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import attrs
 import yaml
@@ -53,7 +53,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from intent_aligner.compress import ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, summarize_trajectory
 from intent_aligner.intent import INTENT_SCHEMA, Intent, is_excerpt, stray_evidence
-from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, TruncatedReply, asker
+from intent_aligner.llm import (
+    CALL_SUBJECT,
+    CALLS_FILE,
+    TRUNCATED_FEEDBACK,
+    Ask,
+    CallLog,
+    TruncatedReply,
+    asker,
+)
 from intent_aligner.segment import MessageSegments, Segment
 from intent_aligner.store import (
     STORE_HEADER,
@@ -600,6 +608,7 @@ def extract_units(
                 )
             _into_stores(stores, step, record)
         else:
+            CALL_SUBJECT.set(f"unit:{position}")
             hint = round_hint if isinstance(step.unit, ToolCall) else None
             window = _Round(in_force=compressions.setdefault(_round_low(step), []), ask=asks.round)
             record = _assign(step, ref, context, hint, window, call_topics, asks.topic)
@@ -1451,17 +1460,23 @@ def main() -> None:
     done = load_assignments(assignments_path)
     topics = topics_from(done, args.out)
     compressions_path = args.out / "tool_compressions.jsonl"
-    llm = (args.backend, args.model, args.effort)
+    calls = CallLog(path=args.out / CALLS_FILE)
+
+    def ask(name: str, system: str, schema: dict[str, Any]) -> Ask:
+        return asker(
+            args.backend, args.model, args.effort, system, schema, args.stream, calls, name
+        )
+
     asks = Asks(
-        topic=asker(*llm, T_SYSTEM_PROMPT, T_SCHEMA, args.stream),
-        signal=asker(*llm, A_SYSTEM_PROMPT, A_SCHEMA, args.stream),
-        registry=asker(*llm, B_SYSTEM_PROMPT, B_SCHEMA, args.stream),
-        aggregate=asker(*llm, G_SYSTEM_PROMPT, G_SCHEMA, args.stream),
-        tool_intent=asker(*llm, L_SYSTEM_PROMPT, L_SCHEMA, args.stream),
-        relation=asker(*llm, C_SYSTEM_PROMPT, C_SCHEMA, args.stream),
-        outcome=asker(*llm, D_SYSTEM_PROMPT, D_SCHEMA, args.stream),
-        outcome_summary=asker(*llm, D_SUMMARY_SYSTEM_PROMPT, D_SUMMARY_SCHEMA, args.stream),
-        round=asker(*llm, ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream),
+        topic=ask("topic", T_SYSTEM_PROMPT, T_SCHEMA),
+        signal=ask("signal", A_SYSTEM_PROMPT, A_SCHEMA),
+        registry=ask("registry", B_SYSTEM_PROMPT, B_SCHEMA),
+        aggregate=ask("aggregate", G_SYSTEM_PROMPT, G_SCHEMA),
+        tool_intent=ask("tool_intent", L_SYSTEM_PROMPT, L_SCHEMA),
+        relation=ask("relation", C_SYSTEM_PROMPT, C_SCHEMA),
+        outcome=ask("outcome", D_SYSTEM_PROMPT, D_SCHEMA),
+        outcome_summary=ask("outcome_summary", D_SUMMARY_SYSTEM_PROMPT, D_SUMMARY_SCHEMA),
+        round=ask("round", ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA),
     )
     stores = Stores(merged_file=str(args.merged), items=items)
     results = extract_units(
