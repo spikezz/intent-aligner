@@ -137,7 +137,9 @@ flowchart TD
     VA -- "通过，空列表" --> SPAN
     VA -- "通过，非空" --> RET["代码：列出候选<br/>当前 topic 的全部节点 + 窗口内尚未建节点的观测<br/>+ 被拒绝调用的意图（用户拒绝时）"]:::code
 
-    RET --> B["调用 B：每个意图是已有的哪一个？<br/>输出 已有编号或 NEW<br/>+ 已有意图是否完整包含这个单元的信息"]:::llm
+    RET --> HAS{当前 topic 已有意图节点？}:::code
+    HAS -- "没有：全部算作 NEW" --> ASSIGN
+    HAS -- 有 --> B["调用 B：每个意图是已有的哪一个？<br/>输出 已有编号或 NEW<br/>+ 已有意图是否完整包含这个单元的信息"]:::llm
     B --> VB{"校验 B<br/>答案和本单元的意图一一对应？<br/>选的编号在候选列表里？<br/>选已有编号的都回答了完整性？"}:::check
     VB -- 不通过 --> B
     VB -- 通过 --> ASSIGN["代码：同一单元内重复的编号去重<br/>给 NEW 和“不完整”的意图分配新编号<br/>填 type / actor"]:::code
@@ -175,7 +177,7 @@ flowchart TD
     END -- 有 --> PTR
     END -- 没有 --> DONE([结束])
 
-    VT -. 调用 2 次仍失败 .-> NR["调用 T 失败：topic 记为未归属<br/>意图路径：标记 needs_review，单独成段<br/>观测路径：建 needs_review 的观测节点<br/>写入存储，写一条运行日志，继续下一个"]:::store
+    VT -. 调用 2 次仍失败 .-> NR["调用 T 失败时 topic 记为未归属<br/>其他调用失败时保留已判定的 topic<br/>意图路径：标记 needs_review，单独成段<br/>观测路径：建 needs_review 的观测节点<br/>写入存储，写一条运行日志，继续下一个"]:::store
     VA -.-> NR
     VB -.-> NR
     VC -.-> NR
