@@ -20,7 +20,14 @@ import pytest
 from pydantic import ValidationError
 
 from intent_aligner import llm
-from intent_aligner.llm import LLMCall, LLMError, build_invocation, complete, hive_request_body
+from intent_aligner.llm import (
+    LLMCall,
+    LLMError,
+    build_invocation,
+    complete,
+    hive_client,
+    hive_request_body,
+)
 
 SCHEMA = {
     "type": "object",
@@ -183,6 +190,33 @@ def test_hive_schema_becomes_response_format() -> None:
     assert body["response_format"]["json_schema"]["schema"] == SCHEMA, body
 
 
+def _listing(*clients: dict[str, object]) -> dict[str, dict[str, Any]]:
+    entries: dict[str, dict[str, Any]] = {
+        f"deployment/d{n}": {"id": f"deployment/d{n}", "hive": {"client": c}}
+        for n, c in enumerate(clients)
+    }
+    members = [{"deployment": f"d{n}"} for n in range(len(clients))]
+    entries["pool"] = {"id": "pool", "instances": members}
+    return entries
+
+
+def test_a_role_takes_its_members_shared_client() -> None:
+    renamed = {**QWEN_CLIENT, "name": "another card"}
+
+    got = hive_client(_listing(QWEN_CLIENT, renamed), "pool")
+
+    assert {k: v for k, v in got.items() if k != "name"} == {
+        k: v for k, v in QWEN_CLIENT.items() if k != "name"
+    }, got
+
+
+def test_a_role_whose_members_differ_in_protocol_is_refused() -> None:
+    unbudgeted = {k: v for k, v in QWEN_CLIENT.items() if k != "thinking_token_budget_field"}
+
+    with pytest.raises(LLMError, match="different client protocols"):
+        hive_client(_listing(QWEN_CLIENT, unbudgeted), "pool")
+
+
 class _Gateway:
     """A stand-in Hive gateway: one deployment, a canned chat reply, recorded requests."""
 
@@ -295,9 +329,11 @@ def test_a_stream_cut_off_is_an_incomplete_reply() -> None:
     assert llm._assemble_stream(lines)["choices"][0]["finish_reason"] is None
 
 
-def test_hive_rejects_a_role_without_client_declaration(tmp_path: Path, gateway: _Gateway) -> None:
+def test_hive_rejects_a_name_that_is_neither_deployment_nor_role(
+    tmp_path: Path, gateway: _Gateway
+) -> None:
     with pytest.raises(LLMError, match=r"Running now: \['deployment/d'\]"):
-        complete(_call("hive", "chat"), tmp_path)
+        complete(_call("hive", "no-such-pool"), tmp_path)
 
 
 def test_hive_truncated_reply_is_an_error_but_still_recorded(

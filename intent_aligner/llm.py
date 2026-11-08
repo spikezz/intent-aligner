@@ -392,16 +392,38 @@ def _hive_complete(call: LLMCall, home: Path) -> LLMReply:
 
 
 def _hive_client(model: str) -> dict[str, Any]:
-    """Only deployment ids carry a client declaration; a role may route to several."""
     _, listing = _hive_get("/v1/models")
-    entries = {str(e["id"]): e for e in listing["data"]}
-    if model not in entries or "hive" not in entries[model]:
-        served = sorted(i for i, e in entries.items() if "hive" in e)
+    return hive_client({str(e["id"]): e for e in listing["data"]}, model)
+
+
+def hive_client(entries: dict[str, dict[str, Any]], model: str) -> dict[str, Any]:
+    """The client declaration `model` is called with: a deployment's own, or a role's.
+
+    The gateway picks a role's member only after the body is built, so every member
+    must take the same body. Members may differ in display name, nothing else.
+    """
+    entry = entries.get(model)
+    if entry is not None and "hive" in entry:
+        return cast(dict[str, Any], entry["hive"]["client"])
+    served = sorted(i for i, e in entries.items() if "hive" in e or i.startswith("deployment/"))
+    if entry is None:
         raise LLMError(
-            f"{model!r} is not a running Hive deployment. Running now: {served}. "
-            "Start one with `hive-frame services apply`."
+            f"{model!r} is neither a running Hive deployment nor a role. Running now: "
+            f"{served}. Start one with `hive-frame services apply` or `hive-frame setup apply`."
         )
-    return cast(dict[str, Any], entries[model]["hive"]["client"])
+    members = [f"deployment/{i['deployment']}" for i in entry["instances"]]
+    clients = {m: entries[m]["hive"]["client"] for m in members}
+    protocols = {
+        json.dumps({k: v for k, v in c.items() if k != "name"}, sort_keys=True)
+        for c in clients.values()
+    }
+    if len(protocols) != 1:
+        raise LLMError(
+            f"The members of {model!r} declare different client protocols, so one request "
+            f"body cannot fit whichever member the gateway picks: {clients!r}. "
+            "Align models.<model>.client in hive.json."
+        )
+    return cast(dict[str, Any], next(iter(clients.values())))
 
 
 def _hive_get(path: str) -> tuple[int, dict[str, Any]]:
