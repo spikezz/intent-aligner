@@ -2,7 +2,7 @@
 
 意图对齐器由三部分组成：轨迹提取器、可视化，以及后续待定的部分。
 
-轨迹提取器从一段对话的时间线开头开始，依次读取用户说的话、AI 的工具调用和环境返回的结果，提取其中的意图、观测以及它们之间的关系。轨迹提取器已经实现的部分是：把对话按时间顺序切成处理单元、两级压缩工具操作、把用户消息按意图切成段落，以及主循环的前半部分，即逐个单元判断它属于哪个 topic、把用户的意图对照 topic 的已有意图、把工具调用的底层意图归入意图聚合并在聚合内去重，然后写入段落（见下面“运行”的第 3 到 6 步）；之后建关系和观测节点的步骤还没有实现。`playground/` 里是手工完成的示范提取，每个 topic 一个文件 `playground/topics/<topic 编号>.yaml`，所有 topic 列在 `playground/topics.yaml` 里。
+轨迹提取器从一段对话的时间线开头开始，依次读取用户说的话、AI 的工具调用和环境返回的结果，提取其中的意图、观测以及它们之间的关系。轨迹提取器已经实现的部分是：把对话按时间顺序切成处理单元、两级压缩工具操作、把用户消息按意图切成段落，以及主循环，即逐个单元判断它属于哪个 topic、把用户的意图对照 topic 的已有意图、把工具调用的底层意图归入意图聚合并在聚合内去重、建立意图之间的关系，并判断每个观测达成或阻碍了哪些意图（见下面“运行”的第 3 到 6 步）。`playground/` 里是手工完成的示范提取，每个 topic 一个文件 `playground/topics/<topic 编号>.yaml`，所有 topic 列在 `playground/topics.yaml` 里。
 
 ## 运行
 
@@ -45,8 +45,8 @@ $PY -m intent_aligner.segment corpus/merged/claude-5a1f0c1a.jsonl \
     --backend hive --model deployment/pc-qwen38-np8 --out $OUT/segments.jsonl
 
 # 6. 指针按时间顺序逐个走过单元（用户消息换成第 5 步的段落），判断每个单元属于哪个 topic，再把用户的意图
-#    对照 topic 的已有意图，把工具调用的底层意图归入聚合并在聚合内去重。工具结果沿用它的调用的 topic，
-#    不调用模型；其余单元每个都要调用模型，次数取决于单元类型。第 4、5 步都必须先对整个对话跑完
+#    对照 topic 的已有意图，把工具调用的底层意图归入聚合并在聚合内去重，再建立意图之间的关系，判断观测的影响。
+#    工具结果沿用它的调用的 topic；每个单元要调用模型的次数取决于单元类型。第 4、5 步都必须先对整个对话跑完
 $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
     --digests $OUT/digests.jsonl --segments $OUT/segments.jsonl \
     --backend hive --model deployment/pc-qwen38-np8 --out $OUT/extract
@@ -58,7 +58,7 @@ $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
 
 第 5 步里，模型重试几次仍然定位不到段落结尾，或者连一轮对话都放不进窗口时，剩下的文本成为一段 `needs_review: true`、意图为空的段落，原因打印在标准错误里。
 
-第 6 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（用户意图节点、工具调用的意图聚合节点和段落，暂时还没有边和观测节点）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic 和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：一轮太长、模型看到的内容放不下时，还没压缩过的工具操作会压缩成一段话，之前压缩出的段落保持不变，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
+第 6 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（用户意图节点、工具调用的意图聚合节点、观测节点、边和段落）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic、整条没有意图的用户消息和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：一轮太长、模型看到的内容放不下时，还没压缩过的工具操作会压缩成一段话，之前压缩出的段落保持不变，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
 
 第 1 步完成后，`corpus/index.json` 会列出每个合并后的对话，包括成员 session、记录条数、丢弃的 fork 复制品数量，以及损坏的行。
 

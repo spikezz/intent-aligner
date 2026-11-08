@@ -48,7 +48,7 @@ flowchart TD
     A --> VA{"校验 A<br/>每项字段齐全？<br/>evidence 是单元原文的摘录？<br/>explicit 为 false 时 note 非空？"}
     VA -- 不通过 --> A
     VA -- "通过，空列表" --> SPAN
-    VA -- "通过，非空" --> RET["代码：列出候选<br/>调用 B：当前 topic 的用户意图节点<br/>调用 C：当前 topic 的全部节点 + 窗口内尚未建节点的观测<br/>（用户拒绝时被拒绝调用所属的聚合已在全部节点里）"]
+    VA -- "通过，非空" --> RET["代码：列出候选<br/>调用 B：当前 topic 的用户意图节点<br/>调用 C：当前 topic 的全部节点 + 窗口内能单独看到的未建节点观测<br/>（用户拒绝时被拒绝调用所属的聚合已在全部节点里）"]
 
     RET --> HAS{当前 topic 已有意图节点？}
     HAS -- "没有：全部算作 NEW" --> ASSIGN
@@ -70,7 +70,7 @@ flowchart TD
     GASSIGN["代码：给 NEW 分配 G 编号<br/>同一个底层意图沿用原 L 编号，其余分配新 L 编号<br/>登记进 meta.tool_intents，段落引用 L 编号"]
     GASSIGN --> C
     C["调用 C：这个单元的每个意图<br/>和候选之间有关系吗？<br/>输出 [起点编号, 终点编号, relation 枚举, evidence]"]
-    C --> VC{"校验 C<br/>两端一个是本单元的意图<br/>另一个在候选列表里？<br/>relation 在枚举里且方向和节点类型匹配？<br/>evidence 是单元原文或 input 的摘录？<br/>“不完整”的意图有 refines 边？"}
+    C --> VC{"校验 C<br/>两端一个是本单元的意图<br/>另一个在候选列表或本单元的意图里？<br/>relation 在枚举里且方向和节点类型匹配？<br/>evidence 是单元原文或 input 的摘录？<br/>“不完整”的意图有 refines 边？"}
     VC -- 不通过 --> C
     VC -- 通过 --> TRIG["代码：重复的边去重<br/>triggers 指向尚未建节点的观测时<br/>用这个观测的概括文本为它建节点<br/>是工具结果则补 produces 边"]
     TRIG --> SPAN
@@ -91,13 +91,13 @@ flowchart TD
     PEND --> FINAL
 
     FINAL{"代码：pydantic 校验"}
-    FINAL -- 通过 --> WRITE[("写入当前 topic 的存储文件")]
+    FINAL -- 通过 --> MSGEND{"刚处理完一条用户消息的<br/>最后一个段落？"}
     FINAL -- 不通过 --> HALT([报错停止：这是代码的 bug])
-    WRITE --> MSGEND{"刚处理完一条用户消息的<br/>最后一个段落？"}
-    MSGEND -- 是 --> COVER{"代码：覆盖检查<br/>这条消息在所有 topic 文件<br/>和未归属文件里的段落<br/>合起来首尾相接覆盖整个正文？"}
-    MSGEND -- 否 --> END
-    COVER -- 通过 --> END
+    MSGEND -- 是 --> COVER{"代码：覆盖检查<br/>这条消息在所有 topic 存储<br/>和未归属存储里的段落<br/>（包括当前这一段）合起来首尾相接覆盖整个正文？"}
+    MSGEND -- 否 --> WRITE[("写入当前 topic 的存储文件")]
+    COVER -- 通过 --> WRITE
     COVER -- 不通过 --> HALT
+    WRITE --> END
     END{还有单元？}
     END -- 有 --> PTR
     END -- 没有 --> DONE([结束])
@@ -111,26 +111,10 @@ flowchart TD
     VD -.-> NR
     NR -.-> PTR
 
-    class A,ASSIGN,B,COVER,CUT,DONE,END,G,GASSIGN,HALT,HAS,INHERIT,ISRES,KIND,L,LHAS,MSGEND,NEWT,PTR,SEG,SEGI,SPAN,SRC,START,T,VA,VB,VG,VL,VT,WRITE,ZIP,ZIPI done
-    class CTX,RET,FINAL,NR partial
-    class C,VC,TRIG,BACKFILL,CTXD,RETD,D,VD,ONODE,PEND todo
+    class A,ASSIGN,B,BACKFILL,C,COVER,CTX,CTXD,CUT,D,DONE,END,FINAL,G,GASSIGN,HALT,HAS,INHERIT,ISRES,KIND,L,LHAS,MSGEND,NEWT,NR,ONODE,PEND,PTR,RET,RETD,SEG,SEGI,SPAN,SRC,START,T,TRIG,VA,VB,VC,VD,VG,VL,VT,WRITE,ZIP,ZIPI done
+
 ```
 
-## 部分实现的节点
+## 当前代码和图的差异
 
-| 节点 | 已经实现的部分 | 还没有实现的部分 |
-|---|---|---|
-| 组装 context（意图路径） | 调用 A、B、G、L 的 header、窗口和预算检查（调用 T 的 context 在这个节点之前组装，已经实现） | 调用 C 需要的 `relations`、`unit_intents`，以及候选里窗口内尚未建节点的观测 |
-| 列出候选 | 调用 B 的候选，即当前 topic 的用户意图节点 | 调用 C 的候选 |
-| pydantic 校验 | 新建的段落、意图节点和聚合节点在构造时校验，校验失败时报错停止 | 写入前没有对整个存储做一次校验，图上的这个节点在代码里并不是单独的一步；工具调用并入前一段时用 `model_copy` 更新段落，这一步不经过校验；边和观测节点还不存在 |
-| 重试失败后的路径 | 调用 T、A、B、G、L 失败时的未归属和 `needs_review` 处理，以及运行日志 | 调用 C 失败时的处理；观测路径上建 `needs_review` 观测节点；一个单元开启了新 topic、之后的调用又失败时，`run.log` 只记录新 topic，不记录这次失败 |
-
-## 当前代码实际走的路径
-
-当前代码在下面几处和图上的箭头不同，前两处的原因是调用 C 和调用 D 还没有实现：
-
-- 意图路径上，分配完编号以后直接进入“定段落”，跳过调用 C、校验 C、`triggers` 的处理和边的 `span` 回填。所以存储文件里 `edges` 始终是空的。调用 B 判为“不完整”的意图，它要 refines 的编号只保存在 `assignments.jsonl` 里，还没有变成边。
-- 观测路径上，代码只为这个观测确定 topic，然后直接进入下一个单元，不写段落也不建观测节点。工具结果沿用调用的 topic；任务通知和系统消息仍然经过调用 T。
-- 覆盖检查发生在写入存储之前，图上画的是写入之后。代码在写入最后一个段落的内存结构时就做覆盖检查，所以检查不通过时，这个单元不会写进任何文件。
-
-`docs/workflow.md` 的“运行日志”一节还要求记录“整条用户消息都没有意图”的情况，这一项没有实现，当前的 `run.log` 只记录新 topic 和 `needs_review`。流程图上没有这一项对应的节点，所以它没有体现在颜色里。
+流程图的所有节点都已经实现，目前没有虚线和红色节点，代码和图没有差异。覆盖检查发生在写入存储之前，所以检查不通过时，这个单元不会写进任何文件。

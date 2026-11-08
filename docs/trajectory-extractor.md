@@ -2,7 +2,7 @@
 
 本文档定义轨迹提取器的概念、存储格式、关系类型和判断原则；提取流程（处理单元、context 组装、LLM 调用和校验）定义在 `docs/workflow.md`。topic 列表 `playground/topics.yaml` 和各个 topic 存储文件 `playground/topics/<topic 编号>.yaml` 的结构以本文档为准，自动提取写到 `--out` 目录下的 `topics.yaml` 和 `topics/` 用的是同样的结构；存储文件、代码或提示词和这两份文档冲突时，先改文档，再改它们。
 
-轨迹提取器的工作方式是：从一段对话的时间线开头开始，依次读取用户说的话、AI 的工具调用，以及环境返回的结果。它从用户的话和 AI 的工具调用里提取意图，把影响了意图走向的环境结果记为观测，再记录这些节点之间的关系，最后形成一张意图图谱。提取由 `intent_aligner.extract` 自动执行，模型可以是本地 LLM，也可以是 Claude 或 Codex 的模型；调用 C 和调用 D 还没有实现，所以自动提取目前不产出边和观测节点。`playground/` 里是手工完成的示范提取，包含自动提取还不产出的部分。
+轨迹提取器的工作方式是：从一段对话的时间线开头开始，依次读取用户说的话、AI 的工具调用，以及环境返回的结果。它从用户的话和 AI 的工具调用里提取意图，把影响了意图走向的环境结果记为观测，再记录这些节点之间的关系，最后形成一张意图图谱。提取由 `intent_aligner.extract` 自动执行，模型可以是本地 LLM，也可以是 Claude 或 Codex 的模型。`playground/` 里是手工完成的示范提取。
 
 适用范围：目前处理 Claude Code 和 Codex 对话的主时间线。子代理的内部记录（`subagents/` 目录）和上下文压缩后注入的摘要，处理方式都还没有确定。
 
@@ -109,7 +109,7 @@ meta:
       - from: I001
         to: I002
         relation: prerequisite
-        span: S002            # 这条关系是在哪个段落里确立的
+        span: S002            # 这条关系是在哪个段落里确立的；satisfies 和 blocks 来自观测，观测没有段落，所以没有这个字段
         evidence: "原文片段"
   tool_intents:               # 聚合 -> 底层意图编号 -> 底层意图的文本；不在 graph 里，所以不进 header
     G001:
@@ -175,14 +175,14 @@ spans:
 | `serves` | intent → intent | from 是实现 to 的手段 |
 | `refines` | intent → intent | to 把 from 具体化，或者给 from 加上限定；from 是已有的意图，to 是新意图 |
 | `supersedes` | intent → intent | to 修正或取代了 from；from 是旧意图，to 是新意图 |
-| `produces` | intent → observation | from 这个动作的执行产生了 to 这个观测；工具调用有几个意图，就从每个意图各连一条 |
+| `produces` | intent → observation | from 这个动作的执行产生了 to 这个观测；工具调用属于几个聚合，就从每个聚合各连一条 |
 | `satisfies` | observation → intent | from 这个观测表明 to 这个意图已经达成 |
 | `blocks` | observation → intent | from 这个观测表明 to 这个意图没有达成，或者遇到了障碍 |
 | `triggers` | observation → intent | from 这个观测引出了 to 这个新意图 |
 
 意图从 A 转向 B 时，如果转向是由某个观测引起的，图谱里要同时记录两条边：从 A 指向 B 的 `supersedes` 边，以及从这个观测指向 B 的 `triggers` 边。用户拒绝工具调用时，通常有一条从被拒绝调用所属的聚合指向用户信号意图的 `supersedes` 边。
 
-`satisfies` 和 `blocks` 记录的是环境给出的事实。用户对 AI 工作的评价，比如打分或者说“这个不对”，在性质上是评价信号，不属于观测；这类评价是否单独建节点类型，等语料里读到时再定。
+`produces`、`satisfies` 和 `blocks` 边的 `evidence` 是观测的概括文本，因为这些边不是从对话原文里摘录出来的。`satisfies` 和 `blocks` 记录的是环境给出的事实。用户对 AI 工作的评价，比如打分或者说“这个不对”，在性质上是评价信号，不属于观测；这类评价是否单独建节点类型，等语料里读到时再定。
 
 ## 判断原则
 

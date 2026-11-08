@@ -5,5 +5,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
-corpus/
+corpus/*
+!corpus/results/
+corpus/results/*
+!corpus/results/README.md
+!corpus/results/segment-intents-comparison.md
 llm-home/
