@@ -1,11 +1,11 @@
-"""Cut a user message into segments with an LLM-driven pointer.
+"""Cut a speech (a user message or what the AI said to the user) into segments with an LLM-driven pointer.
 
 The model never reports offsets: each call shows the whole message split at the
 pointer and asks for the intents of the next segment plus the segment's closing
 text, copied verbatim. Code locates that text in the rest of the message, so one
 segment always ends where the next begins. Each intent carries its evidence, an
-excerpt code checks against the located segment, and whether the user said it or
-the model inferred it, so the main loop takes user segments' intents from here and
+excerpt code checks against the located segment, and whether the speaker said it or
+the model inferred it, so the main loop takes speech segments' intents from here and
 does not ask call A for them.
 
 The prompt also carries the window before the message (intent_aligner.window),
@@ -17,7 +17,8 @@ message still tile it.
 
 Usage: python -m intent_aligner.segment MERGED.jsonl --digests DIGESTS.jsonl
            --backend codex --model gpt-6.1-sol --out SEGMENTS.jsonl [--workers 8]
-Every user message of the conversation is segmented; the output is appended to as
+           [--window-rounds N]
+Every speech of the conversation is segmented; the output is appended to as
 messages finish, so a stopped run resumes where it was.
 """
 
@@ -42,14 +43,16 @@ from intent_aligner.llm import (
     TruncatedReply,
     asker,
 )
-from intent_aligner.units import Item, UserMessage, conversation_units
+from intent_aligner.units import SPEAKER_NAMES, Item, Speech, conversation_units
 from intent_aligner.window import (
+    DEFAULT_WINDOW_ROUNDS,
     PROMPT_BUDGET,
     Count,
     Digests,
     WindowError,
     load_digests,
     qwen_tokens,
+    window_rounds,
     window_text,
 )
 
@@ -59,15 +62,15 @@ CONTEXT_CHARS = 30
 FEEDBACK_ROOM = 2_000
 
 SYSTEM_PROMPT = """\
-你在把一条用户消息按意图切成连续的段落。<此前的对话> 是这条消息之前的对话，其中 AI 每一轮的工具操作已经压缩成一段概括（【AI 的工具操作】）；它只用来理解用户在回应什么、指的是什么，不切分它。要切的消息分成两部分：<已处理> 是前面已经切好的文本，<剩余> 是还没有切的文本。你只确定下一段：它从 <剩余> 的第一个字符开始，到哪里结束由你判断。
+你在把对话里的一次发言按意图切成连续的段落。发言可能是用户说的，也可能是 AI 对用户说的，<说话的一方> 写明是谁。<此前的对话> 是这次发言之前的对话，其中每一轮的工具操作已经压缩成一段概括（【AI 的工具操作】）；它只用来理解说话的一方在回应什么、指的是什么，不切分它。要切的发言分成两部分：<已处理> 是前面已经切好的文本，<剩余> 是还没有切的文本。你只确定下一段：它从 <剩余> 的第一个字符开始，到哪里结束由你判断。
 
 一段是一串连续的文本，其中表达的意图集合保持不变；意图集合一变，这一段就结束。一个句子可以被切成几段，几句话也可以是一段。本身没有意图的内容（客套话、粘贴进来的材料、日志、表格、图片标记 [Image #N]）归入用到它、说明它或回应它的那一段，不单独成段。
 
 回答两项：
-- intents：这一段里用户的意图。用户要 AI 做的事不同，才算不同的意图；用户告知的情况（理由、背景、条件、自己接下来的状态）并入它支撑的那个意图，不单独列出。一段里只有告知、没有要 AI 做的事时，告知的内容本身就是意图。每个意图回答四项：
+- intents：这一段里说话的一方的意图。说话的一方自己要做或者要对方做的事不同，才算不同的意图；告知的情况（理由、背景、条件、自己接下来的状态）并入它支撑的那个意图，不单独列出。一段里只有告知、没有要做的事时，告知的内容本身就是意图，比如 AI 报告的结论、回答对方的内容。每个意图回答四项：
   - text：意图，一句话。要脱离对话也能看懂：用 <此前的对话> 把“这个”“当前任务”“继续干”这类指代换成具体的事。
   - evidence：这个意图在这一段原文里的依据，原样摘录。可以用 … 省略中间的部分，但被 … 分开的每个片段都必须原样出现在这一段里，并且按原文的先后顺序排列。
-  - explicit：用户在这一段里明说了这个意图，就是 true。text 里有这一段原文没有说出、要靠 <此前的对话> 或常识推断的内容，就是 false，比如原文只有“继续”，要继续做什么来自此前的对话。只把“这个”“那里”换成它明确指向的东西，不算推断。
+  - explicit：说话的一方在这一段里明说了这个意图，就是 true。text 里有这一段原文没有说出、要靠 <此前的对话> 或常识推断的内容，就是 false，比如原文只有“继续”，要继续做什么来自此前的对话。只把“这个”“那里”换成它明确指向的东西，不算推断。
   - note：explicit 为 false 时写推断依据：推断出了什么，依据的是此前对话里的哪件事。explicit 为 true 时写空字符串。
 - segment_end：从 <剩余> 里原样抄出这一段末尾的几个字符（不含末尾的空格和换行），一个字符都不能改，包括标点和空格。代码会在 <剩余> 里查找它来确定段落结尾，所以它在 <剩余> 里必须只出现一次；不够唯一就往前多抄几个字。
 """
@@ -175,10 +178,11 @@ def _around(rest: str, i: int, length: int) -> str:
     )
 
 
-def build_prompt(window: str, message: UserMessage, start: int, feedback: str) -> str:
-    """The window, the message split at the pointer, its images, and any retry feedback."""
+def build_prompt(window: str, message: Speech, start: int, feedback: str) -> str:
+    """The window, the speaker, the speech split at the pointer, its images, and any retry feedback."""
     parts = [
         f"<此前的对话>\n{window}\n</此前的对话>",
+        f"<说话的一方>\n{SPEAKER_NAMES[message.speaker]}\n</说话的一方>",
         f"<已处理>\n{message.body[:start]}\n</已处理>",
         f"<剩余>\n{message.body[start:]}\n</剩余>",
     ]
@@ -189,7 +193,7 @@ def build_prompt(window: str, message: UserMessage, start: int, feedback: str) -
     return "\n\n".join(parts)
 
 
-def segment_message(window: str, message: UserMessage, ask: Ask) -> list[Segment]:
+def segment_message(window: str, message: Speech, ask: Ask) -> list[Segment]:
     """Walk the pointer through the body; `ask` sends one prompt and returns the reply text.
 
     A segment still not located after MAX_ATTEMPTS calls takes the rest of the body
@@ -204,7 +208,7 @@ def segment_message(window: str, message: UserMessage, ask: Ask) -> list[Segment
     return segments
 
 
-def _next_segment(window: str, message: UserMessage, start: int, ask: Ask) -> Segment:
+def _next_segment(window: str, message: Speech, start: int, ask: Ask) -> Segment:
     feedback = ""
     from_start = False
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -243,7 +247,7 @@ def _next_segment(window: str, message: UserMessage, start: int, ask: Ask) -> Se
     return _review_segment(message, start, MAX_ATTEMPTS)
 
 
-def _review_segment(message: UserMessage, start: int, attempts: int) -> Segment:
+def _review_segment(message: Speech, start: int, attempts: int) -> Segment:
     return Segment(
         start=start,
         end=len(message.body),
@@ -254,12 +258,14 @@ def _review_segment(message: UserMessage, start: int, attempts: int) -> Segment:
     )
 
 
-def message_window(items: Sequence[Item], index: int, digests: Digests, count: Count) -> str:
+def message_window(
+    items: Sequence[Item], index: int, digests: Digests, count: Count, rounds: int
+) -> str:
     """The window for segmenting items[index], sized so the longest prompt still fits."""
     message = items[index]
-    assert isinstance(message, UserMessage)
+    assert isinstance(message, Speech)
     rest = count(SYSTEM_PROMPT) + count(build_prompt("", message, 0, ""))
-    return window_text(items, index, digests, PROMPT_BUDGET - rest - FEEDBACK_ROOM, count)
+    return window_text(items, index, digests, PROMPT_BUDGET - rest - FEEDBACK_ROOM, count, rounds)
 
 
 def segment_conversation(
@@ -269,8 +275,9 @@ def segment_conversation(
     ask: Ask,
     count: Count,
     workers: int,
+    rounds: int,
 ) -> Iterator[MessageSegments]:
-    """Yield the segments of every user message whose uuid is not in `done`, as each finishes.
+    """Yield the segments of every speech whose uuid is not in `done`, as each finishes.
 
     A backend failure does not stop the other messages, because a long run must keep
     what it can; LLMError is raised after the last one if any failed.
@@ -278,12 +285,12 @@ def segment_conversation(
     jobs = {
         index: item
         for index, item in enumerate(items)
-        if isinstance(item, UserMessage) and item.source.uuid not in done
+        if isinstance(item, Speech) and item.source.uuid not in done
     }
     failures: list[LLMError] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
-            pool.submit(_segment_at, items, index, message, digests, ask, count)
+            pool.submit(_segment_at, items, index, message, digests, ask, count, rounds)
             for index, message in jobs.items()
         ]
         for future in as_completed(futures):
@@ -302,14 +309,15 @@ def segment_conversation(
 def _segment_at(
     items: Sequence[Item],
     index: int,
-    message: UserMessage,
+    message: Speech,
     digests: Digests,
     ask: Ask,
     count: Count,
+    rounds: int,
 ) -> MessageSegments:
     CALL_SUBJECT.set(f"message:{message.source.uuid}")
     try:
-        window = message_window(items, index, digests, count)
+        window = message_window(items, index, digests, count, rounds)
     except WindowError as error:
         print(f"needs_review: {error}", file=sys.stderr, flush=True)
         segments = [_review_segment(message, 0, 0)]
@@ -325,8 +333,8 @@ def load_done(path: Path) -> set[str]:
 
 
 def main() -> None:
-    """CLI entry point: segment every user message of one conversation, appending to --out."""
-    parser = argparse.ArgumentParser(description="Segment user messages with an LLM.")
+    """CLI entry point: segment every speech of one conversation, appending to --out."""
+    parser = argparse.ArgumentParser(description="Segment speech with an LLM.")
     parser.add_argument("merged", type=Path)
     parser.add_argument("--digests", type=Path, required=True)
     parser.add_argument("--backend", choices=["claude", "codex", "hive"], required=True)
@@ -334,6 +342,7 @@ def main() -> None:
     parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], default="xhigh")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=8, help="np8 serves 8 slots")
+    parser.add_argument("--window-rounds", type=window_rounds, default=DEFAULT_WINDOW_ROUNDS)
     parser.add_argument(
         "--stream",
         action=argparse.BooleanOptionalAction,
@@ -349,7 +358,7 @@ def main() -> None:
         args.backend, args.model, args.effort, SYSTEM_PROMPT, SCHEMA, args.stream, log, "segment"
     )
     results = segment_conversation(
-        items, load_digests(args.digests), done, ask, qwen_tokens, args.workers
+        items, load_digests(args.digests), done, ask, qwen_tokens, args.workers, args.window_rounds
     )
     with args.out.open("a", encoding="utf-8") as out:
         for result in results:

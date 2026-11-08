@@ -1,13 +1,13 @@
 """The main loop of trajectory extraction: the pointer, call T, the intents and the stores.
 
-The pointer walks the units of a conversation in timeline order, a user message
-replaced by its segments (intent_aligner.segment); AI text is context only and is
-never a unit. A tool result takes the topic of the call that produced it; every
+The pointer walks the units of a conversation in timeline order, each speech
+(a user message or an AI text) replaced by its segments (intent_aligner.segment).
+A tool result takes the topic of the call that produced it; every
 other unit goes to call T, which picks a registered topic or opens a new one.
 
-A unit on the intent path then gets its intents: a user segment's from segmentation,
-a tool call's from level-1 compression, a user signal's from call A. Call B matches a
-user's intents against the topic's registry; call G files each tool-call intent under
+A unit on the intent path then gets its intents: a speech segment's from segmentation,
+a tool call's from level-1 compression, a user signal's from call A. Call B matches
+intents against the registry entries of the same actor; call G files each tool-call intent under
 an aggregate, the only form tool calls take in the graph, and call L matches it
 against that aggregate's tool-call intents, so a repeated one keeps its id. The code gives new nodes
 global ids, and the unit's span goes into the topic's store (intent_aligner.store).
@@ -28,13 +28,14 @@ A run writes these files under --out:
     tool_compressions.jsonl  one line per compression of a current round's tool records
     topics.yaml            the topic list (format in docs/trajectory-extractor.md)
     topics/<id>.yaml       one store per topic; topics/unassigned.yaml for units without one
-    run.log                new topics, intentless messages and needs_review units
+    run.log                new topics, intentless speeches and needs_review units
 
 topics.yaml and the stores are rebuilt from assignments.jsonl, the only record of
 what the models decided, so they always agree with it.
 
 Usage: python -m intent_aligner.extract MERGED.jsonl --digests DIGESTS.jsonl
-           --segments SEGMENTS.jsonl --backend codex --model gpt-6.1-sol --out DIR
+           --segments SEGMENTS.jsonl --backend codex --model gpt-6.1-sol
+           [--window-rounds 2] --out DIR
 The digests and segments must cover the whole conversation.
 """
 
@@ -66,6 +67,7 @@ from intent_aligner.segment import MessageSegments, Segment
 from intent_aligner.store import (
     STORE_HEADER,
     Edge,
+    IntentNode,
     ObservationNode,
     ObservationSource,
     PendingObservation,
@@ -74,17 +76,17 @@ from intent_aligner.store import (
     write_stores,
 )
 from intent_aligner.units import (
-    AIText,
+    SPEAKER_NAMES,
     Item,
     Observation,
+    Speech,
     ToolCall,
-    UserMessage,
     UserSignal,
     conversation_units,
 )
 from intent_aligner.window import (
+    DEFAULT_WINDOW_ROUNDS,
     PROMPT_BUDGET,
-    ROUNDS,
     Count,
     Digests,
     ToolCompression,
@@ -95,6 +97,7 @@ from intent_aligner.window import (
     render_following,
     render_round_so_far,
     round_entry,
+    window_rounds,
     window_text,
 )
 
@@ -107,11 +110,11 @@ NEW = "NEW"
 T_SYSTEM_PROMPT = """\
 你在判断对话里的一个单元属于哪个 topic。topic 是对话里一件独立的事情：一个 session 里可以穿插几件互不相干的事，一件事也可以延续好几个 session。
 
-<header> 是结构化的信息：topics 是已经登记的 topic 列表（编号和标题）；unit 是当前单元的类型、发出者和时间，用户段落还有它在消息正文里的字符区间 chars；当前单元是工具调用时，round_topic_hint 是这一轮前一个工具调用的 topic，AI 在一轮里通常做同一件事，但它只是参考。
+<header> 是结构化的信息：topics 是已经登记的 topic 列表（编号和标题）；unit 是当前单元的类型、发出者和时间，发言段落还有它在发言正文里的字符区间 chars；当前单元是工具调用时，round_topic_hint 是这一轮前一个工具调用的 topic，AI 在一轮里通常做同一件事，但它只是参考。
 
 <此前的对话> 是当前单元之前的对话。更早的轮次里，AI 的工具操作压成了每轮一段概括（【AI 的工具操作】）；当前这一轮已经发生的工具调用和工具结果逐条列出，每条是一句概括（【AI 的工具调用】【工具结果】）。
 
-<当前单元> 是要判断的单元。用户段落给出整条消息，用 <当前段落> 和 </当前段落> 标出要判断的那一段；工具调用给出它的意图和操作对象的概括。
+<当前单元> 是要判断的单元。发言段落给出整次发言，用 <当前段落> 和 </当前段落> 标出要判断的那一段；工具调用给出它的意图和操作对象的概括。
 
 回答两项：
 - topic：当前单元做的事属于哪个已有 topic，就回答它的编号；和已有的 topic 都不是同一件事时，回答 NEW。
@@ -151,9 +154,9 @@ A_SCHEMA = {
 B_SYSTEM_PROMPT = """\
 你在把对话里一个单元的意图对照意图注册表：判断每个意图是这个 topic 已经登记的哪一个意图，还是新意图。
 
-<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个单元所属的 topic；unit 是这个单元的类型、发出者和时间；graph 是这个 topic 的意图图谱，nodes 是已经登记的意图（编号、发出者、标准文本），也就是注册表，edges 是它们之间的关系；candidates 是可以回答的已有编号。
+<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个单元所属的 topic；unit 是这个单元的类型、发出者和时间；graph 是这个 topic 的意图图谱，nodes 是已经登记的意图（编号、发出者、标准文本），也就是注册表，edges 是它们之间的关系；candidates 是可以回答的已有编号，只包含和这个单元同一发出者的意图：用户的意图只和用户的意图比较，AI 的意图只和 AI 的意图比较。
 
-<此前的对话> 是这个单元之前的对话。<当前单元> 是这个单元：用户段落给出整条消息，用 <当前段落> 和 </当前段落> 标出这一段；工具调用给出它的意图和操作对象的概括。<本单元的意图> 按顺序列出这个单元的每个意图：编号、文本和原文依据。
+<此前的对话> 是这个单元之前的对话。<当前单元> 是这个单元：发言段落给出整次发言，用 <当前段落> 和 </当前段落> 标出这一段；工具调用给出它的意图和操作对象的概括。<本单元的意图> 按顺序列出这个单元的每个意图：编号、文本和原文依据。
 
 按 <本单元的意图> 的顺序，每个意图回答一项：
 - match：这个意图和注册表里的某个意图是同一个意图时，回答那个意图的编号；和注册表里的意图都不同时，回答 NEW。判断看意图本身是否相同，不看措辞是否相似：同一个意图换一种说法再出现，仍然回答原来的编号；措辞相近但要做的事不同，就是不同的意图。
@@ -161,9 +164,9 @@ B_SYSTEM_PROMPT = """\
 """
 
 G_SYSTEM_PROMPT = """\
-你在把 AI 一个工具调用的底层意图归入意图聚合。底层意图是具体操作，比如读某个文件的某几行；意图聚合说明一串操作合起来在做什么，它和用户说出来的意图在同一个层级，比如“调查 somnia-farm 的文档和目录结构”“搭建音频分析环境”。
+你在把 AI 一个工具调用的底层意图归入意图聚合。底层意图是具体操作，比如读某个文件的某几行；意图聚合说明一串操作合起来在做什么，它和发言的意图在同一个层级，比如“调查 somnia-farm 的文档和目录结构”“搭建音频分析环境”。
 
-<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个工具调用所属的 topic；unit 是这个单元的类型和时间；graph 是这个 topic 的意图图谱，type 为 intent 的节点是用户的意图，type 为 aggregate 的节点是已有的意图聚合，label 是它们的标准文本；candidates 是可以回答的已有聚合编号，可以是空列表。
+<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个工具调用所属的 topic；unit 是这个单元的类型和时间；graph 是这个 topic 的意图图谱，type 为 intent 的节点是用户或 AI 发言的意图（actor 说明是谁），type 为 aggregate 的节点是已有的意图聚合，label 是它们的标准文本；candidates 是可以回答的已有聚合编号，可以是空列表。
 
 <此前的对话> 是这个工具调用之前的对话。<当前单元> 是这个工具调用的意图和操作对象的概括。<本单元的意图> 按顺序列出这个调用的每个底层意图：编号、文本和原文依据。<此后的对话> 是这个工具调用之后接着发生的事，用来看清这个操作最终是为了做成什么；要回答的只有 <本单元的意图> 里的意图。
 
@@ -237,7 +240,7 @@ B_SCHEMA = {
 C_SYSTEM_PROMPT = """\
 你在判断对话里一个单元的意图和这个 topic 的其他节点之间有什么关系。
 
-<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个单元所属的 topic；unit 是这个单元的类型、发出者和时间；graph 是这个 topic 的意图图谱，nodes 是已有节点（intent 是用户的意图，aggregate 是工具操作的意图聚合，observation 是观测），edges 是已有的边；unit_intents 是这个单元的意图或聚合，编号和文本；candidates 是可以连接的节点：字符串是图谱里的编号，带 id 和 text 的对象是还没有建节点的观测；relations 是可以使用的关系，from 和 to 说明两端的节点种类，intent 既指用户的意图也指聚合。
+<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个单元所属的 topic；unit 是这个单元的类型、发出者和时间；graph 是这个 topic 的意图图谱，nodes 是已有节点（intent 是用户或 AI 的意图，actor 说明是谁，aggregate 是工具操作的意图聚合，observation 是观测），edges 是已有的边；unit_intents 是这个单元的意图或聚合，编号和文本；candidates 是可以连接的节点：字符串是图谱里的编号，带 id 和 text 的对象是还没有建节点的观测；relations 是可以使用的关系，from 和 to 说明两端的节点种类，intent 既指用户或 AI 的意图，也指聚合。
 
 <此前的对话> 是这个单元之前的对话。<当前单元> 是这个单元。
 
@@ -329,18 +332,18 @@ D_SUMMARY_SCHEMA = {
     "additionalProperties": False,
 }
 
-UnitKind = Literal["user_segment", "user_signal", "tool_call", "observation"]
+UnitKind = Literal["user_segment", "ai_segment", "user_signal", "tool_call", "observation"]
 
 
 @attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
-class UserSegment:
-    """One segment of a user message; the pointer visits it in place of the whole message."""
+class SpeechSegment:
+    """One segment of a speech; the pointer visits it in place of the whole speech."""
 
-    message: UserMessage
+    speech: Speech
     segment: Segment
 
 
-Unit = UserSegment | UserSignal | ToolCall | Observation
+Unit = SpeechSegment | UserSignal | ToolCall | Observation
 
 
 class UnitRef(BaseModel):
@@ -395,7 +398,7 @@ class Assignment(BaseModel):
     `edges` are the edges this unit set up, their spans filled in when the stores are
     folded. `observations` are the nodes it built: its own, or those its triggers edges
     pointed at. `pending_text` is the text of an observation left without a node, and
-    `placeholder` marks a whole user message without intents.
+    `placeholder` marks a whole speech without intents.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -522,7 +525,7 @@ class Asks:
 class _Step:
     """A unit, the timeline index of its item, and where that item's round opens.
 
-    `round_start` is None for tool work before the first user message.
+    `round_start` is None for tool work before the first speech.
     """
 
     unit: Unit
@@ -534,25 +537,26 @@ def walk(items: Sequence[Item], segments: dict[str, list[Segment]]) -> Iterator[
     """The units in timeline order."""
     round_start: int | None = None
     for index, item in enumerate(items):
-        if isinstance(item, UserMessage):
+        if isinstance(item, Speech):
             round_start = index
             if item.source.uuid not in segments:
                 raise ValueError(
-                    f"User message {item.source.uuid} has no segments; run "
+                    f"Speech {item.source.uuid} has no segments; run "
                     "intent_aligner.segment on the whole conversation first."
                 )
             for segment in segments[item.source.uuid]:
-                unit = UserSegment(message=item, segment=segment)
+                unit = SpeechSegment(speech=item, segment=segment)
                 yield _Step(unit=unit, index=index, round_start=round_start)
-        elif not isinstance(item, AIText):
+        else:
             yield _Step(unit=item, index=index, round_start=round_start)
 
 
 def unit_ref(unit: Unit) -> UnitRef:
     """The UnitRef of `unit`."""
-    if isinstance(unit, UserSegment):
+    if isinstance(unit, SpeechSegment):
         chars = (unit.segment.start, unit.segment.end)
-        return UnitRef(kind="user_segment", uuid=unit.message.source.uuid, chars=chars)
+        speech_kind: UnitKind = "user_segment" if unit.speech.speaker == "user" else "ai_segment"
+        return UnitRef(kind=speech_kind, uuid=unit.speech.source.uuid, chars=chars)
     kind: UnitKind = (
         "user_signal"
         if isinstance(unit, UserSignal)
@@ -581,6 +585,7 @@ def extract_units(
     asks: Asks,
     count: Count,
     stores: Stores,
+    window_rounds: int,
 ) -> Iterator[Assignment | ToolCompression]:
     """Yield a record for every unit after the `done` ones, and each new compression.
 
@@ -594,7 +599,9 @@ def extract_units(
     for earlier in compressed:
         compressions.setdefault(earlier.start, []).append(earlier)
     topics = [(a.topic, a.new_title) for a in done if a.topic and a.new_title]
-    context = _Context(items=items, digests=digests, topics=topics, count=count)
+    context = _Context(
+        items=items, digests=digests, topics=topics, count=count, window_rounds=window_rounds
+    )
     call_topics: dict[str, str | None] = {}
     round_hint: str | None = None
     for position, step in enumerate(walk(items, segments)):
@@ -624,7 +631,7 @@ def extract_units(
             into_stores(stores, step, record)
             yield from window.fresh
             yield record
-        if isinstance(step.unit, UserSegment):
+        if isinstance(step.unit, SpeechSegment):
             round_hint = None
         elif isinstance(step.unit, ToolCall):
             call_topics[step.unit.tool_use_id] = record.topic
@@ -639,11 +646,12 @@ class _Context:
     digests: Digests
     topics: Sequence[tuple[str, str]]
     count: Count
+    window_rounds: int
 
 
 def _round_low(step: _Step) -> int:
-    """Where the round shown before `step` starts; a user segment opens its round, so none is."""
-    if isinstance(step.unit, UserSegment):
+    """Where the round shown before `step` starts; a speech segment opens its round, so none is."""
+    if isinstance(step.unit, SpeechSegment):
         return step.index
     return step.round_start or 0
 
@@ -686,9 +694,9 @@ def _fitted_prompt(
             raise
     lines = [" ".join(round_entry(item, context.digests).split()) for item in pending]
     opening = context.items[low]
-    message = opening if isinstance(opening, UserMessage) else None
+    speech = opening if isinstance(opening, Speech) else None
     summary = summarize_trajectory(
-        message, lines, window.ask, context.count, f"round at item {low} up to item {step.index}"
+        speech, lines, window.ask, context.count, f"round at item {low} up to item {step.index}"
     )
     compression = ToolCompression(start=low, begin=begin, through=step.index, summary=summary)
     window.in_force.append(compression)
@@ -783,7 +791,7 @@ def _with_intents(
         return record
     if record.new_title is not None:
         stores.open_topic(topic)
-    if isinstance(unit, UserSegment):
+    if isinstance(unit, SpeechSegment):
         intents = unit.segment.intents
     elif isinstance(unit, ToolCall):
         filed = context.digests.calls[unit.tool_use_id].intents
@@ -816,8 +824,8 @@ def _with_intents(
         intents = answered
     if not intents:
         whole = (
-            isinstance(unit, UserSegment)
-            and (unit.segment.start, unit.segment.end) == (0, len(unit.message.body))
+            isinstance(unit, SpeechSegment)
+            and (unit.segment.start, unit.segment.end) == (0, len(unit.speech.body))
             and not unit.segment.needs_review
         )
         return record.model_copy(update={"placeholder": whole})
@@ -973,10 +981,16 @@ def _match_intents(
 ) -> Assignment:
     """Call B, then the ids: a registered intent keeps its id once per unit, others get new ones.
 
-    Only a user's intents come here; a tool call's go to call G. A topic with no
-    intents yet has nothing to match, so call B is skipped.
+    Only what someone stated comes here; a tool call's intents go to call G. The
+    candidates are the same actor's, because an AI statement matched to a user intent
+    would leave no trace that the AI said it. With no candidates call B is skipped.
     """
-    candidates = [i for i, node in stores.topic_nodes(topic).items() if node.type == "intent"]
+    actor = _actor(step.unit)
+    candidates = [
+        node_id
+        for node_id, node in stores.topic_nodes(topic).items()
+        if isinstance(node, IntentNode) and node.actor == actor
+    ]
     if not candidates:
         matches = [_Match(match=NEW, complete=True) for _ in intents]
     else:
@@ -1022,19 +1036,24 @@ def _match_intents(
     return record.model_copy(update={"intents": resolved})
 
 
+def _actor(unit: Unit) -> Literal["user", "ai"]:
+    """Who stated the intents of a unit on the intent path outside call G."""
+    return unit.speech.speaker if isinstance(unit, SpeechSegment) else "user"
+
+
 def _visible_pending(
     step: _Step, topic: str, in_force: Sequence[ToolCompression], context: _Context, stores: Stores
 ) -> dict[str, PendingObservation]:
     """The pending observations of `topic` the window shows one by one, keyed by call C's handle.
 
     An observation leaves when it is compressed away or only a round summary covers it,
-    which also keeps the list inside the budget: every observation of the two earlier
-    rounds would come to 8,932 tokens on claude-5a1f0c1a against a 9,000 budget.
+    which also keeps the list inside the budget: listing every observation of
+    the earlier rounds could fill the whole prompt budget by itself.
     """
     low = _round_low(step)
     compressed_up_to = in_force[-1].through if in_force else low
-    opened = [i for i in range(low) if isinstance(context.items[i], UserMessage)]
-    earliest = opened[-ROUNDS[0] :][0] if opened else low
+    opened = [i for i in range(low) if isinstance(context.items[i], Speech)]
+    earliest = opened[-context.window_rounds :][0] if opened else low
     shown: dict[str, PendingObservation] = {}
     for index, pending in stores.pending.items():
         item = context.items[index]
@@ -1046,7 +1065,7 @@ def _visible_pending(
 
 
 def _unit_nodes(record: Assignment, topic: str, stores: Stores) -> dict[str, dict[str, str]]:
-    """What call C connects for this unit: each user intent or aggregate, once, with its text."""
+    """What call C connects for this unit: each intent or aggregate, once, with its text."""
     labels = {node_id: node.label for node_id, node in stores.topic_nodes(topic).items()}
     labels |= {i.aggregate or i.id: i.label for i in record.intents if i.label is not None}
     nodes: dict[str, dict[str, str]] = {}
@@ -1059,8 +1078,8 @@ def _unit_nodes(record: Assignment, topic: str, stores: Stores) -> dict[str, dic
 
 
 def _unit_source(unit: Unit) -> str:
-    if isinstance(unit, UserSegment):
-        return unit.message.body[unit.segment.start : unit.segment.end]
+    if isinstance(unit, SpeechSegment):
+        return unit.speech.body[unit.segment.start : unit.segment.end]
     return unit.text
 
 
@@ -1266,7 +1285,7 @@ def into_stores(stores: Stores, step: _Step, record: Assignment) -> None:
         assert topic is not None
         if intent.aggregate is None:
             if intent.label is not None:
-                stores.register_intent(topic, intent.id, intent.label)
+                stores.register_intent(topic, intent.id, intent.label, _actor(unit))
             continue
         aggregates.add(intent.aggregate)
         if intent.label is not None:
@@ -1277,11 +1296,11 @@ def into_stores(stores: Stores, step: _Step, record: Assignment) -> None:
         SpanIntent(id=i.id, evidence=i.evidence, explicit=i.explicit, note=i.note or None)
         for i in record.intents
     ]
-    if isinstance(unit, UserSegment):
+    if isinstance(unit, SpeechSegment):
         segment = unit.segment
         review = record.needs_review or segment.needs_review
-        span = stores.add_user_text(
-            topic, unit.message, (segment.start, segment.end), spans, review
+        span = stores.add_speech_text(
+            topic, unit.speech, (segment.start, segment.end), spans, review
         )
     elif isinstance(unit, UserSignal):
         span = stores.add_user_signal(topic, unit, spans, record.needs_review)
@@ -1347,17 +1366,24 @@ def _prompt(
             f"The current round up to item {step.index} ({items[step.index].source.uuid}) "
             f"needs {-room:,} tokens more than the budget; mark it needs_review."
         )
-    earlier = "" if round_start is None else window_text(items, round_start, digests, room, count)
+    earlier = (
+        ""
+        if round_start is None
+        else window_text(items, round_start, digests, room, count, context.window_rounds)
+    )
     window = "\n\n".join(part for part in (earlier, so_far) if part)
     return f"{head}\n\n<此前的对话>\n{window}\n</此前的对话>\n\n{current}"
 
 
 def _header(unit: Unit, topics: Sequence[tuple[str, str]], extra: dict[str, object]) -> str:
     ref = unit_ref(unit)
-    source = unit.message.source if isinstance(unit, UserSegment) else unit.source
-    actor = {"user_segment": "user", "user_signal": "user", "tool_call": "ai"}.get(
-        ref.kind, "environment"
-    )
+    source = unit.speech.source if isinstance(unit, SpeechSegment) else unit.source
+    actor = {
+        "user_segment": "user",
+        "ai_segment": "ai",
+        "user_signal": "user",
+        "tool_call": "ai",
+    }.get(ref.kind, "environment")
     described: dict[str, object] = {
         "kind": ref.kind,
         "actor": actor,
@@ -1375,16 +1401,16 @@ def _header(unit: Unit, topics: Sequence[tuple[str, str]], extra: dict[str, obje
 
 
 def render_unit(unit: Unit, digests: Digests) -> str:
-    """The unit as the <当前单元> block shows it; a user segment is marked inside its message."""
-    if not isinstance(unit, UserSegment):
+    """The unit as the <当前单元> block shows it; a speech segment is marked inside its speech."""
+    if not isinstance(unit, SpeechSegment):
         return round_entry(unit, digests)
-    body, segment = unit.message.body, unit.segment
+    body, segment = unit.speech.body, unit.segment
     marked = (
         f"{body[: segment.start]}<当前段落>{body[segment.start : segment.end]}"
         f"</当前段落>{body[segment.end :]}"
     )
-    images = "".join(f"\n[图片] {path}" for path in unit.message.images)
-    return f"【用户】\n{marked}{images}"
+    images = "".join(f"\n[图片] {path}" for path in unit.speech.images)
+    return f"【{SPEAKER_NAMES[unit.speech.speaker]}】\n{marked}{images}"
 
 
 def write_topic_files(out: Path, topics: Sequence[TopicEntry], stores: Stores) -> None:
@@ -1431,7 +1457,7 @@ def log_lines(assignment: Assignment) -> list[str]:
     if assignment.new_title is not None:
         lines.append(f"new topic {assignment.topic}: {assignment.new_title} (opened by {where})")
     if assignment.placeholder:
-        lines.append(f"whole message has no intent, placeholder span: {where}")
+        lines.append(f"whole speech has no intent, placeholder span: {where}")
     if assignment.review_reason is not None:
         place = assignment.topic or "unassigned"
         lines.append(f"needs_review in {place}: {where}: {assignment.review_reason}")
@@ -1448,6 +1474,7 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], default="xhigh")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--window-rounds", type=window_rounds, default=DEFAULT_WINDOW_ROUNDS)
     parser.add_argument(
         "--stream",
         action=argparse.BooleanOptionalAction,
@@ -1489,6 +1516,7 @@ def main() -> None:
         asks,
         qwen_tokens,
         stores,
+        args.window_rounds,
     )
     position = len(done)
     with (

@@ -47,8 +47,8 @@ from intent_aligner.extract import (
 from intent_aligner.llm import CALLS_FILE, LLM_HOME, TRUNCATED_FEEDBACK, CallRecord
 from intent_aligner.segment import Segment, message_window
 from intent_aligner.store import Stores
-from intent_aligner.units import Item, ToolCall, UserMessage, conversation_units
-from intent_aligner.window import Digests, load_digests, qwen_tokens
+from intent_aligner.units import SPEAKER_NAMES, Item, Speech, ToolCall, conversation_units
+from intent_aligner.window import Digests, load_digests, qwen_tokens, round_entry
 
 TEMPLATE = Path(__file__).with_name("replay.html")
 
@@ -92,6 +92,7 @@ class Run:
     digests: Path
     segments: Path
     extract: Path
+    window_rounds: int
 
 
 def parse_run(directory: Path) -> Run:
@@ -123,6 +124,7 @@ def parse_run(directory: Path) -> Run:
         digests=base / options["--digests"],
         segments=base / options["--segments"],
         extract=base / options["--out"],
+        window_rounds=int(options.get("--window-rounds", window.DEFAULT_WINDOW_ROUNDS)),
     )
 
 
@@ -217,7 +219,7 @@ class Conversation:
 
     `units` are the extract units' <当前单元> blocks ("" while their digests are
     missing) and `unit_items` their timeline indexes. `round_of` maps a tool call to
-    the user message that opened its round, "" before the first one.
+    the speech that opened its round, "" before the first one.
     """
 
     items: Sequence[Item]
@@ -227,6 +229,7 @@ class Conversation:
     units: list[str]
     unit_items: list[int]
     round_of: dict[str, str]
+    window_rounds: int
 
     @classmethod
     def load(cls, run: Run) -> Conversation:
@@ -239,7 +242,7 @@ class Conversation:
         round_of: dict[str, str] = {}
         opening = ""
         for item in items:
-            if isinstance(item, UserMessage):
+            if isinstance(item, Speech):
                 opening = item.source.uuid
             elif isinstance(item, ToolCall):
                 round_of[item.tool_use_id] = opening
@@ -251,6 +254,7 @@ class Conversation:
             units=[_unit_block(step.unit, digests) for step in steps],
             unit_items=[step.index for step in steps],
             round_of=round_of,
+            window_rounds=run.window_rounds,
         )
 
 
@@ -325,7 +329,7 @@ def matched_calls(
 
     A call is the run's when its model is run.model, its system prompt is one the
     current source sends, and its prompt names a job of this conversation. Earlier runs
-    of the same conversation match too, since a user segment's prompt can be the same
+    of the same conversation match too, since a speech segment's prompt can be the same
     in every run; without --since the run starts after the last pause of RUN_GAP
     between matched calls before the run's last output. Unplaced transcripts are this
     model's calls inside the run's span that matched no job: the code that sent them
@@ -407,7 +411,7 @@ class _JobFinder:
                 if digest is not None:
                     line = f"{item.name} 意图：{digest.purpose} 对象：{digest.targets}"
                     self.tools_by_line[" ".join(line.split())].append(item.tool_use_id)
-            elif isinstance(item, UserMessage):
+            elif isinstance(item, Speech):
                 self.messages_by_body[item.body].append(index)
 
     def jobs(self, ask: str, prompt: str) -> list[str]:
@@ -449,7 +453,7 @@ class _JobFinder:
                 i
                 for i in indexes
                 if prompt.startswith(
-                    f"<此前的对话>\n{message_window(items, i, digests, qwen_tokens)}\n</此前的对话>"
+                    f"<此前的对话>\n{message_window(items, i, digests, qwen_tokens, self.conversation.window_rounds)}\n</此前的对话>"
                 )
             ] or indexes
         return [f"message:{items[i].source.uuid}:{len(done)}" for i in indexes]
@@ -530,6 +534,9 @@ class Attempt(BaseModel):
     record) or "failed" (the call errored, or the same question was asked again from
     scratch later, so this answer was never kept). `fixed` are the [start, end)
     ranges of the prompt that are string literals of the source (see literal_texts).
+    `window_seen` are the opening uuids of the earlier rounds the prompt's window really
+    holds, oldest first, or None for a prompt without a window; `window_limit` is how
+    many it could have held, the run's window size or the rounds that exist if fewer.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -547,6 +554,8 @@ class Attempt(BaseModel):
     prompt: str
     fixed: list[tuple[int, int]]
     feedback_at: int | None
+    window_seen: list[str] | None
+    window_limit: int
     reply: str | None
     reasoning: str | None
     usage: dict[str, Any]
@@ -587,6 +596,7 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
             elif gave_up is not None:
                 verdict, reason = "rejected", gave_up
             exchange = call.exchange
+            window_seen, window_limit = _window_seen(call, conversation)
             judged.append(
                 Attempt(
                     stage=call.stage,
@@ -602,6 +612,8 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
                     prompt=exchange.prompt,
                     fixed=literal_ranges(exchange.prompt, literals),
                     feedback_at=len(base) if k else None,
+                    window_seen=window_seen,
+                    window_limit=window_limit,
                     reply=exchange.reply,
                     reasoning=exchange.reasoning,
                     usage=exchange.usage,
@@ -609,6 +621,34 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
                 )
             )
     return sorted(judged, key=lambda a: (a.started or a.ended, a.ended))
+
+
+def _window_seen(call: Call, conversation: Conversation) -> tuple[list[str] | None, int]:
+    """Which earlier rounds the call's window holds, and how many it could have held.
+
+    The window drops whole rounds when it does not fit, so the earlier speeches still
+    quoted in it, counted back from the current round, are the rounds it kept.
+    """
+    opened = call.exchange.prompt.split("<此前的对话>\n", 1)
+    kind, _, rest = call.subject.partition(":")
+    if len(opened) < 2 or kind not in ("unit", "message"):
+        return None, 0
+    items = conversation.items
+    speeches = [i for i, item in enumerate(items) if isinstance(item, Speech)]
+    if kind == "unit":
+        index = conversation.unit_items[int(rest)]
+    else:
+        uuid = rest.rsplit(":", 1)[0]
+        index = next(i for i in speeches if items[i].source.uuid == uuid)
+    opening = max((i for i in speeches if i <= index), default=-1)
+    earlier = [i for i in speeches if i < opening][-conversation.window_rounds :]
+    block = opened[1].split("\n</此前的对话>", 1)[0]
+    seen: list[str] = []
+    for i in reversed(earlier):
+        if round_entry(items[i], conversation.digests) not in block:
+            break
+        seen.insert(0, items[i].source.uuid)
+    return seen, len(earlier)
 
 
 def _gave_up(call: Call, conversation: Conversation) -> str | None:
@@ -823,11 +863,11 @@ def _shown(source: str, expression: ast.expr) -> str | None:
     return text if re.search(r"[\u4e00-\u9fff]", text) else None
 
 
-def window_rules() -> list[str]:
+def window_rules(window_rounds: int) -> list[str]:
     """The constants and docstrings that decide what a prompt's windows hold."""
     constants = [
         f"window.PROMPT_BUDGET = {window.PROMPT_BUDGET:,}（{window.TOKENIZER} 的 token）",
-        f"window.ROUNDS = {window.ROUNDS}",
+        f"--window-rounds = {window_rounds}（这次运行的值，放不下时逐轮减少到 1）",
         f"window.FOLLOWING_ITEMS = {window.FOLLOWING_ITEMS}，"
         f"window.FOLLOWING_BUDGET = {window.FOLLOWING_BUDGET:,}",
         f"FEEDBACK_ROOM：compress {compress.FEEDBACK_ROOM:,}，segment {segment.FEEDBACK_ROOM:,}，"
@@ -848,8 +888,9 @@ def window_rules() -> list[str]:
 class Job(BaseModel):
     """A node of the page's DAG: one job of the run and the record it wrote.
 
-    `column` is the round it belongs to (0 before the first user message); `after`
-    lists the jobs whose output it reads. `text` is what the job works on when its
+    `column` is the round it belongs to (0 before the first speech); `after`
+    lists the jobs whose output it reads. `speaker` names who made the speech an L2 or
+    SEG job works from. `text` is what the job works on when its
     prompt does not show it alone: an extract unit's block or a message's body. `log`
     are the run.log lines about an extract unit.
     """
@@ -861,6 +902,7 @@ class Job(BaseModel):
     label: str
     column: int
     after: list[str]
+    speaker: str = ""
     text: str = ""
     log: list[str] = []
     record: Any
@@ -869,8 +911,8 @@ class Job(BaseModel):
 def run_jobs(conversation: Conversation, extract_dir: Path) -> list[Job]:
     """Every job the run had to do, whether or not it called the model.
 
-    A message's segments run one after another and read the round summaries of the
-    window before it; extract units run in a single chain. The barriers between
+    A speech's segments run one after another and read the round summaries of the
+    window before it; only a round with tool work has a summary, and so a job. Extract units run in a single chain. The barriers between
     commands (all L1, then all L2, then segmentation, then extraction) are drawn by
     the page from the stages themselves.
     """
@@ -879,14 +921,21 @@ def run_jobs(conversation: Conversation, extract_dir: Path) -> list[Job]:
     rounds: list[str] = []
     columns: list[int] = []
     bodies: dict[str, str] = {}
+    speakers: dict[str, str] = {}
+    worked: set[str] = set()
     for item in items:
-        if isinstance(item, UserMessage):
+        if isinstance(item, Speech):
             rounds.append(item.source.uuid)
             bodies[item.source.uuid] = item.body
-            made.append(_round_job(item.source.uuid, item.body[:40], len(rounds), digests))
+            speakers[item.source.uuid] = SPEAKER_NAMES[item.speaker]
         elif isinstance(item, ToolCall):
-            if not rounds and not made:
-                made.append(_round_job("", "首条用户消息之前", 0, digests))
+            opening = rounds[-1] if rounds else ""
+            if opening not in worked:
+                worked.add(opening)
+                label = bodies[opening][:40] if rounds else "首次发言之前"
+                made.append(
+                    _round_job(opening, label, len(rounds), speakers.get(opening, ""), digests)
+                )
             record = {
                 "call": _dump(digests.calls.get(item.tool_use_id)),
                 "result": _dump(digests.results.get(item.tool_use_id)),
@@ -903,7 +952,9 @@ def run_jobs(conversation: Conversation, extract_dir: Path) -> list[Job]:
             )
         columns.append(len(rounds))
     for n, uuid in enumerate(rounds):
-        windowed = [f"round:{r}" for r in rounds[max(0, n - window.ROUNDS[0]) : n]]
+        windowed = [
+            f"round:{r}" for r in rounds[max(0, n - conversation.window_rounds) : n] if r in worked
+        ]
         previous: list[str] = []
         for part in conversation.segments.get(uuid, []):
             job_id = f"message:{uuid}:{part.start}"
@@ -914,6 +965,7 @@ def run_jobs(conversation: Conversation, extract_dir: Path) -> list[Job]:
                     label=f"{part.start}–{part.end}",
                     column=n + 1,
                     after=windowed + previous,
+                    speaker=speakers[uuid],
                     text=bodies[uuid],
                     record=part.model_dump(mode="json"),
                 )
@@ -957,13 +1009,14 @@ def _log_lines(log: Sequence[str], assignment: Assignment) -> list[str]:
     return [line for line in log if all(mark in line for mark in marks)]
 
 
-def _round_job(uuid: str, label: str, column: int, digests: Digests) -> Job:
+def _round_job(uuid: str, label: str, column: int, speaker: str, digests: Digests) -> Job:
     return Job(
         id=f"round:{uuid}",
         stage="L2",
         label=label,
         column=column,
         after=[],
+        speaker=speaker,
         record=_dump(digests.rounds.get(uuid)),
     )
 
@@ -1042,6 +1095,7 @@ class Page(BaseModel):
     schemas: dict[str, Any]
     rules: dict[str, list[Rule]]
     window: list[str]
+    window_rounds: int
     calls: list[Attempt]
     jobs: list[Job]
     graphs: list[GraphChange]
@@ -1071,7 +1125,8 @@ def build_page(run: Run, since: datetime | None, until: datetime | None) -> Page
         systems={c.ask: c.exchange.system for c in calls},
         schemas={c.ask: c.exchange.schema for c in calls},
         rules={ask: ask_rules(ask) for ask in asks},
-        window=window_rules(),
+        window=window_rules(run.window_rounds),
+        window_rounds=conversation.window_rounds,
         calls=judge(calls, conversation),
         jobs=run_jobs(conversation, run.extract),
         graphs=graph_changes(run, conversation),

@@ -1,6 +1,10 @@
 # 运行结果
 
-`claude-5a1f0c1a-sol/` 是对对话 `corpus/merged/claude-5a1f0c1a.jsonl` 依次跑压缩、切分和主循环的结果，模型是 Codex 的 gpt-6.1-sol，思考强度 xhigh。其中 `extract/` 是主循环只判断 topic 时的产物，没有意图和段落；要得到现行代码的结果，需要移走 `extract/` 后重跑。
+`claude-87eeb4bd-sol/` 是对话 `corpus/merged/claude-87eeb4bd.jsonl` 按现行规则依次跑压缩、切分和主循环的结果，模型是 Codex 的 gpt-6.1-sol，思考强度 xhigh，窗口 `--window-rounds 2`，这次运行的主循环还没有结束。`claude-87eeb4bd-qwen-pool/` 只跑主循环，模型是 Hive 上的 `qwen38-pool`，思考强度 xhigh，窗口也是 2 轮；它直接读 `claude-87eeb4bd-sol/` 的压缩和切分结果，所以两次运行的差别只有主循环用的模型，这次运行还没有开始。
+
+下面的内容说明 `claude-5a1f0c1a-*` 目录。
+
+`claude-5a1f0c1a-sol/` 是对对话 `corpus/merged/claude-5a1f0c1a.jsonl` 依次跑压缩、切分和主循环的结果，模型是 Codex 的 gpt-6.1-sol，思考强度 xhigh。其中 `extract/` 是主循环只判断 topic 时的产物，没有意图和段落。`claude-5a1f0c1a-*` 的二级压缩和切分都只按用户消息划分，不包含 AI 发言；要得到现行规则的结果，需要从 `digests.jsonl` 里去掉二级压缩的行，再移走 `segments.jsonl` 和 `extract/` 后重跑。
 
 | 文件 | 来自哪一步 | 内容 |
 |---|---|---|
@@ -12,7 +16,7 @@
 | `extract/run.log` | `intent_aligner.extract` | 新 topic 和 `needs_review` 单元的记录 |
 | `*.log`、`extract/stdout.log` | 各步的运行日志 | |
 
-`claude-5a1f0c1a-qwen/` 里的 `digests.jsonl` 和 `segments.jsonl` 由本地 Qwen（Hive 的 `deployment/pc-qwen38-np8`，思考强度 xhigh）生成。这个目录的 `extract/` 由 `run.sh` 用现行流程写入，这次完整运行还没有结束。更早的主循环结果在下面两处，都只覆盖对话的一部分：
+`claude-5a1f0c1a-qwen/` 里的 `digests.jsonl` 和 `segments.jsonl` 由本地 Qwen（Hive 的 `deployment/pc-qwen38-np8`，思考强度 xhigh）生成。这个目录的 `extract/` 是一次没有跑完的主循环结果，同样只按用户消息划分。更早的主循环结果在下面两处，都只覆盖对话的一部分：
 
 | 路径 | 内容 | 生成脚本 |
 |---|---|---|

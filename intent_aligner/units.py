@@ -45,6 +45,11 @@ class UserMessage(BaseModel):
     queued: bool
     images: tuple[str, ...]
 
+    @property
+    def speaker(self) -> Literal["user"]:
+        """Who said it, in the terms of a graph node's `actor`."""
+        return "user"
+
 
 class UserSignal(BaseModel):
     """An ESC interrupt, or a rejected tool call (`tool_use_id` names the call)."""
@@ -93,6 +98,24 @@ class AIText(BaseModel):
     source: Source
     text: str
 
+    @property
+    def speaker(self) -> Literal["ai"]:
+        """Who said it, in the terms of a graph node's `actor`."""
+        return "ai"
+
+    @property
+    def body(self) -> str:
+        """The text under the name a user message's has, so speech is handled one way."""
+        return self.text
+
+    @property
+    def images(self) -> tuple[str, ...]:
+        """Always empty: only user messages carry images."""
+        return ()
+
+
+Speech = UserMessage | AIText
+SPEAKER_NAMES = {"user": "用户", "ai": "AI"}
 
 Item = Annotated[
     UserMessage | UserSignal | ToolCall | Observation | AIText,

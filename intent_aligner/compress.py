@@ -7,7 +7,7 @@ the main loop records for the call, so it does not ask for them again. A call an
 result are one job; jobs read nothing of the conversation around them and run in
 parallel.
 
-Level 2 reads the user message that opened a round and the level-1 trajectory of the
+Level 2 reads the speech that opened a round and the level-1 trajectory of the
 round (intents, targets and results, in order) and writes one passage. That passage is all a window (intent_aligner.window) shows
 of the round's tools. A trajectory too long for one prompt is summarized batch by
 batch, and the batch summaries are summarized again until one passage is left.
@@ -41,8 +41,10 @@ from intent_aligner.llm import (
     asker,
 )
 from intent_aligner.units import (
+    SPEAKER_NAMES,
     Item,
     Observation,
+    Speech,
     ToolCall,
     UserMessage,
     UserSignal,
@@ -67,7 +69,7 @@ FEEDBACK_ROOM = 1_000
 # Every chunk of a result repeats the call's full text, so a call must leave this much
 # of the prompt for the result; the largest call in the corpus (6,116 tokens) leaves 1,650.
 MIN_RESULT_ROOM = 1_000
-# A round's opening message is repeated in every batch of its trajectory, so it is cut to
+# A round's opening speech is repeated in every batch of its trajectory, so it is cut to
 # this many tokens; the corpus has single messages (38cb90a8) larger than a whole prompt.
 MESSAGE_ROOM = 2_000
 # Room for the "（第 i/n 段）" label on a chunked result.
@@ -92,9 +94,9 @@ RESULT_SYSTEM_PROMPT = """\
 """
 
 ROUND_SYSTEM_PROMPT = """\
-你在概括 AI 助手在一轮对话里做的全部工具操作。这段概括会放进对话记录，供人判断用户下一条消息的意图时阅读：读的人要靠它知道 AI 这一轮在为什么事做操作、做到了哪一步、发现了什么。<用户消息> 是开启这一轮的用户消息，太长时只保留开头，会注明；注明了“AI 工作时发出”的消息，AI 这一轮也可能还在接着做之前的请求。对话开头没有用户消息时，没有这一项。<轨迹> 按时间顺序列出每次工具调用的意图、对象和结果，或者更细的轨迹已经写成的几段概括；太长时 <轨迹> 只是其中一段，会注明是第几段，这时只概括这一段。
+你在概括 AI 助手在两次发言之间做的全部工具操作。这段概括会放进对话记录，供人判断下一次发言的意图时阅读：读的人要靠它知道 AI 这段时间在为什么事做操作、做到了哪一步、发现了什么。<发言> 是紧挨在这段操作前面的那次发言，开头注明是用户说的还是 AI 说的，太长时只保留开头，会注明；注明了“AI 工作时发出”的用户消息，AI 也可能还在接着做之前的请求。对话开头没有发言时，没有这一项。<轨迹> 按时间顺序列出每次工具调用的意图、对象和结果，或者更细的轨迹已经写成的几段概括；太长时 <轨迹> 只是其中一段，会注明是第几段，这时只概括这一段。
 
-回答 summary：一小段话，写出 AI 在为用户的什么请求做这些操作、最后的状态和结论、还没解决的问题。只保留和最后结论直接相关的对象和数值，例如结论依据的关键数值、改动或产出的文件；单次操作的细节和其余数值归纳进主线，不逐项列出。只供 AI 自己中转的东西不写，例如后台任务 ID 和临时输出文件名。
+回答 summary：一小段话，写出 AI 在为什么事做这些操作、最后的状态和结论、还没解决的问题。只保留和最后结论直接相关的对象和数值，例如结论依据的关键数值、改动或产出的文件；单次操作的细节和其余数值归纳进主线，不逐项列出。只供 AI 自己中转的东西不写，例如后台任务 ID 和临时输出文件名。
 """
 
 CALL_SCHEMA = {
@@ -176,9 +178,9 @@ def compress_conversation(
         for item in items
         if isinstance(item, UserSignal) and item.tool_use_id is not None
     }
-    messages = {item.source.uuid: item for item in items if isinstance(item, UserMessage)}
+    speeches = {item.source.uuid: item for item in items if isinstance(item, Speech)}
     round_jobs = [
-        partial(_compress_round, round_uuid, messages.get(round_uuid), trajectory, ask_round, count)
+        partial(_compress_round, round_uuid, speeches.get(round_uuid), trajectory, ask_round, count)
         for round_uuid, trajectory in _trajectories(items, done, rejections).items()
         if round_uuid not in done.rounds
     ]
@@ -265,7 +267,7 @@ def _trajectories(
     trajectories: dict[str, list[str]] = {}
     round_uuid = ""
     for item in items:
-        if isinstance(item, UserMessage):
+        if isinstance(item, Speech):
             round_uuid = item.source.uuid
         elif isinstance(item, ToolCall):
             digest = digests.calls[item.tool_use_id]
@@ -284,22 +286,22 @@ def _outcome(tool_use_id: str, digests: Digests, rejections: dict[str, str]) -> 
 
 
 def _compress_round(
-    round_uuid: str, message: UserMessage | None, trajectory: list[str], ask: Ask, count: Count
+    round_uuid: str, speech: Speech | None, trajectory: list[str], ask: Ask, count: Count
 ) -> list[Digest]:
     CALL_SUBJECT.set(f"round:{round_uuid}")
-    summary = summarize_trajectory(message, trajectory, ask, count, round_uuid)
+    summary = summarize_trajectory(speech, trajectory, ask, count, round_uuid)
     return [RoundDigest(round_uuid=round_uuid, summary=summary)]
 
 
 def summarize_trajectory(
-    message: UserMessage | None, trajectory: list[str], ask: Ask, count: Count, where: str
+    speech: Speech | None, trajectory: list[str], ask: Ask, count: Count, where: str
 ) -> str:
     """Level 2: one passage for `trajectory`, the lines of a round's tool work so far.
 
     `ask` must carry ROUND_SYSTEM_PROMPT and SUMMARY_SCHEMA; `where` names the round
     in the error raised when the model gives no valid answer.
     """
-    head = _message_block(message, count)
+    head = _speech_block(speech, count)
     room = PROMPT_BUDGET - count(ROUND_SYSTEM_PROMPT) - count(head) - FEEDBACK_ROOM - LABEL_ROOM
     lines = trajectory
     while True:
@@ -314,15 +316,16 @@ def summarize_trajectory(
         lines = [" ".join(summary.split()) for summary in summaries]
 
 
-def _message_block(message: UserMessage | None, count: Count) -> str:
-    """The `<用户消息>` block a round prompt starts with; empty for tool work before any message."""
-    if message is None:
+def _speech_block(speech: Speech | None, count: Count) -> str:
+    """The `<发言>` block a round prompt starts with; empty for tool work before any speech."""
+    if speech is None:
         return ""
-    text = message.body + "".join(f"\n[图片] {path}" for path in message.images)
-    label = "（AI 工作时发出）" if message.queued else ""
+    text = speech.body + "".join(f"\n[图片] {path}" for path in speech.images)
+    queued = isinstance(speech, UserMessage) and speech.queued
+    label = f"（{SPEAKER_NAMES[speech.speaker]}）" + ("（AI 工作时发出）" if queued else "")
     if count(text) > MESSAGE_ROOM:
         text, label = chunks(text, MESSAGE_ROOM, count)[0], f"{label}（太长，只保留开头）"
-    return f"<用户消息>{label}\n{text}\n</用户消息>\n"
+    return f"<发言>{label}\n{text}\n</发言>\n"
 
 
 def chunks(text: str, room: int, count: Count) -> list[str]:

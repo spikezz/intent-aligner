@@ -183,13 +183,13 @@ def _whole_rest(prompt: str) -> str:
 
 
 def _run(ask: Ask, done: set[str], count: Count = len) -> list[MessageSegments]:
-    return list(segment_conversation(TIMELINE, DIGESTS, done, ask, count, 2))
+    return list(segment_conversation(TIMELINE, DIGESTS, done, ask, count, 2, 2))
 
 
 def test_every_message_not_done_is_segmented() -> None:
     made = _run(_whole_rest, {"u2"})
 
-    assert sorted(m.uuid for m in made) == ["u1", "u3"], made
+    assert sorted(m.uuid for m in made) == ["a1", "u1", "u3"], made
     assert all(len(m.segments) == 1 and not m.segments[0].needs_review for m in made), made
 
 
@@ -197,6 +197,7 @@ def test_a_window_that_does_not_fit_gives_one_review_segment() -> None:
     made = _run(_whole_rest, set(), count=lambda text: 1_000 * len(text))
 
     assert {(m.uuid, len(m.segments), m.segments[0].needs_review) for m in made} == {
+        ("a1", 1, True),
         ("u1", 1, True),
         ("u2", 1, True),
         ("u3", 1, True),
@@ -210,7 +211,7 @@ def test_a_backend_failure_keeps_the_other_messages() -> None:
         return _whole_rest(prompt)
 
     made: list[MessageSegments] = []
-    with pytest.raises(LLMError, match="1 of 3 messages failed"):
-        made.extend(segment_conversation(TIMELINE, DIGESTS, set(), ask, len, 2))
+    with pytest.raises(LLMError, match="1 of 4 messages failed"):
+        made.extend(segment_conversation(TIMELINE, DIGESTS, set(), ask, len, 2, 2))
 
-    assert sorted(m.uuid for m in made) == ["u1", "u3"], made
+    assert sorted(m.uuid for m in made) == ["a1", "u1", "u3"], made

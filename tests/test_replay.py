@@ -57,6 +57,7 @@ def _empty() -> Conversation:
         units=[],
         unit_items=[],
         round_of={},
+        window_rounds=2,
     )
 
 
@@ -129,6 +130,28 @@ def test_every_ask_has_retry_feedback_and_parsed_asks_have_checks() -> None:
         for ask in RULE_SOURCES
     }
     expected = {ask: (True, ask not in no_checks) for ask in RULE_SOURCES}
+    assert got == expected, f"{got!r} vs {expected!r}"
+
+
+@needs_sol
+def test_window_reports_the_rounds_really_sent() -> None:
+    page = build_page(parse_run(SOL_RUN), None, None)
+    windowed = [c for c in page.calls if c.window_seen is not None]
+    assert windowed, "no call of the run has a window"
+    bad = [
+        c.subject
+        for c in windowed
+        if not min(1, c.window_limit) <= len(c.window_seen or []) <= c.window_limit
+    ]
+    assert bad == [], bad
+
+
+@needs_sol
+def test_only_rounds_with_tool_work_are_compression_jobs() -> None:
+    run = parse_run(SOL_RUN)
+    page = build_page(run, None, None)
+    got = {j.id.removeprefix("round:") for j in page.jobs if j.stage == "L2"}
+    expected = set(Conversation.load(run).digests.rounds)
     assert got == expected, f"{got!r} vs {expected!r}"
 
 

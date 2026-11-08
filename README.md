@@ -2,7 +2,7 @@
 
 意图对齐器由三部分组成：轨迹提取器、可视化，以及后续待定的部分。
 
-轨迹提取器从一段对话的时间线开头开始，依次读取用户说的话、AI 的工具调用和环境返回的结果，提取其中的意图、观测以及它们之间的关系。轨迹提取器已经实现的部分是：把对话按时间顺序切成处理单元、两级压缩工具操作、把用户消息按意图切成段落，以及主循环，即逐个单元判断它属于哪个 topic、把用户的意图对照 topic 的已有意图、把工具调用的底层意图归入意图聚合并在聚合内去重、建立意图之间的关系，并判断每个观测达成或阻碍了哪些意图（见下面“运行”的第 3 到 6 步）。`playground/` 里是手工完成的示范提取，每个 topic 一个文件 `playground/topics/<topic 编号>.yaml`，所有 topic 列在 `playground/topics.yaml` 里。
+轨迹提取器从一段对话的时间线开头开始，依次读取用户说的话、AI 对用户说的话、AI 的工具调用和环境返回的结果，提取其中的意图、观测以及它们之间的关系。轨迹提取器已经实现的部分是：把对话按时间顺序切成处理单元、两级压缩工具操作、把每次发言（用户消息或 AI 对用户说的一段话）按意图切成段落，以及主循环，即逐个单元判断它属于哪个 topic、把发言的意图对照 topic 里同一方（用户或 AI）的已有意图、把工具调用的底层意图归入意图聚合并在聚合内去重、建立意图之间的关系，并判断每个观测达成或阻碍了哪些意图（见下面“运行”的第 3 到 6 步）。`playground/` 里是手工完成的示范提取，每个 topic 一个文件 `playground/topics/<topic 编号>.yaml`，所有 topic 列在 `playground/topics.yaml` 里。
 
 ## 运行
 
@@ -30,35 +30,37 @@ $PY -m intent_aligner.units corpus/merged/claude-5a1f0c1a.jsonl --out corpus/uni
 #    是明说还是推断 explicit 和推断依据 note）和它针对的具体对象，把它的
 #    结果对照调用的意图和全文压成一句话（太长的结果按行切段，每段一句），一个调用和它的结果是一个任务，
 #    任务之间互相独立，--workers 个并行。第二级把一轮里全部的意图、对象和结果压成一段概括。
-#    第二级同时看开启这一轮的用户消息。输出边跑边追加，中断后重跑会从断点继续；--until 在这条用户消息之前停下。
+#    一轮从一次发言开始，到下一次发言之前结束；第二级同时看开启这一轮的发言。输出边跑边追加，中断后重跑会从断点继续；--until 在这条用户消息之前停下。
 OUT=corpus/results/claude-5a1f0c1a-qwen38
 mkdir -p $OUT
 $PY -m intent_aligner.compress corpus/merged/claude-5a1f0c1a.jsonl \
     --backend hive --model deployment/pc-qwen38-np8 \
     --out $OUT/digests.jsonl
 
-# 5. 把对话里的每条用户消息按意图切成连续的段落，每行一条消息。每个意图附带原文摘录 evidence、
-#    是明说还是推断（explicit）和推断依据 note。--workers 条消息并行，
+# 5. 把对话里的每次发言（用户消息或 AI 对用户说的一段话）按意图切成连续的段落，每行一次发言。每个意图附带原文摘录 evidence、
+#    是明说还是推断（explicit）和推断依据 note。--workers 次发言并行，
 #    输出边跑边追加，中断后重跑会从断点继续。第 4 步必须先对整个对话跑完（不加 --until）
 $PY -m intent_aligner.segment corpus/merged/claude-5a1f0c1a.jsonl \
     --digests $OUT/digests.jsonl \
     --backend hive --model deployment/pc-qwen38-np8 --out $OUT/segments.jsonl
 
-# 6. 指针按时间顺序逐个走过单元（用户消息换成第 5 步的段落），判断每个单元属于哪个 topic，再把用户的意图
-#    对照 topic 的已有意图，把工具调用的底层意图归入聚合并在聚合内去重，再建立意图之间的关系，判断观测的影响。
+# 6. 指针按时间顺序逐个走过单元（发言换成第 5 步的段落），判断每个单元属于哪个 topic，再把发言的意图
+#    对照 topic 里同一方的已有意图，把工具调用的底层意图归入聚合并在聚合内去重，再建立意图之间的关系，判断观测的影响。
 #    工具结果沿用它的调用的 topic；每个单元要调用模型的次数取决于单元类型。第 4、5 步都必须先对整个对话跑完
 $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
     --digests $OUT/digests.jsonl --segments $OUT/segments.jsonl \
     --backend hive --model deployment/pc-qwen38-np8 --out $OUT/extract
 ```
 
-第 3 步输出的单元有 `user_message`（用户消息全文，附带图片路径）、`user_signal`、`tool_call` 和 `observation`；另外 `ai_text` 是 AI 对用户说的话，只注入 input，不做处理。
+第 3 步输出的单元有 `user_message`（用户消息全文，附带图片路径）、`ai_text`（AI 对用户说的一段话）、`user_signal`、`tool_call` 和 `observation`。用户消息和 AI 说的话都算发言，用同样的方式处理。
 
-第 5 步的模型除了这条消息，还会看到它之前两轮对话；两轮放不下时只看前一轮。这些对话里，每一轮的工具操作只显示第 4 步写出的那一段概括，所以这条消息之前的对话必须先压缩过。
+第 5 步的模型除了这次发言，还会看到它之前 N 轮对话；N 轮放不下时依次减少一轮。一轮是一次发言，加上它之后、下一次发言之前的全部内容。这些对话里，每一轮的工具操作只显示第 4 步写出的那一段概括，所以这次发言之前的对话必须先压缩过。
+
+N 由第 5、6 步的 `--window-rounds` 设定，默认值是 2，这两步要用同一个值。回放从 `run.sh` 里的第 6 步命令读这个值，命令里没有写时按默认值显示。
 
 第 5 步里，模型重试几次仍然定位不到段落结尾，或者连一轮对话都放不进窗口时，剩下的文本成为一段 `needs_review: true`、意图为空的段落，原因打印在标准错误里。
 
-第 6 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（用户意图节点、工具调用的意图聚合节点、观测节点、边和段落）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic、整条没有意图的用户消息和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：一轮太长、模型看到的内容放不下时，还没压缩过的工具操作会压缩成一段话，之前压缩出的段落保持不变，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
+第 6 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（发言和用户信号的意图节点、工具调用的意图聚合节点、观测节点、边和段落；意图节点的 `actor` 标明是用户的还是 AI 的）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic、整次没有意图的发言和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：一轮太长、模型看到的内容放不下时，还没压缩过的工具操作会压缩成一段话，之前压缩出的段落保持不变，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
 
 第 1 步完成后，`corpus/index.json` 会列出每个合并后的对话，包括成员 session、记录条数、丢弃的 fork 复制品数量，以及损坏的行。
 
@@ -70,7 +72,7 @@ $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
 
 第 4 到 6 步重跑时都从已经写出的结果继续，只补缺少的部分，所以结果齐全时重跑不调用模型。续跑不检查模型是否和之前相同，所以换模型时要换一个目录，否则同一份结果里会混着两个模型的回答。第 6 步发现对话或切分结果和 `assignments.jsonl` 对不上时会报错停止，这时也要换一个 `--out` 目录。要完全重跑，先把这个目录里的 `digests.jsonl`、`segments.jsonl` 和 `extract/` 移走。
 
-第 4、5 步在结果目录下、第 6 步在 `extract/` 下各写一份 `calls.jsonl`，每次模型调用一行：调用的是哪一种（`call`、`segment`、`topic` 等）、为哪个任务调用（`tool:<tool_use_id>`、`round:<轮的 uuid>`、`message:<消息 uuid>`、`unit:<单元序号>`）、开始和结束时间、对话记录的路径，失败时还有错误信息。
+第 4、5 步在结果目录下、第 6 步在 `extract/` 下各写一份 `calls.jsonl`，每次模型调用一行：调用的是哪一种（`call`、`segment`、`topic` 等）、为哪个任务调用（`tool:<tool_use_id>`、`round:<轮的 uuid>`、`message:<发言 uuid>`、`unit:<单元序号>`）、开始和结束时间、对话记录的路径，失败时还有错误信息。
 
 ### 回放一次运行
 
@@ -83,11 +85,11 @@ $PY -m intent_aligner.replay corpus/results/claude-87eeb4bd-sol --out replay.htm
 每一帧显示下面这些内容：
 
 - 流程条标出当前阶段，第 6 步标到具体的调用（T、A、B、G、L、C、D）。
-- 当前任务的原文：抽取单元的全文和它所属的 topic，或者用户消息里正在切分的那一段。
+- 当前任务的原文：抽取单元的全文和它所属的 topic，或者发言里正在切分的那一段。
 - 发给端点的请求：请求行里的设置、system、提示词和上下文窗口的规则。提示词里源码写死的文字和随任务变化的文字用不同底色区分，重问时附上的反馈另外标出来。
 - 模型的回答、推理、用量和 schema。
 - 代码对这个调用的校验规则和重问时追加的反馈，这些都是生成页面时从源码里读出来的；还有这次调用是第几次尝试、被接受还是被驳回，以及写入的文件、needs_review 和 run.log 的行。
-- 当前 topic 的图谱：按 `assignments.jsonl` 逐单元重建，本单元新增的节点和边在单元最后一次调用之前画成虚线，这次调用 header 里的候选加粗。
+- 当前 topic 的图谱：按 `assignments.jsonl` 逐单元重建，本单元新增的节点和边在单元最后一次调用之前画成虚线，这次调用 header 里的候选加粗；用户的意图和 AI 的意图用不同的边框颜色，节点上也写明是谁的。
 
 依赖图按轮次画出全部任务。第一层压缩的每个工具画成一对方块（压调用、压结果），结果分段压缩时标出段数；第二层压缩、切分和抽取之间的屏障写明了原因，切分读取的第二层压缩窗口用细线画出；抽取单元画成一条链，每个单元标出它的调用序列，并高亮当前调用。页面顶部的表按阶段统计真实的调用次数、重试、驳回和失败。
 

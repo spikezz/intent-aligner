@@ -16,7 +16,7 @@ import attrs
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from intent_aligner.units import AIText, Item, ToolCall, UserMessage, UserSignal
+from intent_aligner.units import Item, Speech, ToolCall, UserSignal
 
 STORE_HEADER = "# 结构和填写规则见 docs/trajectory-extractor.md（路径相对于工具根目录）\n"
 UNASSIGNED_FILE = "unassigned.yaml"
@@ -27,17 +27,17 @@ Relation = Literal[
 
 
 class IntentNode(BaseModel):
-    """A user intent in a topic's registry; `label` is its one standard text."""
+    """An intent someone stated in a topic's registry; `label` is its one standard text."""
 
     model_config = ConfigDict(frozen=True)
 
     type: Literal["intent"] = "intent"
-    actor: Literal["user"] = "user"
+    actor: Literal["user", "ai"] = "user"
     label: str = Field(min_length=1)
 
 
 class AggregateNode(BaseModel):
-    """What a run of tool calls is doing, at the level of what the user says.
+    """What a run of tool calls is doing, at the level of a speech.
 
     Tool-call intents are too low-level for the graph; `Meta.tool_intents` lists them
     under their aggregate.
@@ -145,7 +145,7 @@ class Span(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: str
-    kind: Literal["user_text", "tool_calls", "user_signal"]
+    kind: Literal["user_text", "ai_text", "tool_calls", "user_signal"]
     source: SpanSource
     chars: tuple[int, int] | None = None
     text: str
@@ -302,13 +302,15 @@ class Stores:
             update={"meta": store.meta.model_copy(update={"graph": graph})}
         )
 
-    def register_intent(self, topic: str, node_id: str, label: str) -> None:
-        """Add user intent `node_id` to `topic`'s registry; it must be the next global id."""
+    def register_intent(
+        self, topic: str, node_id: str, label: str, actor: Literal["user", "ai"]
+    ) -> None:
+        """Add speech or signal intent `node_id` to `topic`'s registry; it must be the next global id."""
         if node_id != self.next_intent_id():
             raise AssertionError(
                 f"Registering {node_id} when the next id is {self.next_intent_id()}."
             )
-        self._add_node(topic, node_id, IntentNode(label=label))
+        self._add_node(topic, node_id, IntentNode(label=label, actor=actor))
         self.intents += 1
 
     def register_aggregate(self, topic: str, node_id: str, label: str) -> None:
@@ -345,18 +347,18 @@ class Stores:
             update={"meta": store.meta.model_copy(update={"graph": graph})}
         )
 
-    def add_user_text(
+    def add_speech_text(
         self,
         topic: str | None,
-        message: UserMessage,
+        message: Speech,
         chars: tuple[int, int],
         intents: list[SpanIntent],
         needs_review: bool,
     ) -> str:
-        """A span for one user segment, returning its id; the last segment of a message triggers its coverage check."""
+        """A span for one speech segment, returning its id; the last segment of a speech triggers its coverage check."""
         source = self._source(message.source.session, message.source.timestamp.isoformat())
         span = self._span(
-            kind="user_text",
+            kind="user_text" if message.speaker == "user" else "ai_text",
             source=source.model_copy(update={"uuid": message.source.uuid}),
             chars=chars,
             text=message.body[chars[0] : chars[1]],
@@ -444,13 +446,13 @@ class Stores:
         self._call_spans[call.tool_use_id] = _CallSpan(span=span.id, aggregates=aggregates)
         return span.id
 
-    def check_coverage(self, message: UserMessage) -> None:
+    def check_coverage(self, message: Speech) -> None:
         """Raise when the message's spans across all stores do not tile its body exactly."""
         chars = sorted(
             span.chars
             for store in self.stores.values()
             for span in store.spans
-            if span.kind == "user_text"
+            if span.kind in ("user_text", "ai_text")
             and span.source.uuid == message.source.uuid
             and span.chars is not None
         )
@@ -463,9 +465,10 @@ class Stores:
             )
 
     def _adjacent(self, before: int, after: int) -> bool:
-        """No user text, user signal or AI text lies between the two timeline items."""
-        said = (UserMessage, UserSignal, AIText)
-        return not any(isinstance(item, said) for item in self.items[before + 1 : after])
+        """No speech or user signal lies between the two timeline items."""
+        return not any(
+            isinstance(item, Speech | UserSignal) for item in self.items[before + 1 : after]
+        )
 
     def _source(self, session: str, timestamp: str) -> SpanSource:
         return SpanSource(merged_file=self.merged_file, session=session, timestamp=timestamp)

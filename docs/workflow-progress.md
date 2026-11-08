@@ -15,11 +15,11 @@ flowchart TD
     classDef todo fill:#fecaca,stroke:#dc2626,stroke-width:2px,color:#7f1d1d
 
     START([开始：合并后的对话文件]) --> CUT
-    CUT["代码：按时间顺序切成单元<br/>用户消息 / 用户信号 / 工具调用 / 观测<br/>AI 对用户说的话只作上下文<br/>跳过思考、状态行、压缩摘要"]
+    CUT["代码：按时间顺序切成单元<br/>用户消息 / AI 发言 / 用户信号 / 工具调用 / 观测<br/>跳过思考、状态行、压缩摘要"]
     CUT --> ZIP
-    ZIP["LLM：两级压缩工具操作<br/>第一级：每个调用的意图<br/>[意图文本, evidence, explicit, note] + 对象<br/>每个结果的概括<br/>第二级：每一轮一段概括"]
+    ZIP["LLM：两级压缩工具操作<br/>第一级：每个调用的意图<br/>[意图文本, evidence, explicit, note] + 对象<br/>每个结果的概括<br/>第二级：每两次发言之间的工具操作一段概括"]
     ZIP --> SEG
-    SEG["LLM 指针：把每条用户消息<br/>切成首尾相接的用户段落<br/>每段附带意图<br/>[意图文本, evidence, explicit, note]"]
+    SEG["LLM 指针：把每次发言<br/>切成首尾相接的段落<br/>每段附带意图<br/>[意图文本, evidence, explicit, note]"]
     SEG --> PTR
 
     PTR["代码：指针移到下一个单元"]
@@ -33,13 +33,13 @@ flowchart TD
     INHERIT --> KIND
     KIND{单元类型？}
 
-    KIND -- "用户段落 / 用户信号 / 工具调用" --> CTX
+    KIND -- "用户段落 / AI 段落 / 用户信号 / 工具调用" --> CTX
     KIND -- "观测" --> CTXD
 
     CTX["代码：组装 context<br/>header：topic 列表、当前 topic、<br/>单元信息、当前 topic 的整张图谱、候选<br/>input：窗口内的对话 + 当前单元"]
 
     CTX --> SRC{意图从哪里来？}
-    SRC -- 用户段落 --> SEGI["代码：取切分给出的意图"]
+    SRC -- 用户段落或 AI 段落 --> SEGI["代码：取切分给出的意图"]
     SRC -- 工具调用 --> ZIPI["代码：取第一级压缩给出的意图"]
     SEGI -- 空列表 --> SPAN
     SEGI -- 非空 --> RET
@@ -48,9 +48,9 @@ flowchart TD
     A --> VA{"校验 A<br/>每项字段齐全？<br/>evidence 是单元原文的摘录？<br/>explicit 为 false 时 note 非空？"}
     VA -- 不通过 --> A
     VA -- "通过，空列表" --> SPAN
-    VA -- "通过，非空" --> RET["代码：列出候选<br/>调用 B：当前 topic 的用户意图节点<br/>调用 C：当前 topic 的全部节点 + 窗口内能单独看到的未建节点观测<br/>（用户拒绝时被拒绝调用所属的聚合已在全部节点里）"]
+    VA -- "通过，非空" --> RET["代码：列出候选<br/>调用 B：当前 topic 里同一方（用户或 AI）的意图节点<br/>调用 C：当前 topic 的全部节点 + 窗口内能单独看到的未建节点观测<br/>（用户拒绝时被拒绝调用所属的聚合已在全部节点里）"]
 
-    RET --> HAS{当前 topic 已有意图节点？}
+    RET --> HAS{当前 topic 已有同一方的意图节点？}
     HAS -- "没有：全部算作 NEW" --> ASSIGN
     HAS -- 有 --> B["调用 B：每个意图是已有的哪一个？<br/>输出 已有编号或 NEW<br/>+ 已有意图是否完整包含这个单元的信息"]
     B --> VB{"校验 B<br/>答案和本单元的意图一一对应？<br/>选的编号在候选列表里？<br/>选已有编号的都回答了完整性？"}
@@ -75,13 +75,13 @@ flowchart TD
     VC -- 通过 --> TRIG["代码：重复的边去重<br/>triggers 指向尚未建节点的观测时<br/>用这个观测的概括文本为它建节点<br/>是工具结果则补 produces 边"]
     TRIG --> SPAN
 
-    SPAN["代码：定段落<br/>用户段落沿用切分给出的边界<br/>工具调用按合并规则并入前一段或新建段落<br/>填 id / kind / source / chars 或 tool_use_ids / text"]
+    SPAN["代码：定段落<br/>发言段落沿用切分给出的边界<br/>工具调用按合并规则并入前一段或新建段落<br/>填 id / kind / source / chars 或 tool_use_ids / text"]
     SPAN --> BACKFILL
     BACKFILL["代码：给本单元新建的边回填 span 字段"]
     BACKFILL --> FINAL
 
     CTXD["代码：组装 context<br/>header：topic 列表、当前 topic、<br/>单元信息、当前 topic 的整张图谱、候选<br/>input：窗口内的对话 + 这个观测<br/>工具结果给第一级压缩的概括，其他观测给原文"]
-    CTXD --> RETD["代码：列出候选<br/>当前 topic 的全部用户意图和聚合节点"]
+    CTXD --> RETD["代码：列出候选<br/>当前 topic 的全部意图节点（用户的和 AI 的）和聚合节点"]
     RETD --> D["调用 D：这个观测达成或阻碍了哪些已有意图？<br/>输出 [relation, 目标编号] 列表，为空表示都没有<br/>任务通知和系统消息另外输出一句概括"]
     D --> VD{"校验 D<br/>relation 只能是 satisfies / blocks？<br/>目标编号在候选列表里？<br/>需要概括时概括非空？"}
     VD -- 不通过 --> D
@@ -91,9 +91,9 @@ flowchart TD
     PEND --> FINAL
 
     FINAL{"代码：pydantic 校验"}
-    FINAL -- 通过 --> MSGEND{"刚处理完一条用户消息的<br/>最后一个段落？"}
+    FINAL -- 通过 --> MSGEND{"刚处理完一次发言的<br/>最后一个段落？"}
     FINAL -- 不通过 --> HALT([报错停止：这是代码的 bug])
-    MSGEND -- 是 --> COVER{"代码：覆盖检查<br/>这条消息在所有 topic 存储<br/>和未归属存储里的段落<br/>（包括当前这一段）合起来首尾相接覆盖整个正文？"}
+    MSGEND -- 是 --> COVER{"代码：覆盖检查<br/>这次发言在所有 topic 存储<br/>和未归属存储里的段落<br/>（包括当前这一段）合起来首尾相接覆盖整个正文？"}
     MSGEND -- 否 --> WRITE[("写入当前 topic 的存储文件")]
     COVER -- 通过 --> WRITE
     COVER -- 不通过 --> HALT

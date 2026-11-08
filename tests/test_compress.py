@@ -66,7 +66,7 @@ def test_level_one_then_one_digest_per_round() -> None:
         ("call", "c2"),
         ("result", "c1"),
         ("result", "c2"),
-        ("round", "u1"),
+        ("round", "a1"),
         ("round", "u2"),
     ], made
     assert made[-1].kind == "round", made
@@ -131,7 +131,9 @@ def test_the_round_reads_intents_targets_and_results_not_raw_text() -> None:
     rounds = _Script(*[_round_answer("")] * 2)
     _run(TIMELINE, Digests(), _call_answer, _result_answer, rounds)
 
-    expected = "<用户消息>\n第一条\n</用户消息>\n<轨迹>\nBash 意图：看目录 对象：ls 结果：列出了文件\n</轨迹>"
+    expected = (
+        "<发言>（AI）\n好的\n</发言>\n<轨迹>\nBash 意图：看目录 对象：ls 结果：列出了文件\n</轨迹>"
+    )
     assert rounds.prompts[0] == expected, rounds.prompts[0]
 
 
@@ -154,7 +156,7 @@ def test_a_long_trajectory_is_summarized_again() -> None:
     assert sum(d.kind == "round" for d in made) == 1, made
     assert "（第 2/2 段）" in rounds.prompts[1], rounds.prompts[1][:60]
     assert (
-        rounds.prompts[2] == "<用户消息>\n做\n</用户消息>\n<轨迹>\n看了目录\n看了目录\n</轨迹>"
+        rounds.prompts[2] == "<发言>（用户）\n做\n</发言>\n<轨迹>\n看了目录\n看了目录\n</轨迹>"
     ), rounds.prompts[2]
 
 
@@ -170,8 +172,8 @@ def test_a_long_queued_message_is_cut_and_marked() -> None:
     rounds = _Script(_round_answer(""))
     _run([queued, _call("c1"), _result("c1")], Digests(), _call_answer, _result_answer, rounds)
 
-    head = rounds.prompts[0].split("</用户消息>")[0]
-    assert head.startswith("<用户消息>（AI 工作时发出）（太长，只保留开头）\n"), head[:60]
+    head = rounds.prompts[0].split("</发言>")[0]
+    assert head.startswith("<发言>（用户）（AI 工作时发出）（太长，只保留开头）\n"), head[:60]
     body = head.split("\n", 1)[1]
     assert body == "长" * compress.MESSAGE_ROOM + "\n", len(body)
 
@@ -191,7 +193,7 @@ def test_existing_digests_are_not_redone() -> None:
     done = Digests(
         calls={"c1": _call_digest("c1", "i")},
         results={"c1": ResultDigest(tool_use_id="c1", summaries=["s"])},
-        rounds={"u1": RoundDigest(round_uuid="u1", summary="r")},
+        rounds={"a1": RoundDigest(round_uuid="a1", summary="r")},
     )
     made = _run(TIMELINE, done, _call_answer, _result_answer)
 

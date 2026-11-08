@@ -10,19 +10,19 @@
   --l1: #3b7dd8; --l2: #7a5cc7; --seg: #d08a1e; --loop: #2f9e6a;
   --ok: #2f9e6a; --bad: #d1453b; --warn: #d08a1e; --pending: #c9c9c3; --active: #111111;
   --feedback: #fde7c4; --var: #fbe3c0; --var-ink: #8a5300; --code: #f1f1ee; --signal: #0b6e8a;
-  --I: #4656b8; --G: #a86a00; --O: #b3322a;
+  --I: #4656b8; --A: #0f7d6b; --G: #a86a00; --O: #b3322a;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #a09f98; --line: #3a3a36;
     --pending: #4a4a45; --active: #ffffff; --feedback: #5a4318; --var: #4a3512; --var-ink: #f0c070;
-    --code: #262624; --signal: #4dbcd8; --I: #99a6f2; --G: #e6ac4b; --O: #ef7f75;
+    --code: #262624; --signal: #4dbcd8; --I: #99a6f2; --A: #5fd0b5; --G: #e6ac4b; --O: #ef7f75;
   }
 }
 :root[data-theme="dark"] {
   --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #a09f98; --line: #3a3a36;
   --pending: #4a4a45; --active: #ffffff; --feedback: #5a4318; --var: #4a3512; --var-ink: #f0c070;
-  --code: #262624; --signal: #4dbcd8; --I: #99a6f2; --G: #e6ac4b; --O: #ef7f75;
+  --code: #262624; --signal: #4dbcd8; --I: #99a6f2; --A: #5fd0b5; --G: #e6ac4b; --O: #ef7f75;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 system-ui, "Noto Sans CJK SC", sans-serif; }
@@ -150,16 +150,16 @@ details.more summary { cursor: pointer; color: var(--muted); }
   </section>
   <section class="box">
     <div class="head"><span class="ftitle" id="gtitle"></span></div>
-    <div class="legend"><span>实线框和实线边：已经写入存储</span> · <span>虚线：这个单元刚产生、在单元最后一次调用之后提交</span> · <span>粗框：这次调用 header 里的候选</span> · <span style="color:var(--I)">I 用户意图</span> · <span style="color:var(--G)">G 工具调用的聚合</span> · <span style="color:var(--O)">O 观测</span></div>
+    <div class="legend"><span>实线框和实线边：已经写入存储</span> · <span>虚线：这个单元刚产生、在单元最后一次调用之后提交</span> · <span>粗框：这次调用 header 里的候选</span> · <span style="color:var(--I)">I 用户的意图</span> · <span style="color:var(--A)">I AI 的意图</span> · <span style="color:var(--G)">G 工具调用的聚合</span> · <span style="color:var(--O)">O 观测</span></div>
     <div id="bench"></div>
   </section>
 </div>
 <script>
 const PAGE = /*PAGE_DATA*/null;
 const STAGES = ["L1", "L2", "SEG", "LOOP"];
-const STAGE_NAMES = {L1: "第一层压缩（工具调用和结果）", L2: "第二层压缩（整轮）", SEG: "切分用户消息", LOOP: "逐单元抽取"};
+const STAGE_NAMES = {L1: "第一层压缩（工具调用和结果）", L2: "第二层压缩（一轮的工具操作）", SEG: "切分发言", LOOP: "逐单元抽取"};
 const STAGE_COLORS = {L1: "var(--l1)", L2: "var(--l2)", SEG: "var(--seg)", LOOP: "var(--loop)"};
-const ASK_NAMES = {call: "压缩工具调用", result: "压缩工具结果", round: "压缩整轮", segment: "切分", topic: "T 归入 topic",
+const ASK_NAMES = {call: "压缩工具调用", result: "压缩工具结果", round: "压缩一轮的工具操作", segment: "切分", topic: "T 归入 topic",
   signal: "A 信号意图", registry: "B 登记意图", aggregate: "G 归入聚合", tool_intent: "L 底层意图", relation: "C 连边",
   outcome: "D 观察结果", outcome_summary: "D 观察结果（摘要）"};
 const LETTER = {topic: "T", signal: "A", registry: "B", aggregate: "G", tool_intent: "L", relation: "C", outcome: "D", outcome_summary: "D", round: "压"};
@@ -260,7 +260,6 @@ function tick() {
 function togglePlay() {
   if (timer) return stop();
   if (current >= frames.length - 1) current = 0;
-  else current++;
   beat = 0; draw();
   const b = document.getElementById("play"); b.textContent = "暂停"; b.classList.add("on");
   timer = setTimeout(tick, beatMs());
@@ -339,9 +338,8 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
     out.push(`<text x="${x + 3}" y="${y + 12}" pointer-events="none" style="fill:#fff">${esc(j.label.slice(0, 9))}</text>`);
     cells.push({id: j.id});
   });
-  const windowed = Math.max(0, ...jobs.filter(j => j.stage === "SEG").map(j => j.after.filter(a => a.startsWith("round:")).length));
   y += 16 + 36;
-  barrier(y - 14, `compress 命令结束后才运行 segment；每条消息的窗口读它前面最多 ${windowed} 轮的第二层压缩（细线）`);
+  barrier(y - 14, `compress 命令结束后才运行 segment；每次发言的窗口最多读它前面 ${PAGE.window_rounds} 轮，细线连着实际放进窗口、并且有工具操作的那些轮`);
 
   bandLabel("SEG", y);
   const windows = [];
@@ -351,7 +349,8 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
     if (k % SEG_PER_ROW) out.push(`<line class="chain" x1="${x - 6}" y1="${yy + 6}" x2="${x}" y2="${yy + 6}"/>`);
     out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" x="${x}" y="${yy}" width="${SEG_W - 6}" height="12" rx="2"><title>${esc(j.id + "\n字符 " + j.label)}</title></rect>`);
     cells.push({id: j.id});
-    for (const a of j.after) if (a.startsWith("round:") && layout[a]) windows.push([layout[a], layout[j.id]]);
+    const seen = calls[callsOf[j.id]?.at(-1)]?.window_seen;
+    for (const a of j.after) if (a.startsWith("round:") && layout[a] && (!seen || seen.includes(a.slice(6)))) windows.push([layout[a], layout[j.id]]);
   });
   for (const [a, b] of windows) out.push(`<path class="window" d="M${a.x + a.w / 2},${a.y + a.h} C${a.x + a.w / 2},${(a.y + a.h + b.y) / 2} ${b.x + b.w / 2},${(a.y + a.h + b.y) / 2} ${b.x + b.w / 2},${b.y}"/>`);
   y += rowsOf(segs, SEG_PER_ROW) * 18 + 34;
@@ -375,7 +374,7 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
 
   const width = Math.max(LEFT + columns * COL_W, LEFT + PER_CHAIN * (BW + GX)) + 10;
   let head = "";
-  for (let c = 0; c < columns; c++) head += `<text x="${LEFT + c * COL_W}" y="12">${c + first === 0 ? "首条消息前" : "第 " + (c + first) + " 轮"}</text>`;
+  for (let c = 0; c < columns; c++) head += `<text x="${LEFT + c * COL_W}" y="12">${c + first === 0 ? "首次发言前" : "第 " + (c + first) + " 轮"}</text>`;
   for (const [yy, text] of bars) head += `<line class="barrier" x1="4" x2="${width}" y1="${yy}" y2="${yy}"/><text class="bartext" x="${LEFT}" y="${yy - 3}">${esc(text)}</text>`;
   const svg = `<svg width="${width}" height="${y}" role="img" aria-label="任务依赖图">${head}<g id="edges"></g>${out.join("")}</svg>`;
   document.getElementById("dag").innerHTML = svg;
@@ -394,8 +393,8 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
   document.getElementById("dagnote").textContent =
     `第一层压缩：${toolJobs.length} 个工具调用各是一个任务，一共调用模型 ${l1} 次。任务内部是串行的：先压调用，再压结果，因为压结果的提示词要带上调用的意图；` +
     `其中 ${multi} 个结果太长，被分成几段逐段压缩（加粗的右块，旁边的数字是段数）。任务之间互不依赖，可以并行。` +
-    `第二层压缩要等全部第一层任务结束才开始，${jobs.filter(j => j.stage === "L2").length} 轮各是一个任务。` +
-    `切分在 compress 命令之后运行：${messages} 条用户消息之间并行，一共切出 ${jobs.filter(j => j.stage === "SEG").length} 段；同一条消息里的段只能一段接一段地切，因为下一段从上一段的结尾开始。` +
+    `第二层压缩要等全部第一层任务结束才开始，有工具操作的 ${jobs.filter(j => j.stage === "L2").length} 轮各是一个任务。` +
+    `切分在 compress 命令之后运行：${messages} 次发言之间并行，一共切出 ${jobs.filter(j => j.stage === "SEG").length} 段；同一次发言里的段只能一段接一段地切，因为下一段从上一段的结尾开始。` +
     `抽取在切分之后运行：${unitJobs.length} 个单元严格串行，单元内部的调用也串行。各单元的调用序列：${top}。“压”是提示词放不下时临时调用的本轮压缩。点图里的方块可以跳到对应的调用。`;
 })();
 
@@ -468,14 +467,15 @@ function drawHead(f, job) {
   if (c) {
     const mine = callsOf[c.subject];
     $("fmeta").textContent = `第 ${c.attempt} 次（最多 ${limitOf(c)} 次）· ${c.started ? "开始 " + time(c.started) + " · " : ""}结束 ${time(c.ended)} · ` +
-      `这个任务的第 ${mine.indexOf(f.i) + 1} 次调用，共 ${mine.length} 次`;
+      `这个任务的第 ${mine.indexOf(f.i) + 1} 次调用，共 ${mine.length} 次` +
+      (c.window_seen ? ` · 窗口实际放进前 ${c.window_seen.length} 轮（这里最多能放 ${c.window_limit} 轮）` : "");
     $("freason").innerHTML = c.reason && beat >= 3
       ? `<div class="reason">${c.verdict === "rejected" && c.attempt < limitOf(c) ? "管线把下面这段反馈附在提示词后面，又问了一次：\n" : ""}${esc(c.reason)}</div>` : "";
   } else {
     const a = job.record?.assignment;
     $("fmeta").textContent = "这个单元没有调用模型，记录直接由代码写出。";
     $("freason").innerHTML = `<div class="reason skip">${esc(a?.needs_review ? "代码把它标成 needs_review：" + a.review_reason
-      : a?.placeholder ? "整条消息没有意图，代码写下一个占位记录。"
+      : a?.placeholder ? "整次发言没有意图，代码写下一个占位记录。"
       : a?.topic ? `它的 topic ${a.topic} 由代码直接确定，没有需要模型判断的内容。` : "它不属于任何 topic，代码直接写下空记录。")}</div>`;
   }
   $("unit").innerHTML = unitHtml(c, job);
@@ -489,9 +489,9 @@ function unitHtml(c, job) {
   }
   if (job.stage === "SEG") {
     const [a, b] = [job.record.start, job.record.end];
-    return `<div class="kv">用户消息，这一段是字符 ${a}–${b}（黄框）</div><pre>${esc(job.text.slice(0, a))}<mark>${esc(job.text.slice(a, b))}</mark>${esc(job.text.slice(b))}</pre>`;
+    return `<div class="kv">${esc(job.speaker)}的发言，这一段是字符 ${a}–${b}（黄框）</div><pre>${esc(job.text.slice(0, a))}<mark>${esc(job.text.slice(a, b))}</mark>${esc(job.text.slice(b))}</pre>`;
   }
-  return `<div class="kv">${esc(job.stage === "L1" ? "工具 " + job.label + " · " + job.id : "这一轮从用户消息开始：" + job.label)}</div>`;
+  return `<div class="kv">${esc(job.stage === "L1" ? "工具 " + job.label + " · " + job.id : (job.speaker ? `这一轮从${job.speaker}的发言开始：` : "") + job.label)}</div>`;
 }
 
 function promptHtml(c) {
@@ -615,6 +615,8 @@ function drawBench(f, job) {
   $("gtitle").textContent = `图谱：${topic} ${PAGE.topics[topic] ?? ""}（${entries.length} 个节点${committed ? "，本单元的改动已提交" : "，虚线是本单元还没提交的改动"}）`;
   if (!entries.length) { $("bench").innerHTML = `<p class="note">这个 topic 的图谱目前还是空的。</p>`; return; }
   const kinds = ["intent", "aggregate", "observation"], colors = {intent: "var(--I)", aggregate: "var(--G)", observation: "var(--O)"};
+  const strokeOf = n => n.type === "intent" && n.actor === "ai" ? "var(--A)" : colors[n.type] ?? "var(--muted)";
+  const nameOf = (id, n) => n.type === "intent" ? `${id} · ${n.actor === "ai" ? "AI" : "用户"}` : id;
   const W = 270, H = 44, GAP = 60, pos = {}, rows = [0, 0, 0];
   for (const [id, n] of entries) { const kk = Math.max(0, kinds.indexOf(n.type)); pos[id] = {x: 10 + kk * (W + GAP), y: 10 + rows[kk]++ * (H + 12)}; }
   const height = 20 + Math.max(...rows) * (H + 12);
@@ -630,8 +632,8 @@ function drawBench(f, job) {
   }
   for (const [id, n] of entries) {
     const p = pos[id], pending = fresh.has(id) && !committed, hot = candidates.has(id);
-    svg += `<g><title>${esc(id + " " + (n.label ?? ""))}</title><rect x="${p.x}" y="${p.y}" width="${W}" height="${H}" rx="4" fill="var(--panel)" stroke="${colors[n.type] ?? "var(--muted)"}" stroke-width="${hot ? 3.2 : 1.3}"${pending ? ' stroke-dasharray="5 4"' : ""}/>` +
-      `<text x="${p.x + 6}" y="${p.y + 16}" font-weight="700">${esc(id)}</text><text x="${p.x + 6}" y="${p.y + 34}">${esc(String(n.label ?? "").slice(0, 22))}</text></g>`;
+    svg += `<g><title>${esc(id + " " + (n.label ?? ""))}</title><rect x="${p.x}" y="${p.y}" width="${W}" height="${H}" rx="4" fill="var(--panel)" stroke="${strokeOf(n)}" stroke-width="${hot ? 3.2 : 1.3}"${pending ? ' stroke-dasharray="5 4"' : ""}/>` +
+      `<text x="${p.x + 6}" y="${p.y + 16}" font-weight="700">${esc(nameOf(id, n))}</text><text x="${p.x + 6}" y="${p.y + 34}">${esc(String(n.label ?? "").slice(0, 22))}</text></g>`;
   }
   $("bench").innerHTML = `<svg width="${10 + 3 * (W + GAP)}" height="${height}" role="img" aria-label="topic 图谱">${svg}</svg>`;
 }

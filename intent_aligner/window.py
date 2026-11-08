@@ -2,10 +2,12 @@
 
 The tool work of a round enters the window only as that round's one digest (see
 intent_aligner.compress), so the window is mostly what the user and the AI said.
+A round is one speech, by the user or the AI, and everything up to the next speech.
 """
 
 from __future__ import annotations
 
+from argparse import ArgumentTypeError
 from collections.abc import Callable, Sequence
 from functools import cache
 from pathlib import Path
@@ -16,7 +18,15 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from tokenizers import Tokenizer
 
 from intent_aligner.intent import Intent
-from intent_aligner.units import AIText, Item, Observation, ToolCall, UserMessage, UserSignal
+from intent_aligner.units import (
+    AIText,
+    Item,
+    Observation,
+    Speech,
+    ToolCall,
+    UserMessage,
+    UserSignal,
+)
 
 # hive-frame qwen38-np8 gives each slot 18,944 tokens; the rest of the slot is left
 # for the 9,216-token thinking budget (llm._HIVE_THINKING_BUDGET) and the answer; the
@@ -25,7 +35,7 @@ PROMPT_BUDGET = 9_000
 # Qwen3-0.6B shares the Qwen tokenizer family; on six corpus texts its counts were
 # within 7% of the qwen38 server's /tokenize, which PROMPT_BUDGET's slack absorbs.
 TOKENIZER = "Qwen/Qwen3-0.6B"
-ROUNDS = (2, 1)
+DEFAULT_WINDOW_ROUNDS = 2
 # How far call G looks past the unit it files. Both aggregates misfiled before this
 # existed were settled within two units; the limits keep room for the earlier rounds.
 FOLLOWING_ITEMS = 8
@@ -65,7 +75,7 @@ class ResultDigest(BaseModel):
 
 
 class RoundDigest(BaseModel):
-    """All tool work of one round in one passage; `round_uuid` is its opening user message."""
+    """All tool work of one round in one passage; `round_uuid` is its opening speech."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -94,6 +104,14 @@ class Digests:
             self.results[digest.tool_use_id] = digest
         else:
             self.rounds[digest.round_uuid] = digest
+
+
+def window_rounds(text: str) -> int:
+    """argparse type of --window-rounds: how many earlier rounds a window may hold."""
+    rounds = int(text)
+    if rounds < 1:
+        raise ArgumentTypeError(f"--window-rounds must be at least 1, got {rounds}.")
+    return rounds
 
 
 def load_digests(path: Path) -> Digests:
@@ -129,7 +147,7 @@ def render_items(items: Sequence[Item], digests: Digests) -> str:
     round_uuid = ""
     round_shown = False
     for item in items:
-        if isinstance(item, UserMessage):
+        if isinstance(item, Speech):
             round_uuid, round_shown = item.source.uuid, False
         if isinstance(item, ToolCall):
             if not round_shown:
@@ -242,20 +260,21 @@ def _round_summary(digests: Digests, round_uuid: str) -> str:
 
 
 def window_text(
-    items: Sequence[Item], index: int, digests: Digests, room: int, count: Count
+    items: Sequence[Item], index: int, digests: Digests, room: int, count: Count, rounds: int
 ) -> str:
-    """The rounds before the user message items[index], within `room` tokens.
+    """The `rounds` rounds before the speech items[index], within `room` tokens.
 
-    A round is one typed user message and everything up to the next one. Two
-    earlier rounds are tried first, then one; raises WindowError when neither fits.
+    One round fewer is tried until the text fits; raises WindowError when even one
+    round does not.
     """
-    starts = [i for i in range(index) if isinstance(items[i], UserMessage)]
-    for rounds in ROUNDS:
-        low = starts[-rounds] if len(starts) >= rounds else 0
+    starts = [i for i in range(index) if isinstance(items[i], Speech)]
+    text = ""
+    for taken in range(rounds, 0, -1):
+        low = starts[-taken] if len(starts) >= taken else 0
         text = render_items(items[low:index], digests)
         if count(text) <= room:
             return text
     raise WindowError(
-        f"The {ROUNDS[-1]}-round window before item {index} ({items[index].source.uuid}) "
+        f"The 1-round window before item {index} ({items[index].source.uuid}) "
         f"needs {count(text):,} tokens but only {room:,} are left; mark it needs_review."
     )

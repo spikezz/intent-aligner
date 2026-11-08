@@ -68,15 +68,17 @@ TIMELINE: list[Item] = [
     _user("u3", "第三条"),
 ]
 DIGESTS = Digests(
-    rounds={u: RoundDigest(round_uuid=u, summary=f"概括{u}") for u in ("u1", "u2")},
+    rounds={u: RoundDigest(round_uuid=u, summary=f"概括{u}") for u in ("a1", "u1", "u2")},
 )
 
 
-def test_two_rounds_when_they_fit() -> None:
-    text = window_text(TIMELINE, 7, DIGESTS, 10_000, len)
+def test_the_rounds_parameter_sets_how_far_back_the_window_reaches() -> None:
+    three = window_text(TIMELINE, 7, DIGESTS, 10_000, len, 3)
+    two = window_text(TIMELINE, 7, DIGESTS, 10_000, len, 2)
 
-    assert text.startswith("【用户】\n第一条"), text
-    assert "x" * 100 not in text, "tool results must enter only through the round digest"
+    assert three.startswith("【用户】\n第一条"), three
+    assert two.startswith("【AI】\n好的"), "what the AI said opens a round of its own"
+    assert "x" * 100 not in three, "tool results must enter only through the round digest"
 
 
 def test_a_round_shows_its_tool_work_once() -> None:
@@ -95,15 +97,15 @@ def test_a_result_in_a_later_round_opens_no_entry() -> None:
 
 
 def test_falls_back_to_one_round() -> None:
-    two = len(window_text(TIMELINE, 7, DIGESTS, 10_000, len))
-    text = window_text(TIMELINE, 7, DIGESTS, two - 1, len)
+    two = len(window_text(TIMELINE, 7, DIGESTS, 10_000, len, 2))
+    text = window_text(TIMELINE, 7, DIGESTS, two - 1, len, 2)
 
     assert text.startswith("【用户】\n第二条"), text
 
 
 def test_one_round_too_long_raises() -> None:
     with pytest.raises(WindowError, match="needs_review"):
-        window_text(TIMELINE, 7, DIGESTS, 5, len)
+        window_text(TIMELINE, 7, DIGESTS, 5, len, 2)
 
 
 def test_missing_round_digest_names_the_fix() -> None:

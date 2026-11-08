@@ -149,7 +149,8 @@ def _assignments(
         round=_no_round,
     )
     stores = stores or Stores(merged_file="merged.jsonl", items=items)
-    events = extract_units(items, segments, digests, done or [], [], asks, count, stores)
+    segments = {"a1": [], **segments}
+    events = extract_units(items, segments, digests, done or [], [], asks, count, stores, 2)
     return [event for event in events if isinstance(event, Assignment)]
 
 
@@ -238,7 +239,7 @@ def test_the_current_round_shows_level_one_digests_up_to_the_unit() -> None:
     _run(_new_then_first(prompts))
     c2 = prompts[4]
 
-    assert "【AI 的工具操作】\n概括u1" in c2, "earlier rounds come as round digests"
+    assert "【AI 的工具操作】\n概括a1" in c2, "earlier rounds come as round digests"
     assert "概括u2" not in c2, "the round in hand must not show how it ended"
     assert c2.endswith(
         "<当前单元>\n【AI 的工具调用】\nBash 意图：意图c2 对象：对象c2\n</当前单元>"
@@ -399,6 +400,41 @@ def test_call_b_is_skipped_until_the_topic_has_intents_and_sees_only_user_ones()
     assert header["candidates"] == ["I001"], header
     assert header["current_topic"] == "T001", header
     assert _unit_intents(registry_prompts[0]) == ["1. 做乙（依据：第）"], registry_prompts[0]
+
+
+def test_ai_speech_gets_its_own_nodes_and_is_matched_only_against_the_ai() -> None:
+    items: list[Item] = [
+        _user("u1", "第一条"),
+        AIText(source=_source("a1"), text="回答甲"),
+        AIText(source=_source("a2"), text="回答乙"),
+        _user("u2", "第二条"),
+    ]
+    segments = {
+        uuid: [_segment(0, 3).model_copy(update={"intents": _said(uuid)})]
+        for uuid in ("u1", "a1", "a2", "u2")
+    }
+    candidates: list[object] = []
+
+    def registry(prompt: str) -> str:
+        candidates.append(_header(prompt)["candidates"])
+        return _all_new(prompt)
+
+    stores = Stores(merged_file="merged.jsonl", items=items)
+    made = _assignments(
+        items, segments, Digests(), _new_then_first([]), registry=registry, stores=stores
+    )
+    store = stores.stores["T001"]
+
+    assert candidates == [["I002"], ["I001"]], candidates
+    assert [a.unit.kind for a in made] == [
+        "user_segment",
+        "ai_segment",
+        "ai_segment",
+        "user_segment",
+    ], made
+    actors = {i: getattr(n, "actor", None) for i, n in store.meta.graph.nodes.items()}
+    assert actors == {"I001": "user", "I002": "ai", "I003": "ai", "I004": "user"}, actors
+    assert [s.kind for s in store.spans] == ["user_text", "ai_text", "ai_text", "user_text"], store
 
 
 def test_a_complete_match_keeps_the_registered_id_once_per_unit() -> None:
@@ -728,7 +764,7 @@ LONG_DIGESTS = Digests(
         f"c{n}": ResultDigest(tool_use_id=f"c{n}", summaries=[f"结果{n}"]) for n in range(PAIRS)
     },
 )
-LONG_SEGMENTS = {"u1": [_segment(0, 4)]}
+LONG_SEGMENTS: dict[str, list[Segment]] = {"u1": [_segment(0, 4)], "a1": []}
 
 
 @pytest.fixture
@@ -762,7 +798,7 @@ def _long_run(
     )
     stores = Stores(merged_file="merged.jsonl", items=LONG)
     events = extract_units(
-        LONG, LONG_SEGMENTS, LONG_DIGESTS, [], compressed or [], asks, _heavy_results, stores
+        LONG, LONG_SEGMENTS, LONG_DIGESTS, [], compressed or [], asks, _heavy_results, stores, 2
     )
     return list(events)
 
@@ -806,7 +842,7 @@ def test_each_compression_is_its_own_level_two_passage() -> None:
     first, second = compressions[:2]
     assert second.begin == first.through, "a compression covers the records after the last one"
     assert "压缩1" not in round_prompts[1], "an earlier passage is never compressed again"
-    assert all("<用户消息>\n做一件事\n</用户消息>" in p for p in round_prompts), round_prompts
+    assert all("<发言>（AI）\n好的，我开始\n</发言>" in p for p in round_prompts), round_prompts
     last = t_prompts[-1]
     assert last.index("压缩1") < last.index("压缩2"), "every passage stays in the window, in order"
 
