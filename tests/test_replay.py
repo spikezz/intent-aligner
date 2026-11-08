@@ -7,15 +7,22 @@ from pathlib import Path
 import pytest
 
 from intent_aligner.corpus import TOOL_ROOT
+from intent_aligner.extract import into_stores, walk
 from intent_aligner.llm import LLM_HOME
 from intent_aligner.replay import (
+    RULE_SOURCES,
     Call,
     Conversation,
     Exchange,
+    ask_rules,
     build_page,
+    graph_changes,
     judge,
+    literal_ranges,
+    literal_texts,
     parse_run,
 )
+from intent_aligner.store import Stores
 from intent_aligner.window import Digests
 
 SOL_RUN = TOOL_ROOT / "corpus" / "results" / "claude-87eeb4bd-sol"
@@ -33,6 +40,7 @@ def _call(subject: str, prompt: str, minute: int, error: str | None = None) -> C
         reasoning=None,
         usage={},
         finish="stop" if error is None else error,
+        request={},
         ended=T0 + timedelta(minutes=minute),
     )
     return Call(
@@ -109,3 +117,52 @@ def test_old_run_matches_every_call_its_records_account_for() -> None:
     got = {key: asks[key] for key in expected}
     assert got == expected, f"{got!r} vs {expected!r}"
     assert page.unplaced == [], page.unplaced
+
+
+def test_every_ask_has_retry_feedback_and_parsed_asks_have_checks() -> None:
+    no_checks = {"round"}
+    got = {
+        ask: (
+            any(r.kind == "feedback" for r in ask_rules(ask)),
+            any(r.kind == "check" for r in ask_rules(ask)),
+        )
+        for ask in RULE_SOURCES
+    }
+    expected = {ask: (True, ask not in no_checks) for ask in RULE_SOURCES}
+    assert got == expected, f"{got!r} vs {expected!r}"
+
+
+def test_prompt_literals_cover_the_tags_of_a_prompt() -> None:
+    prompt = "<此前的对话>\nhello\n</此前的对话>"
+    got = [prompt[a:b] for a, b in literal_ranges(prompt, literal_texts())]
+    assert "hello" not in "".join(got), got
+    assert any("<此前的对话>" in part for part in got), got
+
+
+@needs_sol
+def test_graph_changes_add_up_to_the_final_graphs() -> None:
+    run = parse_run(SOL_RUN)
+    conversation = Conversation.load(run)
+    nodes: dict[str, dict[str, object]] = {}
+    edges: dict[str, list[object]] = {}
+    for change in graph_changes(run, conversation):
+        if change.topic is None:
+            continue
+        topic_nodes = nodes.setdefault(change.topic, {})
+        for removed in change.removed:
+            del topic_nodes[removed]
+        topic_nodes.update(change.nodes)
+        kept = [e for e in edges.get(change.topic, []) if e not in change.removed_edges]
+        edges[change.topic] = kept + change.edges
+    stores = Stores(merged_file=str(run.merged), items=conversation.items)
+    for step, record in zip(
+        walk(conversation.items, conversation.segments), conversation.assignments, strict=False
+    ):
+        into_stores(stores, step, record)
+    graphs = {
+        topic: store.meta.graph.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for topic, store in stores.stores.items()
+    }
+    got = {topic: (nodes[topic], edges[topic]) for topic in nodes}
+    expected = {topic: (g["nodes"], g["edges"]) for topic, g in graphs.items()}
+    assert got == expected, f"{got!r} vs {expected!r}"

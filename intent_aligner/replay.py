@@ -17,6 +17,9 @@ conversation and model, --since/--until must bound this run's time.
 from __future__ import annotations
 
 import argparse
+import ast
+import importlib
+import inspect
 import json
 import re
 import shlex
@@ -24,24 +27,26 @@ from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast, get_args
 
 import attrs
 from pydantic import BaseModel, ConfigDict
 
-from intent_aligner import compress, extract, segment
+from intent_aligner import compress, extract, segment, window
 from intent_aligner.corpus import TOOL_ROOT
 from intent_aligner.extract import (
     Assignment,
     Unit,
+    into_stores,
     load_assignments,
     load_compressions,
     load_segments,
     render_unit,
     walk,
 )
-from intent_aligner.llm import CALLS_FILE, LLM_HOME, CallRecord
+from intent_aligner.llm import CALLS_FILE, LLM_HOME, TRUNCATED_FEEDBACK, CallRecord
 from intent_aligner.segment import Segment, message_window
+from intent_aligner.store import Stores
 from intent_aligner.units import Item, ToolCall, UserMessage, conversation_units
 from intent_aligner.window import Digests, load_digests, qwen_tokens
 
@@ -138,11 +143,14 @@ def _options(tokens: Sequence[str]) -> dict[str, str]:
 class Exchange:
     """One transcript: the request as sent and the reply as received.
 
-    `ended` is the file's mtime: the backend writes the transcript's last line when the
-    reply arrives, and nothing touches it afterwards.
+    `request` is the transcript's request line without the texts shown on their own
+    (system, prompt, schema, and a hive body's messages). `ended` is the file's mtime:
+    the backend writes the transcript's last line when the reply arrives, and nothing
+    touches it afterwards.
     """
 
     path: Path
+    request: dict[str, Any]
     model: str
     system: str
     prompt: str
@@ -180,6 +188,7 @@ def read_exchange(path: Path) -> Exchange | None:
             usage = line["body"].get("usage", {})
     return Exchange(
         path=path,
+        request=_request_settings(request),
         model=request["model"],
         system=request["system_prompt"],
         prompt=request["prompt"],
@@ -190,6 +199,16 @@ def read_exchange(path: Path) -> Exchange | None:
         finish=finish,
         ended=datetime.fromtimestamp(path.stat().st_mtime, UTC),
     )
+
+
+def _request_settings(request: dict[str, Any]) -> dict[str, Any]:
+    shown = {"system_prompt", "prompt", "json_schema", "type"}
+    settings = {key: value for key, value in request.items() if key not in shown}
+    if isinstance(settings.get("body"), dict):
+        body = {key: value for key, value in settings["body"].items() if key != "messages"}
+        body["messages"] = "[system, user]：内容见 system 和提示词"
+        settings["body"] = body
+    return settings
 
 
 @attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
@@ -509,7 +528,8 @@ class Attempt(BaseModel):
     `feedback_at` is where a retry's feedback starts in its prompt. `verdict` is
     "accepted", "rejected" (the pipeline asked again, or gave up and marked the
     record) or "failed" (the call errored, or the same question was asked again from
-    scratch later, so this answer was never kept).
+    scratch later, so this answer was never kept). `fixed` are the [start, end)
+    ranges of the prompt that are string literals of the source (see literal_texts).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -523,7 +543,9 @@ class Attempt(BaseModel):
     started: datetime | None
     ended: datetime
     transcript: str
+    request: dict[str, Any]
     prompt: str
+    fixed: list[tuple[int, int]]
     feedback_at: int | None
     reply: str | None
     reasoning: str | None
@@ -548,6 +570,7 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
     last_asked = {
         (q[0].ask, q[0].subject, q[0].exchange.prompt): n for n, q in enumerate(questions)
     }
+    literals = literal_texts()
     judged: list[Attempt] = []
     for n, question in enumerate(questions):
         base = question[0].exchange.prompt
@@ -563,7 +586,28 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
                 verdict, reason = "failed", "后来同一个问题又从头问了一次，这次的回答没有被保留。"
             elif gave_up is not None:
                 verdict, reason = "rejected", gave_up
-            judged.append(_attempt(call, k + 1, verdict, reason, len(base) if k else None))
+            exchange = call.exchange
+            judged.append(
+                Attempt(
+                    stage=call.stage,
+                    ask=call.ask,
+                    subject=call.subject,
+                    attempt=k + 1,
+                    verdict=verdict,
+                    reason=reason,
+                    started=call.started,
+                    ended=exchange.ended,
+                    transcript=str(exchange.path),
+                    request=exchange.request,
+                    prompt=exchange.prompt,
+                    fixed=literal_ranges(exchange.prompt, literals),
+                    feedback_at=len(base) if k else None,
+                    reply=exchange.reply,
+                    reasoning=exchange.reasoning,
+                    usage=exchange.usage,
+                    finish=exchange.finish,
+                )
+            )
     return sorted(judged, key=lambda a: (a.started or a.ended, a.ended))
 
 
@@ -578,34 +622,236 @@ def _gave_up(call: Call, conversation: Conversation) -> str | None:
     return reason if reason.startswith(f"call {LETTERS[call.ask]} gave no valid answer") else None
 
 
-def _attempt(
-    call: Call, attempt: int, verdict: str, reason: str, feedback_at: int | None
-) -> Attempt:
-    exchange = call.exchange
-    return Attempt(
-        stage=call.stage,
-        ask=call.ask,
-        subject=call.subject,
-        attempt=attempt,
-        verdict=verdict,
-        reason=reason,
-        started=call.started,
-        ended=exchange.ended,
-        transcript=str(exchange.path),
-        prompt=exchange.prompt,
-        feedback_at=feedback_at,
-        reply=exchange.reply,
-        reasoning=exchange.reasoning,
-        usage=exchange.usage,
-        finish=exchange.finish,
+# The modules whose string literals build prompts; units.py is left out because the
+# tool call texts it renders are the conversation's content.
+PROMPT_MODULES = (compress, segment, extract, window)
+# A literal counts as prompt text only if it carries a tag, a label or a full-width
+# punctuation mark; shorter or plainer literals ("\n", "topics") would also match
+# inside the conversation's own text.
+_PROMPT_MARKS = frozenset("<>【】：（）")
+
+
+def literal_texts() -> list[str]:
+    """Prompt-building string literals of the source, longest first, docstrings left out."""
+    found: set[str] = set()
+    for module in PROMPT_MODULES:
+        tree = ast.parse(inspect.getsource(module))
+        docstrings = {
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef)
+            and node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+        }
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in docstrings
+                and len(node.value.strip()) >= 2
+                and _PROMPT_MARKS & set(node.value)
+            ):
+                found.add(node.value)
+    return sorted(found, key=len, reverse=True)
+
+
+def literal_ranges(prompt: str, literals: Sequence[str]) -> list[tuple[int, int]]:
+    """Where `literals` occur in `prompt`, longest first and without overlaps, merged.
+
+    Examples:
+        >>> literal_ranges("<a>\\nx\\n</a>", ["\\n</a>", "<a>\\n"])
+        [(0, 4), (5, 10)]
+    """
+    taken = bytearray(len(prompt))
+    for literal in literals:
+        at = prompt.find(literal)
+        while at >= 0:
+            end = at + len(literal)
+            if not any(taken[at:end]):
+                taken[at:end] = b"\x01" * len(literal)
+            at = prompt.find(literal, at + 1)
+    ranges: list[tuple[int, int]] = []
+    start: int | None = None
+    for i, flag in enumerate([*taken, 0]):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            ranges.append((start, i))
+            start = None
+    return ranges
+
+
+class Rule(BaseModel):
+    """A check the code applies to an ask's reply, or feedback it sends with a retry.
+
+    `text` is the message as written in the source, its expressions shown as {source};
+    `where` is the definition it is in.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["check", "feedback"]
+    text: str
+    where: str
+
+
+# The definitions that judge each ask's reply. Their messages in Chinese are the ones
+# the model is sent back; the reply models they use are searched too (see ask_rules).
+RULE_SOURCES: dict[str, tuple[str, ...]] = {
+    "call": ("compress._compress_call", "compress._ask_until_valid"),
+    "result": ("compress._compress_result", "compress._ask_until_valid"),
+    "round": ("compress.summarize_trajectory", "compress._ask_until_valid"),
+    "segment": ("segment._next_segment", "segment.locate_end"),
+    "topic": ("extract._assign.parse", "extract._ask_until_valid"),
+    "signal": ("extract._with_intents.parse_a", "extract._ask_until_valid"),
+    "registry": ("extract._match_intents.parse_b", "extract._ask_until_valid"),
+    "aggregate": ("extract._file_under_aggregates.parse", "extract._ask_until_valid"),
+    "tool_intent": ("extract._match_tool_intents.parse", "extract._ask_until_valid"),
+    "relation": ("extract._relate.parse", "extract._ask_until_valid"),
+    "outcome": ("extract._observe.parse", "extract._ask_until_valid"),
+    "outcome_summary": ("extract._observe.parse", "extract._ask_until_valid"),
+}
+
+
+def ask_rules(ask: str) -> list[Rule]:
+    """The checks and retry feedback of `ask`, read from the source of RULE_SOURCES[ask].
+
+    Each source also brings the checks of the reply models it names and of the models
+    nested in their fields.
+    """
+    rules: list[Rule] = []
+    models: list[type[BaseModel]] = []
+    for where in RULE_SOURCES[ask]:
+        module_name, *path = where.split(".")
+        module = importlib.import_module(f"intent_aligner.{module_name}")
+        source = inspect.getsource(module)
+        node = _definition(ast.parse(source), path, where)
+        rules += _messages(source, node, where)
+        for name in {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}:
+            value = getattr(module, name, None)
+            if isinstance(value, type) and issubclass(value, BaseModel):
+                _collect_models(value, models)
+    for model in models:
+        source = inspect.getsource(model)
+        where = f"{model.__module__.rsplit('.', 1)[-1]}.{model.__name__}"
+        rules += _messages(source, ast.parse(source), where)
+    unique: dict[str, Rule] = {}
+    for rule in rules:
+        unique.setdefault(rule.text, rule)
+    return list(unique.values())
+
+
+def _definition(tree: ast.AST, path: Sequence[str], where: str) -> ast.AST:
+    node = tree
+    for name in path:
+        found = [
+            child
+            for child in ast.walk(node)
+            if isinstance(child, ast.FunctionDef | ast.ClassDef) and child.name == name
+        ]
+        if not found:
+            raise ValueError(f"{where} is not in the source; update replay.RULE_SOURCES.")
+        node = found[0]
+    return node
+
+
+def _collect_models(model: type[BaseModel], into: list[type[BaseModel]]) -> None:
+    if model in into or not model.__module__.startswith("intent_aligner."):
+        return
+    into.append(model)
+    for field in model.model_fields.values():
+        for arg in _type_args(field.annotation):
+            if isinstance(arg, type) and issubclass(arg, BaseModel):
+                _collect_models(arg, into)
+
+
+def _type_args(annotation: object) -> list[object]:
+    args = list(get_args(annotation))
+    return [annotation, *[a for arg in args for a in _type_args(arg)]]
+
+
+def _messages(source: str, node: ast.AST, where: str) -> list[Rule]:
+    """Chinese raise messages (checks) and assignments to `feedback` (retry feedback)."""
+    rules: list[Rule] = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.Raise) and isinstance(child.exc, ast.Call) and child.exc.args:
+            text = _shown(source, child.exc.args[0])
+            if text is not None:
+                rules.append(Rule(kind="check", text=text, where=where))
+        elif isinstance(child, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "feedback" for t in child.targets
+        ):
+            value = child.value
+            if isinstance(value, ast.Name) and value.id == "TRUNCATED_FEEDBACK":
+                rules.append(Rule(kind="feedback", text=TRUNCATED_FEEDBACK, where=where))
+                continue
+            if isinstance(value, ast.JoinedStr) and _is_truncation(value):
+                rules.append(Rule(kind="feedback", text=TRUNCATED_FEEDBACK, where=where))
+                continue
+            text = _shown(source, value)
+            if text is not None:
+                rules.append(Rule(kind="feedback", text=text.strip(), where=where))
+    return rules
+
+
+def _is_truncation(value: ast.JoinedStr) -> bool:
+    return any(
+        isinstance(part, ast.FormattedValue)
+        and isinstance(part.value, ast.Name)
+        and part.value.id == "TRUNCATED_FEEDBACK"
+        for part in value.values
     )
+
+
+def _shown(source: str, expression: ast.expr) -> str | None:
+    """A string or f-string with its expressions as {source}; None unless it has Chinese."""
+    if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+        text = expression.value
+    elif isinstance(expression, ast.JoinedStr):
+        text = "".join(
+            str(part.value)
+            if isinstance(part, ast.Constant)
+            # The parts of an f-string are only its literal pieces and FormattedValues.
+            else "{"
+            + (ast.get_source_segment(source, cast(ast.FormattedValue, part).value) or "")
+            + "}"
+            for part in expression.values
+        )
+    else:
+        return None
+    return text if re.search(r"[\u4e00-\u9fff]", text) else None
+
+
+def window_rules() -> list[str]:
+    """The constants and docstrings that decide what a prompt's windows hold."""
+    constants = [
+        f"window.PROMPT_BUDGET = {window.PROMPT_BUDGET:,}（{window.TOKENIZER} 的 token）",
+        f"window.ROUNDS = {window.ROUNDS}",
+        f"window.FOLLOWING_ITEMS = {window.FOLLOWING_ITEMS}，"
+        f"window.FOLLOWING_BUDGET = {window.FOLLOWING_BUDGET:,}",
+        f"FEEDBACK_ROOM：compress {compress.FEEDBACK_ROOM:,}，segment {segment.FEEDBACK_ROOM:,}，"
+        f"extract {extract.FEEDBACK_ROOM:,}",
+    ]
+    documented = (
+        window.window_text,
+        window.render_round_so_far,
+        window.round_entry,
+        window.render_following,
+        extract._fitted_prompt,
+    )
+    return constants + [
+        f"{f.__module__.rsplit('.', 1)[-1]}.{f.__name__}：{inspect.getdoc(f)}" for f in documented
+    ]
 
 
 class Job(BaseModel):
     """A node of the page's DAG: one job of the run and the record it wrote.
 
     `column` is the round it belongs to (0 before the first user message); `after`
-    lists the jobs whose output it reads.
+    lists the jobs whose output it reads. `text` is what the job works on when its
+    prompt does not show it alone: an extract unit's block or a message's body. `log`
+    are the run.log lines about an extract unit.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -615,10 +861,12 @@ class Job(BaseModel):
     label: str
     column: int
     after: list[str]
+    text: str = ""
+    log: list[str] = []
     record: Any
 
 
-def run_jobs(conversation: Conversation, compressions_path: Path) -> list[Job]:
+def run_jobs(conversation: Conversation, extract_dir: Path) -> list[Job]:
     """Every job the run had to do, whether or not it called the model.
 
     A message's segments run one after another and read the round summaries of the
@@ -630,9 +878,11 @@ def run_jobs(conversation: Conversation, compressions_path: Path) -> list[Job]:
     made: list[Job] = []
     rounds: list[str] = []
     columns: list[int] = []
+    bodies: dict[str, str] = {}
     for item in items:
         if isinstance(item, UserMessage):
             rounds.append(item.source.uuid)
+            bodies[item.source.uuid] = item.body
             made.append(_round_job(item.source.uuid, item.body[:40], len(rounds), digests))
         elif isinstance(item, ToolCall):
             if not rounds and not made:
@@ -653,7 +903,7 @@ def run_jobs(conversation: Conversation, compressions_path: Path) -> list[Job]:
             )
         columns.append(len(rounds))
     for n, uuid in enumerate(rounds):
-        window = [f"round:{r}" for r in rounds[max(0, n - 2) : n]]
+        windowed = [f"round:{r}" for r in rounds[max(0, n - window.ROUNDS[0]) : n]]
         previous: list[str] = []
         for part in conversation.segments.get(uuid, []):
             job_id = f"message:{uuid}:{part.start}"
@@ -663,12 +913,16 @@ def run_jobs(conversation: Conversation, compressions_path: Path) -> list[Job]:
                     stage="SEG",
                     label=f"{part.start}–{part.end}",
                     column=n + 1,
-                    after=window + previous,
+                    after=windowed + previous,
+                    text=bodies[uuid],
                     record=part.model_dump(mode="json"),
                 )
             )
             previous = [job_id]
+    compressions_path = extract_dir / "tool_compressions.jsonl"
     compressions = load_compressions(compressions_path) if compressions_path.exists() else []
+    log_path = extract_dir / "run.log"
+    log = log_path.read_text(encoding="utf-8").splitlines() if log_path.exists() else []
     for position, block in enumerate(conversation.units):
         index = conversation.unit_items[position]
         assignment = (
@@ -681,6 +935,8 @@ def run_jobs(conversation: Conversation, compressions_path: Path) -> list[Job]:
                 label=block.split("\n", 2)[-1][:40],
                 column=columns[index],
                 after=[f"unit:{position - 1}"] if position else [],
+                text=block,
+                log=[] if assignment is None else _log_lines(log, assignment),
                 record={
                     "assignment": _dump(assignment),
                     "compressions": [
@@ -690,6 +946,15 @@ def run_jobs(conversation: Conversation, compressions_path: Path) -> list[Job]:
             )
         )
     return made
+
+
+def _log_lines(log: Sequence[str], assignment: Assignment) -> list[str]:
+    """run.log names a unit by its tool_use_id, or its uuid (and chars for a segment)."""
+    ref = assignment.unit
+    marks = [ref.tool_use_id] if ref.tool_use_id else [ref.uuid]
+    if ref.chars is not None:
+        marks.append(f"chars [{ref.chars[0]}, {ref.chars[1]}]")
+    return [line for line in log if all(mark in line for mark in marks)]
 
 
 def _round_job(uuid: str, label: str, column: int, digests: Digests) -> Job:
@@ -707,11 +972,62 @@ def _dump(model: BaseModel | None) -> Any:
     return None if model is None else model.model_dump(mode="json")
 
 
+class GraphChange(BaseModel):
+    """What one extract unit changed in its topic's graph when its record was folded in.
+
+    `nodes` are the nodes it added or changed, `edges` the edges it added; `removed`
+    and `removed_edges` what it took away. A unit without a topic changes nothing.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    topic: str | None
+    nodes: dict[str, Any]
+    edges: list[Any]
+    removed: list[str]
+    removed_edges: list[Any]
+
+
+def graph_changes(run: Run, conversation: Conversation) -> list[GraphChange]:
+    """Fold assignments.jsonl into the stores as extract does, one unit at a time."""
+    stores = Stores(merged_file=str(run.merged), items=conversation.items)
+    before: dict[str, tuple[dict[str, Any], list[Any]]] = {}
+    changes: list[GraphChange] = []
+    steps = walk(conversation.items, conversation.segments)
+    for step, record in zip(steps, conversation.assignments, strict=False):
+        into_stores(stores, step, record)
+        topic = record.topic
+        if topic is None:
+            changes.append(
+                GraphChange(topic=None, nodes={}, edges=[], removed=[], removed_edges=[])
+            )
+            continue
+        graph = stores.stores[topic].meta.graph.model_dump(
+            mode="json", by_alias=True, exclude_none=True
+        )
+        nodes, edges = graph["nodes"], graph["edges"]
+        old_nodes, old_edges = before.get(topic, ({}, []))
+        old_keys = {json.dumps(e, sort_keys=True) for e in old_edges}
+        keys = {json.dumps(e, sort_keys=True) for e in edges}
+        changes.append(
+            GraphChange(
+                topic=topic,
+                nodes={k: v for k, v in nodes.items() if old_nodes.get(k) != v},
+                edges=[e for e in edges if json.dumps(e, sort_keys=True) not in old_keys],
+                removed=[k for k in old_nodes if k not in nodes],
+                removed_edges=[e for e in old_edges if json.dumps(e, sort_keys=True) not in keys],
+            )
+        )
+        before[topic] = (nodes, edges)
+    return changes
+
+
 class Page(BaseModel):
-    """What the page's script reads; systems and schemas are stored once per ask.
+    """What the page's script reads; systems, schemas and rules are stored once per ask.
 
     `since` is the start of the time span transcripts were matched in, None for a
-    logged run.
+    logged run. `graphs` has one change per extract unit with a record; `files` names
+    the file each stage writes its records to.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -724,8 +1040,13 @@ class Page(BaseModel):
     since: datetime | None
     systems: dict[str, str]
     schemas: dict[str, Any]
+    rules: dict[str, list[Rule]]
+    window: list[str]
     calls: list[Attempt]
     jobs: list[Job]
+    graphs: list[GraphChange]
+    topics: dict[str, str]
+    files: dict[str, str]
     unplaced: list[str]
     attempts: dict[str, int]
 
@@ -739,6 +1060,7 @@ def build_page(run: Run, since: datetime | None, until: datetime | None) -> Page
     if calls is None:
         _check_alone(run, since, until)
         calls, unplaced, since = matched_calls(run, conversation, since, until)
+    asks = {c.ask for c in calls}
     return Page(
         directory=str(run.directory),
         merged=str(run.merged),
@@ -748,8 +1070,19 @@ def build_page(run: Run, since: datetime | None, until: datetime | None) -> Page
         since=since,
         systems={c.ask: c.exchange.system for c in calls},
         schemas={c.ask: c.exchange.schema for c in calls},
+        rules={ask: ask_rules(ask) for ask in asks},
+        window=window_rules(),
         calls=judge(calls, conversation),
-        jobs=run_jobs(conversation, run.extract / "tool_compressions.jsonl"),
+        jobs=run_jobs(conversation, run.extract),
+        graphs=graph_changes(run, conversation),
+        topics={a.topic: a.new_title for a in conversation.assignments if a.topic and a.new_title},
+        files={
+            "L1": str(run.digests),
+            "L2": str(run.digests),
+            "SEG": str(run.segments),
+            "LOOP": str(run.extract / "assignments.jsonl"),
+            "inline": str(run.extract / "tool_compressions.jsonl"),
+        },
         unplaced=[str(p) for p in unplaced],
         attempts={
             "L1": compress.MAX_ATTEMPTS,

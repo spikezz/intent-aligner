@@ -606,7 +606,7 @@ def extract_units(
                     f"Unit {position} is {ref} but assignments.jsonl has {record.unit}; "
                     "the conversation or its segments changed, so start a new --out."
                 )
-            _into_stores(stores, step, record)
+            into_stores(stores, step, record)
         else:
             CALL_SUBJECT.set(f"unit:{position}")
             hint = round_hint if isinstance(step.unit, ToolCall) else None
@@ -621,7 +621,7 @@ def extract_units(
                 record = _with_intents(step, record, context, window, asks, stores)
                 if record.intents and not record.needs_review:
                     record = _relate(step, record, context, window, asks.relation, stores)
-            _into_stores(stores, step, record)
+            into_stores(stores, step, record)
             yield from window.fresh
             yield record
         if isinstance(step.unit, UserSegment):
@@ -1243,7 +1243,7 @@ def _review(record: Assignment, reason: str) -> Assignment:
     return record.model_copy(update={"needs_review": True, "review_reason": reason})
 
 
-def _into_stores(stores: Stores, step: _Step, record: Assignment) -> None:
+def into_stores(stores: Stores, step: _Step, record: Assignment) -> None:
     """Register the record's new intents and put the unit's span in its store.
 
     An observation has no span: it becomes a node, or waits as a triggers candidate.

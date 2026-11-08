@@ -9,17 +9,20 @@
   --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #d9d9d4;
   --l1: #3b7dd8; --l2: #7a5cc7; --seg: #d08a1e; --loop: #2f9e6a;
   --ok: #2f9e6a; --bad: #d1453b; --warn: #d08a1e; --pending: #c9c9c3; --active: #111111;
-  --feedback: #fde7c4; --code: #f1f1ee;
+  --feedback: #fde7c4; --var: #fbe3c0; --var-ink: #8a5300; --code: #f1f1ee; --signal: #0b6e8a;
+  --I: #4656b8; --G: #a86a00; --O: #b3322a;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #a09f98; --line: #3a3a36;
-    --pending: #4a4a45; --active: #ffffff; --feedback: #5a4318; --code: #262624;
+    --pending: #4a4a45; --active: #ffffff; --feedback: #5a4318; --var: #4a3512; --var-ink: #f0c070;
+    --code: #262624; --signal: #4dbcd8; --I: #99a6f2; --G: #e6ac4b; --O: #ef7f75;
   }
 }
 :root[data-theme="dark"] {
   --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #a09f98; --line: #3a3a36;
-  --pending: #4a4a45; --active: #ffffff; --feedback: #5a4318; --code: #262624;
+  --pending: #4a4a45; --active: #ffffff; --feedback: #5a4318; --var: #4a3512; --var-ink: #f0c070;
+  --code: #262624; --signal: #4dbcd8; --I: #99a6f2; --G: #e6ac4b; --O: #ef7f75;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 system-ui, "Noto Sans CJK SC", sans-serif; }
@@ -29,36 +32,77 @@ header h1 { font-size: 17px; margin: 0 0 4px; }
 .summary { margin-top: 8px; border-collapse: collapse; font-size: 12px; }
 .summary td, .summary th { border: 1px solid var(--line); padding: 2px 8px; text-align: right; }
 .summary th:first-child, .summary td:first-child { text-align: left; }
-.controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+.unplaced { padding: 8px 16px; background: var(--feedback); font-size: 12px; }
+.unplaced li { word-break: break-all; }
+.controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 3; }
 .controls button { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 4px; padding: 3px 9px; cursor: pointer; font: inherit; }
 .controls button.on { background: var(--ink); color: var(--panel); }
 .controls input[type=range] { flex: 1; min-width: 160px; }
-#counter { font-variant-numeric: tabular-nums; min-width: 90px; }
+#counter { font-variant-numeric: tabular-nums; min-width: 110px; }
+.rail { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; padding: 6px 16px; background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px; }
+.rail .stop { padding: 1px 8px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); }
+.rail .stop.on { background: var(--signal); border-color: var(--signal); color: var(--panel); }
+.rail .arrow { color: var(--muted); }
 #strip { display: block; width: 100%; height: 34px; background: var(--panel); border-bottom: 1px solid var(--line); cursor: pointer; }
-main { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 0; height: calc(100vh - 210px); min-height: 480px; }
-@media (max-width: 900px) { main { grid-template-columns: 1fr; height: auto; } }
-.pane { overflow: auto; padding: 12px 16px; border-right: 1px solid var(--line); }
+.wrap { padding: 10px 16px; display: grid; gap: 10px; }
+.box { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; min-width: 0; }
+.box > summary { font-weight: 600; cursor: pointer; }
+.note { color: var(--muted); font-size: 12px; margin: 6px 0; max-width: 120ch; }
+#dag { overflow: auto; max-height: 460px; margin-top: 6px; }
 #dag text { font-size: 10px; fill: var(--muted); }
-#dag .band { font-size: 12px; font-weight: 600; fill: var(--ink); }
+#dag .band { font-size: 12px; font-weight: 600; }
 #dag .node { cursor: pointer; }
-#dag .barrier { stroke: var(--line); stroke-dasharray: 4 3; }
-.legend { font-size: 12px; color: var(--muted); margin: 6px 0 10px; }
-.legend span { display: inline-block; width: 10px; height: 10px; margin: 0 4px 0 10px; vertical-align: -1px; border-radius: 2px; }
-.frame-title { font-size: 15px; font-weight: 600; margin: 0 0 4px; }
-.badge { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: 12px; color: #fff; margin-right: 4px; }
-.verdict-accepted { background: var(--ok); } .verdict-rejected { background: var(--warn); } .verdict-failed { background: var(--bad); }
-.reason { background: var(--feedback); padding: 6px 8px; border-radius: 4px; white-space: pre-wrap; font-size: 12px; margin: 6px 0; }
-.tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 10px 0 6px; }
-.tabs button { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 4px 4px 0 0; padding: 2px 10px; cursor: pointer; font: inherit; font-size: 13px; }
-.tabs button.on { background: var(--panel); border-bottom-color: var(--panel); font-weight: 600; }
-pre { background: var(--code); padding: 10px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 ui-monospace, "Noto Sans Mono CJK SC", monospace; margin: 0; }
-pre mark { background: var(--feedback); color: inherit; }
-.unplaced { padding: 8px 16px; background: var(--feedback); font-size: 12px; }
-.unplaced li { word-break: break-all; }
-#graph svg text { font-size: 11px; fill: var(--ink); }
-#graph .edge { fill: none; stroke: var(--muted); stroke-width: 1.2; }
-#graph .elabel { font-size: 10px; fill: var(--muted); }
+#dag .barrier { stroke: var(--warn); stroke-dasharray: 6 4; stroke-width: 1.2; }
+#dag .bartext { fill: var(--warn); font-size: 11px; }
+#dag .window { fill: none; stroke: var(--muted); stroke-width: 0.8; opacity: 0.35; }
+#dag .chain { fill: none; stroke: var(--muted); stroke-width: 1; }
+#dag .unitText { font-size: 11px; fill: var(--ink); }
+#dag tspan.cur { fill: var(--signal); font-weight: 700; }
+.legend { font-size: 12px; color: var(--muted); margin: 6px 0; }
+.legend span.sw { display: inline-block; width: 10px; height: 10px; margin: 0 4px 0 10px; vertical-align: -1px; border-radius: 2px; }
+.head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.badge { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: 12px; color: #fff; }
+.verdict-accepted { background: var(--ok); } .verdict-rejected { background: var(--warn); } .verdict-failed { background: var(--bad); } .verdict-skip { background: var(--muted); }
+.ftitle { font-size: 15px; font-weight: 600; }
 .kv { font-size: 12px; color: var(--muted); }
+.unit { font-size: 13px; }
+.unit pre { max-height: 180px; overflow: auto; }
+.reason { background: var(--feedback); padding: 6px 8px; border-radius: 4px; white-space: pre-wrap; font-size: 12px; margin: 6px 0; }
+.stage { display: grid; grid-template-columns: minmax(0, 1.5fr) 96px minmax(0, 1.1fr) minmax(0, 1fr); align-items: stretch; }
+@media (max-width: 1000px) { .stage { grid-template-columns: minmax(0, 1fr); gap: 8px; } .wire { height: 90px; } .wire::before, .pkt { display: none; } }
+.col { max-height: 720px; overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; min-width: 0; transition: border-color .25s; }
+.col.live { border-color: var(--signal); box-shadow: 0 0 0 1px var(--signal); }
+.col h2 { font-size: 12px; color: var(--muted); margin: 0 0 8px; font-weight: 500; }
+.col h3 { font-size: 12px; margin: 10px 0 4px; color: var(--signal); }
+.wire { display: flex; align-items: center; justify-content: center; position: relative; }
+.wire::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; height: 2px; background: var(--line); }
+.wire .end { width: 80px; height: 80px; border: 2px solid var(--line); border-radius: 50%; display: grid; place-items: center; text-align: center; font-size: 11px; line-height: 1.3; background: var(--panel); z-index: 1; overflow-wrap: anywhere; padding: 4px; }
+.wire.busy .end { border-color: var(--signal); animation: pulse 1s infinite; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--signal) 22%, transparent); } }
+.pkt { position: absolute; top: calc(50% - 6px); left: 0; width: 12px; height: 12px; border-radius: 50%; background: var(--signal); opacity: 0; z-index: 2; }
+.pkt.go { animation: go var(--beat) linear forwards; }
+.pkt.back { animation: back var(--beat) linear forwards; }
+@keyframes go { 0% { left: 0; opacity: 1; } 100% { left: calc(50% - 6px); opacity: 1; } }
+@keyframes back { 0% { left: calc(50% - 6px); opacity: 1; } 100% { left: calc(100% - 12px); opacity: 1; } }
+.dim { opacity: .2; transition: opacity .25s; } .dim.lit { opacity: 1; }
+pre { background: var(--code); padding: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 ui-monospace, "Noto Sans Mono CJK SC", monospace; margin: 0; }
+pre .v { background: var(--var); color: var(--var-ink); }
+pre mark { background: var(--feedback); color: inherit; outline: 1px solid var(--warn); }
+.check { font-size: 12px; padding: 2px 0 2px 20px; position: relative; }
+.check::before { content: "○"; position: absolute; left: 2px; color: var(--muted); }
+.check.ok::before { content: "✓"; color: var(--ok); }
+.check.no::before { content: "✗"; color: var(--bad); }
+.check .where { color: var(--muted); font-size: 11px; }
+.write { font-size: 12px; overflow-wrap: anywhere; }
+.write.bad { color: var(--bad); }
+details.more { margin-top: 8px; font-size: 12px; }
+details.more summary { cursor: pointer; color: var(--muted); }
+#bench { overflow: auto; max-height: 460px; margin-top: 6px; }
+#bench svg text { font-size: 11px; fill: var(--ink); }
+#bench .edge { fill: none; stroke: var(--muted); stroke-width: 1.2; }
+#bench .elabel { font-size: 10px; fill: var(--muted); }
+.skip { color: var(--warn); }
+@media (prefers-reduced-motion: reduce) { .pkt { display: none; } .wire.busy .end { animation: none; } * { transition: none !important; } }
 </style>
 </head>
 <body>
@@ -70,28 +114,46 @@ pre mark { background: var(--feedback); color: inherit; }
 <div id="unplaced"></div>
 <div class="controls">
   <button id="prev">◀</button><button id="play">播放</button><button id="next">▶</button>
-  <input type="range" id="slider" min="0" value="0">
+  <input type="range" id="slider" min="0" value="0" aria-label="帧">
   <span id="counter"></span>
   <span id="jumps"></span>
   <button id="speed">1×</button>
 </div>
+<nav class="rail" id="rail" aria-label="流程阶段"></nav>
 <svg id="strip"></svg>
-<main>
-  <section class="pane" id="dagPane">
+<div class="wrap">
+  <details class="box" open>
+    <summary>依赖图：哪些任务并行，哪些必须等前面的结果</summary>
+    <p class="note" id="dagnote"></p>
     <div class="legend">
-      <span style="background:var(--pending)"></span>还没有调用
-      <span style="background:var(--ok)"></span>已接受
-      <span style="background:var(--warn)"></span>被驳回或重问
-      <span style="background:var(--bad)"></span>失败
-      <span style="background:none;border:2px solid var(--active)"></span>当前调用
-      <span style="background:none;border:1px dashed var(--muted)"></span>这个任务不需要调用模型
+      <span class="sw" style="background:var(--pending)"></span>还没有调用
+      <span class="sw" style="background:var(--ok)"></span>已接受（按阶段着色）
+      <span class="sw" style="background:var(--warn)"></span>被驳回或重问
+      <span class="sw" style="background:var(--bad)"></span>失败
+      <span class="sw" style="background:none;border:2px solid var(--active)"></span>当前
+      <span class="sw" style="background:none;border:1px dashed var(--muted)"></span>没有调用模型
+      · L1 每个工具一对方块：左边压调用，右边压结果；结果分几段压时右块加粗并标段数
     </div>
-    <svg id="dag"></svg>
+    <div id="dag"></div>
+  </details>
+  <section class="box">
+    <div class="head"><span class="badge" id="badge"></span><span class="ftitle" id="ftitle"></span><span id="verdict"></span></div>
+    <div class="kv" id="fmeta"></div>
+    <div id="freason"></div>
+    <div class="unit" id="unit"></div>
   </section>
-  <section class="pane" id="framePane">
-    <div id="frame"></div>
+  <section class="stage">
+    <div class="col" id="c1"><h2>代码发给端点的请求：普通底色是源码里写死的文字，<span style="background:var(--var);color:var(--var-ink)">橙底</span>是随任务变化的部分，<mark style="background:var(--feedback);color:inherit">黄框</mark>是重问时追加的反馈</h2><div id="request"></div></div>
+    <div class="wire" id="wire"><div class="pkt" id="pkt"></div><div class="end" id="endpoint"></div></div>
+    <div class="col" id="c2"><h2>模型的回答</h2><div id="reply"></div></div>
+    <div class="col" id="c3"><h2>代码校验与写入</h2><div id="checks"></div></div>
   </section>
-</main>
+  <section class="box">
+    <div class="head"><span class="ftitle" id="gtitle"></span></div>
+    <div class="legend"><span>实线框和实线边：已经写入存储</span> · <span>虚线：这个单元刚产生、在单元最后一次调用之后提交</span> · <span>粗框：这次调用 header 里的候选</span> · <span style="color:var(--I)">I 用户意图</span> · <span style="color:var(--G)">G 工具调用的聚合</span> · <span style="color:var(--O)">O 观测</span></div>
+    <div id="bench"></div>
+  </section>
+</div>
 <script>
 const PAGE = /*PAGE_DATA*/null;
 const STAGES = ["L1", "L2", "SEG", "LOOP"];
@@ -100,16 +162,41 @@ const STAGE_COLORS = {L1: "var(--l1)", L2: "var(--l2)", SEG: "var(--seg)", LOOP:
 const ASK_NAMES = {call: "压缩工具调用", result: "压缩工具结果", round: "压缩整轮", segment: "切分", topic: "T 归入 topic",
   signal: "A 信号意图", registry: "B 登记意图", aggregate: "G 归入聚合", tool_intent: "L 底层意图", relation: "C 连边",
   outcome: "D 观察结果", outcome_summary: "D 观察结果（摘要）"};
+const LETTER = {topic: "T", signal: "A", registry: "B", aggregate: "G", tool_intent: "L", relation: "C", outcome: "D", outcome_summary: "D", round: "压"};
+const STOPS = [["L1", "第一层压缩"], ["L2", "第二层压缩"], ["SEG", "切分"], ["T", "T 归 topic"], ["A", "A 信号意图"], ["B", "B 登记意图"],
+  ["G", "G 归聚合"], ["L", "L 底层意图"], ["C", "C 连边"], ["D", "D 观察结果"]];
 const VERDICT_NAMES = {accepted: "已接受", rejected: "被驳回", failed: "失败"};
-const calls = PAGE.calls;
-const jobs = PAGE.jobs;
+const calls = PAGE.calls, jobs = PAGE.jobs;
 const jobById = Object.fromEntries(jobs.map(j => [j.id, j]));
-let current = 0, playing = null, speed = 1, tab = "prompt";
+const unitJobs = jobs.filter(j => j.stage === "LOOP");
+let current = 0, beat = 3, timer = null, speed = 1;
 
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c])); }
 function pretty(text) { try { return JSON.stringify(JSON.parse(text), null, 2); } catch { return text ?? ""; } }
 function time(iso) { return iso ? new Date(iso).toLocaleTimeString("zh-CN", {hour12: false}) : "—"; }
 function limitOf(c) { return c.ask === "topic" ? PAGE.attempts.topic : PAGE.attempts[c.stage]; }
+function unitOf(id) { return id.startsWith("unit:") ? +id.split(":")[1] : -1; }
+function colorOf(c) { return c.verdict === "accepted" ? STAGE_COLORS[c.stage] : c.verdict === "failed" ? "var(--bad)" : "var(--warn)"; }
+function headerOf(prompt) {
+  const m = prompt.match(/<header>\n([\s\S]*?)\n<\/header>/);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); } catch { return null; }
+}
+
+/* ---------- frames: every call, plus one frame for each extract unit that called nothing ---------- */
+const called = new Set(calls.map(c => c.subject));
+const silentUnits = unitJobs.filter(j => !called.has(j.id));
+const frames = [];
+{
+  let next = 0;
+  const flushBefore = u => { while (next < silentUnits.length && unitOf(silentUnits[next].id) < u) frames.push({skip: silentUnits[next++]}); };
+  calls.forEach((c, i) => { if (c.stage === "LOOP") flushBefore(unitOf(c.subject)); frames.push({call: c, i}); });
+  flushBefore(Infinity);
+}
+function frameTime(k) {
+  for (let n = k; n >= 0; n--) { const c = frames[n].call; if (c) return new Date(c.started ?? c.ended).getTime(); }
+  return new Date(calls[0]?.ended ?? 0).getTime();
+}
 
 /* ---------- header ---------- */
 document.getElementById("meta").innerHTML =
@@ -120,15 +207,12 @@ document.getElementById("meta").innerHTML =
 (function summary() {
   const rows = {};
   for (const c of calls) {
-    const key = c.stage + "|" + c.ask;
-    const r = rows[key] ??= {stage: c.stage, ask: c.ask, n: 0, retry: 0, rejected: 0, failed: 0};
+    const r = rows[c.stage + "|" + c.ask] ??= {stage: c.stage, ask: c.ask, n: 0, retry: 0, rejected: 0, failed: 0};
     r.n++; if (c.attempt > 1) r.retry++; if (c.verdict === "rejected") r.rejected++; if (c.verdict === "failed") r.failed++;
   }
   const silent = {};
-  const called = new Set(calls.map(c => c.subject));
   for (const j of jobs) if (!called.has(j.id)) silent[j.stage] = (silent[j.stage] ?? 0) + 1;
-  let html = "<tr><th>阶段</th><th>调用</th><th>次数</th><th>其中重试</th><th>被驳回</th><th>失败</th></tr>";
-  let total = 0;
+  let html = "<tr><th>阶段</th><th>调用</th><th>次数</th><th>其中重试</th><th>被驳回</th><th>失败</th></tr>", total = 0;
   for (const s of STAGES) {
     for (const r of Object.values(rows).filter(r => r.stage === s)) {
       total += r.n;
@@ -145,240 +229,416 @@ if (PAGE.unplaced.length) {
     `<div class="unplaced"><b>${PAGE.unplaced.length} 份同模型的记录落在这次运行的时间范围里，但对不上任何任务</b>（发出它们的代码后来改过，或者它们属于另一次运行）。这些记录没有被猜着填进回放：<ul>` +
     PAGE.unplaced.map(p => `<li>${esc(p)}</li>`).join("") + "</ul></div>";
 }
+document.getElementById("rail").innerHTML = STOPS.map(([k, v], n) => (n ? '<span class="arrow">→</span>' : "") + `<span class="stop" data-k="${k}">${v}</span>`).join("");
+document.getElementById("endpoint").textContent = `${PAGE.backend}\n${PAGE.model}`;
 
 /* ---------- controls ---------- */
 const slider = document.getElementById("slider");
-slider.max = Math.max(0, calls.length - 1);
-slider.oninput = () => show(+slider.value);
-document.getElementById("prev").onclick = () => show(current - 1);
-document.getElementById("next").onclick = () => show(current + 1);
+slider.max = Math.max(0, frames.length - 1);
+slider.oninput = () => go(+slider.value);
+document.getElementById("prev").onclick = () => go(current - 1);
+document.getElementById("next").onclick = () => go(current + 1);
 document.getElementById("play").onclick = togglePlay;
-document.getElementById("speed").onclick = e => { speed = speed >= 8 ? 1 : speed * 2; e.target.textContent = speed + "×"; if (playing) { togglePlay(); togglePlay(); } };
+document.getElementById("speed").onclick = e => { speed = speed >= 8 ? 1 : speed * 2; e.target.textContent = speed + "×"; };
 document.addEventListener("keydown", e => {
-  if (e.key === "ArrowRight") show(current + 1);
-  else if (e.key === "ArrowLeft") show(current - 1);
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "ArrowRight") go(current + 1);
+  else if (e.key === "ArrowLeft") go(current - 1);
   else if (e.key === " ") { e.preventDefault(); togglePlay(); }
 });
-function togglePlay() {
-  const btn = document.getElementById("play");
-  if (playing) { clearInterval(playing); playing = null; btn.textContent = "播放"; btn.classList.remove("on"); return; }
-  btn.textContent = "暂停"; btn.classList.add("on");
-  playing = setInterval(() => { if (current >= calls.length - 1) togglePlay(); else show(current + 1); }, 900 / speed);
+function beatMs() { return 700 / speed; }
+function stop() { clearTimeout(timer); timer = null; const b = document.getElementById("play"); b.textContent = "播放"; b.classList.remove("on"); }
+function tick() {
+  beat++;
+  if (beat > 3 || frames[current].skip) {
+    if (current >= frames.length - 1) { stop(); beat = 3; draw(); return; }
+    current++; beat = 0;
+  }
+  draw();
+  timer = setTimeout(tick, beatMs());
 }
+function togglePlay() {
+  if (timer) return stop();
+  if (current >= frames.length - 1) current = 0;
+  else current++;
+  beat = 0; draw();
+  const b = document.getElementById("play"); b.textContent = "暂停"; b.classList.add("on");
+  timer = setTimeout(tick, beatMs());
+}
+function go(k) { stop(); current = Math.max(0, Math.min(frames.length - 1, k)); beat = 3; draw(); }
 document.getElementById("jumps").innerHTML = STAGES.map(s => {
-  const i = calls.findIndex(c => c.stage === s);
-  return i < 0 ? "" : `<button data-i="${i}" style="border-color:${STAGE_COLORS[s]}">${s}</button>`;
+  const k = frames.findIndex(f => (f.call?.stage ?? f.skip?.stage) === s);
+  return k < 0 ? "" : `<button data-k="${k}" style="border-color:${STAGE_COLORS[s]}">${s}</button>`;
 }).join(" ");
-document.getElementById("jumps").onclick = e => { if (e.target.dataset.i) show(+e.target.dataset.i); };
+document.getElementById("jumps").onclick = e => { if (e.target.dataset.k) go(+e.target.dataset.k); };
 
 /* ---------- time strip ---------- */
 const strip = document.getElementById("strip");
-const times = calls.map(c => new Date(c.started ?? c.ended).getTime());
+const times = frames.map((f, k) => frameTime(k));
 const t0 = Math.min(...times), t1 = Math.max(...times.concat([t0 + 1]));
 function stripX(t, w) { return 8 + (t - t0) / (t1 - t0) * (w - 16); }
 function drawStrip() {
   const w = strip.clientWidth || 800;
   let svg = "";
-  calls.forEach((c, i) => {
+  calls.forEach(c => {
     const y = 4 + STAGES.indexOf(c.stage) * 6;
-    svg += `<rect x="${stripX(times[i], w).toFixed(1)}" y="${y}" width="2" height="5" fill="${c.verdict === "accepted" ? STAGE_COLORS[c.stage] : c.verdict === "failed" ? "var(--bad)" : "var(--warn)"}"/>`;
+    svg += `<rect x="${stripX(new Date(c.started ?? c.ended).getTime(), w).toFixed(1)}" y="${y}" width="2" height="5" fill="${colorOf(c)}"/>`;
   });
   svg += `<line id="cursor" x1="0" x2="0" y1="0" y2="34" stroke="var(--active)" stroke-width="1.5"/>`;
   strip.innerHTML = svg;
 }
 strip.onclick = e => {
   const w = strip.clientWidth, t = t0 + (e.offsetX - 8) / (w - 16) * (t1 - t0);
-  let best = 0; times.forEach((x, i) => { if (Math.abs(x - t) < Math.abs(times[best] - t)) best = i; });
-  show(best);
+  let best = 0; times.forEach((x, k) => { if (Math.abs(x - t) < Math.abs(times[best] - t)) best = k; });
+  go(best);
 };
-window.addEventListener("resize", () => { drawStrip(); show(current); });
+window.addEventListener("resize", () => { drawStrip(); draw(); });
 
 /* ---------- DAG ---------- */
-const CELL = 13, PER_ROW = 6, COL_W = PER_ROW * CELL + 26, LEFT = 96;
-const layout = {};
-const bands = {};
-(function placeJobs() {
+const SQ = 10, PAIR = 26, PER_ROW = 4, COL_W = PER_ROW * PAIR + 18, LEFT = 44;
+const SEG_W = 20, SEG_PER_ROW = 5, PER_CHAIN = 8, BW = 132, BH = 24, GX = 14, GY = 14;
+const layout = {};        /* job id -> {x, y, w, h}, the anchor for edges */
+const cells = [];         /* every drawn node: {id, subject, ask} where ask narrows an L1 pair's half */
+const callsOf = {};
+calls.forEach((c, i) => (callsOf[c.subject] ??= []).push(i));
+const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
+(function buildDag() {
   const first = Math.min(...jobs.map(j => j.column));
-  for (const j of jobs) j.column -= first;
-  const columns = Math.max(...jobs.map(j => j.column)) + 1;
-  let y = 24;
-  for (const s of STAGES) {
-    const perColumn = {};
-    for (const j of jobs.filter(j => j.stage === s)) (perColumn[j.column] ??= []).push(j);
-    const rows = Math.max(1, ...Object.values(perColumn).map(list => Math.ceil(list.length / PER_ROW)));
-    const w = s === "L2" ? COL_W - 26 : CELL - 3;
-    for (const [col, list] of Object.entries(perColumn)) {
-      list.forEach((j, k) => {
-        layout[j.id] = s === "L2"
-          ? {x: LEFT + col * COL_W, y, w, h: 16}
-          : {x: LEFT + col * COL_W + (k % PER_ROW) * CELL, y: y + Math.floor(k / PER_ROW) * CELL, w, h: CELL - 3};
-      });
-    }
-    const h = s === "L2" ? 16 : rows * CELL;
-    bands[s] = {y, h};
-    y += h + 30;
-  }
-  const svg = document.getElementById("dag");
-  svg.setAttribute("width", LEFT + columns * COL_W + 10);
-  svg.setAttribute("height", y);
-  let html = "";
-  for (let col = 0; col < columns; col++) html += `<text x="${LEFT + col * COL_W}" y="12">${col + first === 0 ? "首条消息前" : "第 " + (col + first) + " 轮"}</text>`;
-  STAGES.forEach((s, i) => {
-    const b = bands[s];
-    html += `<text class="band" x="4" y="${b.y + 10}" fill="${STAGE_COLORS[s]}">${s}</text>`;
-    if (i > 0) html += `<line class="barrier" x1="4" x2="${LEFT + columns * COL_W}" y1="${b.y - 15}" y2="${b.y - 15}"/><text x="30" y="${b.y - 18}">上一层全部完成后才开始</text>`;
-  });
-  html += `<g id="edges"></g>`;
-  for (const j of jobs) {
-    const p = layout[j.id];
-    html += `<rect class="node" id="n-${CSS.escape(j.id)}" data-id="${esc(j.id)}" x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="2"><title>${esc(j.id + "\n" + j.label)}</title></rect>`;
-    if (j.stage === "L2") html += `<text x="${p.x + 3}" y="${p.y + 12}" pointer-events="none" style="fill:#fff">${esc(j.label.slice(0, 9))}</text>`;
-  }
-  svg.innerHTML = html;
-  svg.onclick = e => {
-    const id = e.target.dataset?.id; if (!id) return;
-    const i = calls.findIndex(c => c.subject === id);
-    if (i >= 0) show(i); else showJob(jobById[id]);
-  };
-})();
-const firstCall = {};
-calls.forEach((c, i) => { firstCall[c.subject] ??= i; });
+  const col = j => j.column - first;
+  const columns = Math.max(0, ...jobs.filter(j => j.stage !== "LOOP").map(col)) + 1;
+  const by = (s) => { const m = {}; for (const j of jobs.filter(j => j.stage === s)) (m[col(j)] ??= []).push(j); return m; };
+  const tools = by("L1"), rounds = by("L2"), segs = by("SEG");
+  const rowsOf = (m, per) => Math.max(1, ...Object.values(m).map(l => Math.ceil(l.length / per)));
+  const out = [], bars = [];
+  let y = 26;
+  const bandLabel = (s, yy) => out.push(`<text class="band" x="4" y="${yy + 10}" style="fill:${STAGE_COLORS[s]}">${s}</text>`);
+  const barrier = (yy, text) => bars.push([yy, text]);
 
-function paintDag() {
-  const latest = {};
-  for (let i = 0; i <= current; i++) latest[calls[i].subject] = calls[i];
-  const doneUpTo = calls[current];
-  const inFlight = new Set();
-  if (doneUpTo.started) {
-    const t = new Date(doneUpTo.started).getTime();
-    for (const c of calls) if (c.started && new Date(c.started).getTime() <= t && new Date(c.ended).getTime() > t) inFlight.add(c.subject);
-  }
-  const stageReached = STAGES.indexOf(doneUpTo.stage);
-  const unitReached = doneUpTo.stage === "LOOP" ? +doneUpTo.subject.split(":")[1] : -1;
-  for (const j of jobs) {
-    const el = document.getElementById("n-" + CSS.escape(j.id));
-    const c = latest[j.id];
-    let fill = "var(--pending)", stroke = "none", dash = "";
-    if (c) fill = c.verdict === "accepted" ? STAGE_COLORS[j.stage] : c.verdict === "failed" ? "var(--bad)" : "var(--warn)";
-    else if (firstCall[j.id] === undefined) {
-      const passed = STAGES.indexOf(j.stage) < stageReached || (j.stage === "LOOP" && +j.id.split(":")[1] < unitReached);
-      fill = "none"; stroke = passed ? "var(--muted)" : "var(--pending)"; dash = "2 2";
+  bandLabel("L1", y);
+  for (const [c, list] of Object.entries(tools)) list.forEach((j, k) => {
+    const x = LEFT + c * COL_W + (k % PER_ROW) * PAIR, yy = y + Math.floor(k / PER_ROW) * 16, n = chunksOf(j);
+    layout[j.id] = {x, y: yy, w: 2 * SQ + 2, h: SQ};
+    out.push(`<g><title>${esc(j.id + " " + j.label + "\n左：压缩调用；右：压缩结果" + (n > 1 ? `（分 ${n} 段逐段压缩）` : n ? "" : "（没有结果）"))}</title>`);
+    out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" data-ask="call" x="${x}" y="${yy}" width="${SQ}" height="${SQ}" rx="1"/>`);
+    cells.push({id: j.id, ask: "call"});
+    if (n) {
+      out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" data-ask="result" x="${x + SQ + 2}" y="${yy}" width="${SQ}" height="${SQ}" rx="1" data-thick="${n > 1 ? 1 : 0}"/>`);
+      cells.push({id: j.id, ask: "result"});
+      if (n > 1) out.push(`<text x="${x + 2 * SQ + 3}" y="${yy + 8}" style="font-size:8px">${n}</text>`);
     }
-    if (inFlight.has(j.id)) { stroke = "var(--active)"; dash = "2 1"; }
-    if (j.id === doneUpTo.subject) { stroke = "var(--active)"; dash = ""; }
-    el.setAttribute("fill", fill); el.setAttribute("stroke", stroke);
-    el.setAttribute("stroke-width", j.id === doneUpTo.subject ? 2.5 : 1); el.setAttribute("stroke-dasharray", dash);
+    out.push("</g>");
+  });
+  y += rowsOf(tools, PER_ROW) * 16 + 26;
+  barrier(y - 12, "全部第一层任务结束后，第二层压缩才开始（compress.py 先后两次 _run_jobs）");
+
+  bandLabel("L2", y);
+  for (const [c, list] of Object.entries(rounds)) list.forEach(j => {
+    const x = LEFT + c * COL_W;
+    layout[j.id] = {x, y, w: COL_W - 18, h: 16};
+    out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" x="${x}" y="${y}" width="${COL_W - 18}" height="16" rx="2"><title>${esc(j.id + "\n" + j.label)}</title></rect>`);
+    out.push(`<text x="${x + 3}" y="${y + 12}" pointer-events="none" style="fill:#fff">${esc(j.label.slice(0, 9))}</text>`);
+    cells.push({id: j.id});
+  });
+  const windowed = Math.max(0, ...jobs.filter(j => j.stage === "SEG").map(j => j.after.filter(a => a.startsWith("round:")).length));
+  y += 16 + 36;
+  barrier(y - 14, `compress 命令结束后才运行 segment；每条消息的窗口读它前面最多 ${windowed} 轮的第二层压缩（细线）`);
+
+  bandLabel("SEG", y);
+  const windows = [];
+  for (const [c, list] of Object.entries(segs)) list.forEach((j, k) => {
+    const x = LEFT + c * COL_W + (k % SEG_PER_ROW) * SEG_W, yy = y + Math.floor(k / SEG_PER_ROW) * 18;
+    layout[j.id] = {x, y: yy, w: SEG_W - 6, h: 12};
+    if (k % SEG_PER_ROW) out.push(`<line class="chain" x1="${x - 6}" y1="${yy + 6}" x2="${x}" y2="${yy + 6}"/>`);
+    out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" x="${x}" y="${yy}" width="${SEG_W - 6}" height="12" rx="2"><title>${esc(j.id + "\n字符 " + j.label)}</title></rect>`);
+    cells.push({id: j.id});
+    for (const a of j.after) if (a.startsWith("round:") && layout[a]) windows.push([layout[a], layout[j.id]]);
+  });
+  for (const [a, b] of windows) out.push(`<path class="window" d="M${a.x + a.w / 2},${a.y + a.h} C${a.x + a.w / 2},${(a.y + a.h + b.y) / 2} ${b.x + b.w / 2},${(a.y + a.h + b.y) / 2} ${b.x + b.w / 2},${b.y}"/>`);
+  y += rowsOf(segs, SEG_PER_ROW) * 18 + 34;
+  barrier(y - 14, "segment 命令结束后才运行 extract；单元严格一个接一个，每个单元读前面单元写好的图谱");
+
+  bandLabel("LOOP", y);
+  unitJobs.forEach((j, k) => {
+    const x = LEFT + (k % PER_CHAIN) * (BW + GX), yy = y + Math.floor(k / PER_CHAIN) * (BH + GY);
+    if (k % PER_CHAIN) out.push(`<line class="chain" x1="${x - GX}" y1="${yy + BH / 2}" x2="${x}" y2="${yy + BH / 2}"/>`);
+    else if (k) out.push(`<path class="chain" d="M${LEFT + (PER_CHAIN - 1) * (BW + GX) + BW / 2},${yy - GY} V${yy - GY / 2} H${x + BW / 2} V${yy}"/>`);
+    layout[j.id] = {x, y: yy, w: BW, h: BH};
+    const own = callsOf[j.id] ?? [];
+    const letters = own.length
+      ? own.map((i, n) => `<tspan id="t-${i}">${(n ? "→" : "") + LETTER[calls[i].ask]}</tspan>`).join("")
+      : `<tspan>代码直接处理</tspan>`;
+    out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" x="${x}" y="${yy}" width="${BW}" height="${BH}" rx="3"><title>${esc(j.id + " 第 " + (col(j) + first) + " 轮\n" + j.label)}</title></rect>`);
+    out.push(`<text class="unitText" x="${x + 5}" y="${yy + 16}" pointer-events="none">${unitOf(j.id)}·${letters}</text>`);
+    cells.push({id: j.id});
+  });
+  y += Math.ceil(Math.max(1, unitJobs.length) / PER_CHAIN) * (BH + GY) + 6;
+
+  const width = Math.max(LEFT + columns * COL_W, LEFT + PER_CHAIN * (BW + GX)) + 10;
+  let head = "";
+  for (let c = 0; c < columns; c++) head += `<text x="${LEFT + c * COL_W}" y="12">${c + first === 0 ? "首条消息前" : "第 " + (c + first) + " 轮"}</text>`;
+  for (const [yy, text] of bars) head += `<line class="barrier" x1="4" x2="${width}" y1="${yy}" y2="${yy}"/><text class="bartext" x="${LEFT}" y="${yy - 3}">${esc(text)}</text>`;
+  const svg = `<svg width="${width}" height="${y}" role="img" aria-label="任务依赖图">${head}<g id="edges"></g>${out.join("")}</svg>`;
+  document.getElementById("dag").innerHTML = svg;
+  document.getElementById("dag").onclick = e => {
+    const id = e.target.dataset?.id; if (!id) return;
+    const ask = e.target.dataset.ask;
+    const k = frames.findIndex(f => f.call ? f.call.subject === id && (!ask || f.call.ask === ask) : f.skip.id === id);
+    if (k >= 0) go(k);
+  };
+
+  const toolJobs = jobs.filter(j => j.stage === "L1"), multi = toolJobs.filter(j => chunksOf(j) > 1).length;
+  const l1 = calls.filter(c => c.stage === "L1").length, messages = Object.keys(segs).length;
+  const patterns = {};
+  for (const j of unitJobs) { const p = (callsOf[j.id] ?? []).map(i => LETTER[calls[i].ask]).join("→") || "不调用"; patterns[p] = (patterns[p] ?? 0) + 1; }
+  const top = Object.entries(patterns).sort((a, b) => b[1] - a[1]).map(([p, n]) => `${p} ${n} 个`).join("，");
+  document.getElementById("dagnote").textContent =
+    `第一层压缩：${toolJobs.length} 个工具调用各是一个任务，一共调用模型 ${l1} 次。任务内部是串行的：先压调用，再压结果，因为压结果的提示词要带上调用的意图；` +
+    `其中 ${multi} 个结果太长，被分成几段逐段压缩（加粗的右块，旁边的数字是段数）。任务之间互不依赖，可以并行。` +
+    `第二层压缩要等全部第一层任务结束才开始，${jobs.filter(j => j.stage === "L2").length} 轮各是一个任务。` +
+    `切分在 compress 命令之后运行：${messages} 条用户消息之间并行，一共切出 ${jobs.filter(j => j.stage === "SEG").length} 段；同一条消息里的段只能一段接一段地切，因为下一段从上一段的结尾开始。` +
+    `抽取在切分之后运行：${unitJobs.length} 个单元严格串行，单元内部的调用也串行。各单元的调用序列：${top}。“压”是提示词放不下时临时调用的本轮压缩。点图里的方块可以跳到对应的调用。`;
+})();
+
+function paintDag(f) {
+  const c = f.call, now = c ? c.subject : f.skip.id;
+  const latest = {};
+  const upTo = c ? f.i : (frames.slice(0, current).reverse().find(x => x.call)?.i ?? -1);
+  for (let i = 0; i <= upTo; i++) { latest[calls[i].subject] = calls[i]; latest[calls[i].subject + "|" + calls[i].ask] = calls[i]; }
+  const inFlight = new Set();
+  if (c?.started) {
+    const t = new Date(c.started).getTime();
+    for (const x of calls) if (x.started && new Date(x.started).getTime() <= t && new Date(x.ended).getTime() > t) inFlight.add(x.subject);
   }
-  const job = jobById[doneUpTo.subject];
+  const reachedUnit = unitOf(now);
+  cells.forEach((cell, n) => {
+    const el = document.getElementById("n-" + n), j = jobById[cell.id];
+    const last = latest[cell.ask ? cell.id + "|" + cell.ask : cell.id];
+    let fill = "var(--pending)", stroke = "none", dash = "", width = +el.dataset.thick ? 2 : 1;
+    if (last) fill = colorOf(last);
+    if (!callsOf[cell.id]) {
+      const passed = j.stage === "LOOP" ? unitOf(cell.id) <= reachedUnit : STAGES.indexOf(j.stage) < STAGES.indexOf(c?.stage ?? "LOOP");
+      fill = "none"; stroke = passed ? "var(--muted)" : "var(--pending)"; dash = "3 2";
+    }
+    if (+el.dataset.thick && stroke === "none") stroke = "var(--ink)";
+    if (inFlight.has(cell.id)) { stroke = "var(--active)"; dash = "2 1"; }
+    if (cell.id === now && (!cell.ask || cell.ask === c?.ask)) { stroke = "var(--active)"; dash = ""; width = 2.5; }
+    el.setAttribute("fill", fill); el.setAttribute("stroke", stroke); el.setAttribute("stroke-width", width); el.setAttribute("stroke-dasharray", dash);
+  });
+  document.querySelectorAll("#dag tspan.cur").forEach(t => t.classList.remove("cur"));
+  if (c) document.getElementById("t-" + f.i)?.classList.add("cur");
+  const job = jobById[now];
   let edges = "";
   for (const from of job?.after ?? []) {
-    const a = layout[from], b = layout[job.id]; if (!a || !b) continue;
-    edges += `<path d="M${a.x + a.w / 2},${a.y + a.h} C${a.x + a.w / 2},${(a.y + b.y) / 2} ${b.x + b.w / 2},${(a.y + b.y) / 2} ${b.x + b.w / 2},${b.y}" fill="none" stroke="var(--active)" stroke-width="1.2" marker-end=""/>`;
+    const a = layout[from], b = layout[now]; if (!a || !b) continue;
+    const vertical = a.y + a.h < b.y;
+    edges += vertical
+      ? `<path d="M${a.x + a.w / 2},${a.y + a.h} C${a.x + a.w / 2},${(a.y + a.h + b.y) / 2} ${b.x + b.w / 2},${(a.y + a.h + b.y) / 2} ${b.x + b.w / 2},${b.y}" fill="none" stroke="var(--active)" stroke-width="1.4"/>`
+      : `<path d="M${a.x + a.w},${a.y + a.h / 2} L${b.x},${b.y + b.h / 2}" fill="none" stroke="var(--active)" stroke-width="2"/>`;
   }
   document.getElementById("edges").innerHTML = edges;
-  const p = layout[doneUpTo.subject], pane = document.getElementById("dagPane");
+  const p = layout[now], pane = document.getElementById("dag");
   if (p && (p.y < pane.scrollTop || p.y > pane.scrollTop + pane.clientHeight - 40)) pane.scrollTop = p.y - pane.clientHeight / 2;
+  if (p && (p.x < pane.scrollLeft || p.x > pane.scrollLeft + pane.clientWidth - 60)) pane.scrollLeft = p.x - pane.clientWidth / 2;
 }
 
-/* ---------- frame ---------- */
-function show(i) {
-  current = Math.max(0, Math.min(calls.length - 1, i));
+/* ---------- one frame ---------- */
+const $ = id => document.getElementById(id);
+function draw() {
+  const f = frames[current], c = f.call, job = c ? jobById[c.subject] : f.skip;
   slider.value = current;
-  const c = calls[current];
-  document.getElementById("counter").textContent = `${current + 1} / ${calls.length}`;
-  history.replaceState(null, "", `#call=${current + 1}&tab=${tab}`);
-  const cur = document.getElementById("cursor");
+  $("counter").textContent = `第 ${current + 1} / ${frames.length} 帧`;
+  history.replaceState(null, "", `#frame=${current + 1}`);
+  const cur = $("cursor");
   if (cur) { const x = stripX(times[current], strip.clientWidth || 800); cur.setAttribute("x1", x); cur.setAttribute("x2", x); }
-  paintDag();
-  renderFrame(c);
+  const letter = c?.stage === "LOOP" ? (c.ask === "round" ? "L2" : LETTER[c.ask]) : (c?.stage ?? null);
+  document.querySelectorAll(".rail .stop").forEach(s => s.classList.toggle("on", s.dataset.k === letter));
+  paintDag(f);
+  drawHead(f, job);
+  if (c) drawCall(c, job); else drawSkip(job);
+  drawBench(f, job);
+  animate(!!c);
 }
 
-function headerOf(prompt) {
-  const m = prompt.match(/<header>\n([\s\S]*?)\n<\/header>/);
-  if (!m) return null;
-  try { return JSON.parse(m[1]); } catch { return null; }
+function drawHead(f, job) {
+  const c = f.call;
+  const stage = c?.stage ?? job.stage;
+  $("badge").textContent = stage; $("badge").style.background = STAGE_COLORS[stage];
+  $("ftitle").textContent = c ? `${ASK_NAMES[c.ask]} · ${c.subject}` : `${job.id} · 代码直接处理`;
+  $("verdict").innerHTML = c ? (beat >= 3 ? `<span class="badge verdict-${c.verdict}">${VERDICT_NAMES[c.verdict]}</span>` : "") : `<span class="badge verdict-skip">没有调用模型</span>`;
+  if (c) {
+    const mine = callsOf[c.subject];
+    $("fmeta").textContent = `第 ${c.attempt} 次（最多 ${limitOf(c)} 次）· ${c.started ? "开始 " + time(c.started) + " · " : ""}结束 ${time(c.ended)} · ` +
+      `这个任务的第 ${mine.indexOf(f.i) + 1} 次调用，共 ${mine.length} 次`;
+    $("freason").innerHTML = c.reason && beat >= 3
+      ? `<div class="reason">${c.verdict === "rejected" && c.attempt < limitOf(c) ? "管线把下面这段反馈附在提示词后面，又问了一次：\n" : ""}${esc(c.reason)}</div>` : "";
+  } else {
+    const a = job.record?.assignment;
+    $("fmeta").textContent = "这个单元没有调用模型，记录直接由代码写出。";
+    $("freason").innerHTML = `<div class="reason skip">${esc(a?.needs_review ? "代码把它标成 needs_review：" + a.review_reason
+      : a?.placeholder ? "整条消息没有意图，代码写下一个占位记录。"
+      : a?.topic ? `它的 topic ${a.topic} 由代码直接确定，没有需要模型判断的内容。` : "它不属于任何 topic，代码直接写下空记录。")}</div>`;
+  }
+  $("unit").innerHTML = unitHtml(c, job);
 }
 
-function renderFrame(c) {
-  const job = jobById[c.subject];
-  const header = headerOf(c.prompt);
-  const tabs = {prompt: "提示词", reply: "回答", reasoning: "推理", system: "system", schema: "schema", record: "写下的记录", graph: "图谱", usage: "用量"};
-  if (!c.reasoning) delete tabs.reasoning;
-  if (!header?.graph) delete tabs.graph;
-  if (!tabs[tab]) tab = "prompt";
-  let body = "";
-  if (tab === "prompt") {
-    const p = c.prompt, at = c.feedback_at;
-    body = `<pre>${at ? esc(p.slice(0, at)) + "<mark>" + esc(p.slice(at)) + "</mark>" : esc(p)}</pre>`;
-  } else if (tab === "reply") body = `<pre>${esc(pretty(c.reply ?? "（没有回答）"))}</pre>`;
-  else if (tab === "reasoning") body = `<pre>${esc(c.reasoning)}</pre>`;
-  else if (tab === "system") body = `<pre>${esc(PAGE.systems[c.ask])}</pre>`;
-  else if (tab === "schema") body = `<pre>${esc(JSON.stringify(PAGE.schemas[c.ask], null, 2))}</pre>`;
-  else if (tab === "usage") body = `<pre>${esc(JSON.stringify(c.usage, null, 2))}\nfinish: ${esc(c.finish)}\ntranscript: ${esc(c.transcript)}</pre>`;
-  else if (tab === "record") body = recordHtml(c, job);
-  else if (tab === "graph") body = graphHtml(header);
-  const lastOfSubject = calls.findLastIndex(x => x.subject === c.subject);
-  document.getElementById("frame").innerHTML =
-    `<div class="frame-title"><span class="badge" style="background:${STAGE_COLORS[c.stage]}">${c.stage}</span>${esc(ASK_NAMES[c.ask])} · ${esc(c.subject)}</div>` +
-    `<div class="kv">${job ? esc(job.label) + " · " : ""}第 ${c.attempt} 次（最多 ${limitOf(c)} 次）· ` +
-    `${c.started ? "开始 " + time(c.started) + " · " : ""}结束 ${time(c.ended)} · ` +
-    `这个任务的第 ${calls.slice(0, current + 1).filter(x => x.subject === c.subject).length} 次调用，共 ${calls.filter(x => x.subject === c.subject).length} 次` +
-    (lastOfSubject === current ? "（最后一次）" : "") + `</div>` +
-    `<div><span class="badge verdict-${c.verdict}">${VERDICT_NAMES[c.verdict]}</span></div>` +
-    (c.reason ? `<div class="reason">${c.verdict === "rejected" && c.attempt < limitOf(c) ? "管线把这段反馈附在提示词后面，又问了一次：\n" : ""}${esc(c.reason)}</div>` : "") +
-    `<div class="tabs">${Object.entries(tabs).map(([k, v]) => `<button data-tab="${k}" class="${k === tab ? "on" : ""}">${v}</button>`).join("")}</div>` + body;
-  document.querySelector("#frame .tabs").onclick = e => { if (e.target.dataset.tab) { tab = e.target.dataset.tab; renderFrame(c); } };
+function unitHtml(c, job) {
+  if (!job) return "";
+  if (job.stage === "LOOP") {
+    const topic = job.record?.assignment?.topic;
+    return `<div class="kv">当前单元 ${esc(job.id)} · topic ${topic ? esc(topic + "：" + (PAGE.topics[topic] ?? "")) : "无"}</div><pre>${esc(job.text)}</pre>`;
+  }
+  if (job.stage === "SEG") {
+    const [a, b] = [job.record.start, job.record.end];
+    return `<div class="kv">用户消息，这一段是字符 ${a}–${b}（黄框）</div><pre>${esc(job.text.slice(0, a))}<mark>${esc(job.text.slice(a, b))}</mark>${esc(job.text.slice(b))}</pre>`;
+  }
+  return `<div class="kv">${esc(job.stage === "L1" ? "工具 " + job.label + " · " + job.id : "这一轮从用户消息开始：" + job.label)}</div>`;
 }
 
-function recordHtml(c, job) {
-  if (!job) return "<pre>这个调用对应的任务不在当前的记录里。</pre>";
-  const note = calls.findLastIndex(x => x.subject === c.subject) === current
-    ? "这是这个任务的最后一次调用，下面是任务最终写下的记录。"
-    : "这个任务后面还有调用，下面是任务最终写下的记录，不是这一次调用的结果。";
-  return `<div class="kv">${note}</div><pre>${esc(JSON.stringify(job.record, null, 2))}</pre>`;
+function promptHtml(c) {
+  const p = c.prompt, marks = new Set([0, p.length]);
+  for (const [a, b] of c.fixed) { marks.add(a); marks.add(b); }
+  if (c.feedback_at) marks.add(c.feedback_at);
+  const cuts = [...marks].sort((a, b) => a - b), fixed = c.fixed;
+  let html = "", k = 0;
+  for (let n = 0; n + 1 < cuts.length; n++) {
+    const a = cuts[n], b = cuts[n + 1];
+    while (k < fixed.length && fixed[k][1] <= a) k++;
+    const literal = k < fixed.length && fixed[k][0] <= a;
+    let piece = esc(p.slice(a, b));
+    if (!literal) piece = `<span class="v">${piece}</span>`;
+    if (c.feedback_at && a >= c.feedback_at) piece = `<mark>${piece}</mark>`;
+    html += piece;
+  }
+  return html;
 }
 
-function showJob(job) {
-  document.getElementById("frame").innerHTML =
-    `<div class="frame-title"><span class="badge" style="background:${STAGE_COLORS[job.stage]}">${job.stage}</span>${esc(job.id)}</div>` +
-    `<div class="kv">${esc(job.label)} · 这个任务没有调用模型，它的记录直接由代码写出（例如工具结果的 topic 取自它的调用）。</div>` +
-    `<pre>${esc(JSON.stringify(job.record, null, 2))}</pre>`;
+function drawCall(c, job) {
+  $("request").innerHTML =
+    `<h3>HTTP 请求的设置（来自调用记录的请求行）</h3><pre>${esc(JSON.stringify(c.request, null, 2))}</pre>` +
+    `<h3>提示词</h3><pre>${promptHtml(c)}</pre>` +
+    `<details class="more"><summary>system 全文</summary><pre>${esc(PAGE.systems[c.ask])}</pre></details>` +
+    `<details class="more"><summary>上下文窗口的规则（源码常量和 docstring）</summary><pre>${esc(PAGE.window.join("\n\n"))}</pre></details>`;
+  $("reply").innerHTML =
+    `<div class="dim ${beat >= 2 ? "lit" : ""}"><pre>${esc(pretty(c.reply ?? "（没有回答）"))}</pre>` +
+    (c.reasoning ? `<details class="more"><summary>推理</summary><pre>${esc(c.reasoning)}</pre></details>` : "") +
+    `<details class="more"><summary>用量和调用记录</summary><pre>${esc(JSON.stringify(c.usage, null, 2))}\nfinish: ${esc(c.finish)}\ntranscript: ${esc(c.transcript)}</pre></details></div>` +
+    `<details class="more"><summary>response_format 的 JSON schema</summary><pre>${esc(JSON.stringify(PAGE.schemas[c.ask], null, 2))}</pre></details>`;
+  $("checks").innerHTML = checksHtml(c, job);
 }
 
-/* ---------- graph from the prompt header ---------- */
-function graphHtml(header) {
-  const g = header.graph, nodes = Object.entries(g.nodes ?? {}), edges = g.edges ?? [];
-  if (!nodes.length) return `<div class="kv">topic ${esc(header.current_topic)} 的图谱目前还是空的。</div><pre>${esc(JSON.stringify(header, null, 2))}</pre>`;
-  const kinds = ["intent", "aggregate", "observation"], names = {intent: "意图", aggregate: "聚合", observation: "观察"};
-  const colors = {intent: "var(--loop)", aggregate: "var(--l2)", observation: "var(--seg)"};
-  const W = 230, H = 34, pos = {};
-  const counts = {};
-  for (const [id, n] of nodes) { const k = kinds.indexOf(n.type) < 0 ? 0 : kinds.indexOf(n.type); const r = counts[k] = (counts[k] ?? 0) + 1; pos[id] = {x: 10 + k * (W + 40), y: 24 + (r - 1) * (H + 10)}; }
-  const height = 40 + Math.max(...Object.values(counts)) * (H + 10);
-  const candidates = new Set((header.candidates ?? []).map(x => typeof x === "string" ? x : x.id));
-  let svg = kinds.map((k, i) => `<text x="${10 + i * (W + 40)}" y="14" font-weight="600">${names[k]}</text>`).join("");
+function checksHtml(c, job) {
+  const done = beat >= 3, rules = PAGE.rules[c.ask] ?? [];
+  const state = done ? (c.verdict === "accepted" ? "ok" : "no") : "";
+  let html = `<div class="check ${state}">回答必须是合法 JSON，并且符合 schema</div>`;
+  html += rules.filter(r => r.kind === "check").map(r => `<div class="check ${done && c.verdict === "accepted" ? "ok" : ""}">${esc(r.text)} <span class="where">${esc(r.where)}</span></div>`).join("");
+  if (done && c.verdict !== "accepted") html += `<div class="check no">${esc(c.reason || "没有通过")}</div>`;
+  html += `<h3>重问时追加到提示词末尾的反馈（最多调用 ${limitOf(c)} 次）</h3>` +
+    rules.filter(r => r.kind === "feedback").map(r => `<div class="check">${esc(r.text)} <span class="where">${esc(r.where)}</span></div>`).join("");
+  html += `<h3>写入</h3><div class="dim ${done ? "lit" : ""}">${writesHtml(c, job)}</div>`;
+  return html;
+}
+
+function writesHtml(c, job) {
+  if (!job) return `<div class="write">这个调用对应的任务不在当前的记录里。</div>`;
+  const inline = c.stage === "LOOP" && c.ask === "round";
+  const file = inline ? PAGE.files.inline : PAGE.files[c.stage];
+  const last = callsOf[c.subject].at(-1) === calls.indexOf(c);
+  let record = job.record;
+  if (c.stage === "L1") record = job.record[c.ask];
+  else if (c.stage === "LOOP") record = inline ? job.record.compressions : job.record.assignment;
+  const a = job.record?.assignment;
+  let html = `<div class="write">文件：${esc(file)}</div>`;
+  if (c.stage === "LOOP" && !inline) {
+    html += `<div class="write">${last ? "这是本单元最后一次调用，代码接着把记录写入文件并提交到图谱。" : "本单元后面还有调用，记录要等最后一次调用之后才写入。"}</div>`;
+    if (a?.needs_review) html += `<div class="write bad">needs_review：${esc(a.review_reason)}</div>`;
+    for (const line of job.log) html += `<div class="write">run.log：${esc(line)}</div>`;
+  }
+  return html + `<details class="more" ${last ? "open" : ""}><summary>任务最终写下的记录</summary><pre>${esc(JSON.stringify(record, null, 2))}</pre></details>`;
+}
+
+function drawSkip(job) {
+  $("request").innerHTML = `<p>这个单元不需要模型判断，代码直接处理。</p>`;
+  $("reply").innerHTML = "";
+  const a = job.record?.assignment;
+  $("checks").innerHTML = `<h3>写入</h3><div class="write">文件：${esc(PAGE.files.LOOP)}</div>` +
+    (a?.needs_review ? `<div class="write bad">needs_review：${esc(a.review_reason)}</div>` : "") +
+    job.log.map(l => `<div class="write">run.log：${esc(l)}</div>`).join("") +
+    `<details class="more" open><summary>写下的记录</summary><pre>${esc(JSON.stringify(job.record, null, 2))}</pre></details>`;
+}
+
+function animate(isCall) {
+  $("c1").classList.toggle("live", isCall && beat === 0);
+  $("c2").classList.toggle("live", isCall && beat === 2);
+  $("c3").classList.toggle("live", isCall && beat === 3 && !!timer);
+  $("wire").classList.toggle("busy", isCall && beat === 1);
+  document.documentElement.style.setProperty("--beat", beatMs() + "ms");
+  const p = $("pkt"); p.className = "pkt"; void p.offsetWidth;
+  if (isCall && beat === 1) p.classList.add("go");
+  if (isCall && beat === 2) p.classList.add("back");
+}
+
+/* ---------- the topic graph each unit builds on ---------- */
+const keyOf = e => JSON.stringify([e.from, e.to, e.relation]);
+const before = [];          /* before[k]: every topic's graph just before unit k was committed */
+{
+  const state = {};
+  PAGE.graphs.forEach((g, k) => {
+    before.push(state[g.topic] ? {nodes: {...state[g.topic].nodes}, edges: [...state[g.topic].edges]} : {nodes: {}, edges: []});
+    if (!g.topic) return;
+    const s = state[g.topic] ??= {nodes: {}, edges: []};
+    for (const id of g.removed) delete s.nodes[id];
+    Object.assign(s.nodes, g.nodes);
+    const gone = new Set(g.removed_edges.map(keyOf));
+    s.edges = s.edges.filter(e => !gone.has(keyOf(e))).concat(g.edges);
+  });
+}
+
+function drawBench(f, job) {
+  const k = job?.stage === "LOOP" ? unitOf(job.id) : -1, g = PAGE.graphs[k];
+  if (k < 0 || !g) {
+    $("gtitle").textContent = k < 0 ? "图谱：抽取阶段还没有开始，这一步不读也不写图谱" : "图谱：这个单元没有落盘记录";
+    $("bench").innerHTML = ""; return;
+  }
+  const topic = g.topic ?? job.record?.assignment?.topic;
+  if (!topic) { $("gtitle").textContent = "图谱：这个单元不属于任何 topic，不改动图谱"; $("bench").innerHTML = ""; return; }
+  const c = f.call;
+  const committed = !c || (beat >= 3 && callsOf[c.subject].at(-1) === f.i);
+  const base = before[k];
+  const nodes = {...base.nodes}, fresh = new Set(), freshEdges = new Set(g.edges.map(keyOf));
+  if (committed) for (const id of g.removed) delete nodes[id];
+  for (const [id, n] of Object.entries(g.nodes)) { nodes[id] = n; fresh.add(id); }
+  const gone = new Set(g.removed_edges.map(keyOf));
+  const edges = base.edges.filter(e => !committed || !gone.has(keyOf(e))).concat(g.edges);
+  const header = c ? headerOf(c.prompt) : null;
+  const candidates = new Set((header?.candidates ?? []).map(x => typeof x === "string" ? x : x.id));
+  const entries = Object.entries(nodes);
+  $("gtitle").textContent = `图谱：${topic} ${PAGE.topics[topic] ?? ""}（${entries.length} 个节点${committed ? "，本单元的改动已提交" : "，虚线是本单元还没提交的改动"}）`;
+  if (!entries.length) { $("bench").innerHTML = `<p class="note">这个 topic 的图谱目前还是空的。</p>`; return; }
+  const kinds = ["intent", "aggregate", "observation"], colors = {intent: "var(--I)", aggregate: "var(--G)", observation: "var(--O)"};
+  const W = 270, H = 44, GAP = 60, pos = {}, rows = [0, 0, 0];
+  for (const [id, n] of entries) { const kk = Math.max(0, kinds.indexOf(n.type)); pos[id] = {x: 10 + kk * (W + GAP), y: 10 + rows[kk]++ * (H + 12)}; }
+  const height = 20 + Math.max(...rows) * (H + 12);
+  let svg = "";
   for (const e of edges) {
     const a = pos[e.from], b = pos[e.to]; if (!a || !b) continue;
-    const x1 = a.x + W, y1 = a.y + H / 2, x2 = b.x, y2 = b.y + H / 2;
-    const same = a.x === b.x;
-    const d = same ? `M${a.x + W},${y1} C${a.x + W + 30},${y1} ${b.x + W + 30},${y2} ${b.x + W},${y2}` : `M${x1},${y1} C${(x1 + x2) / 2},${y1} ${(x1 + x2) / 2},${y2} ${x2},${y2}`;
-    svg += `<path class="edge" d="${d}"><title>${esc(e.relation + "：" + (e.evidence ?? ""))}</title></path>`;
-    svg += `<text class="elabel" x="${same ? a.x + W + 18 : (x1 + x2) / 2 - 14}" y="${(y1 + y2) / 2 - 2}">${esc(e.relation)}</text>`;
+    const same = a.x === b.x, left = b.x < a.x;
+    const x1 = left ? a.x : a.x + W, x2 = left ? b.x + W : b.x, y1 = a.y + H / 2, y2 = b.y + H / 2;
+    const d = same ? `M${a.x + W},${y1} C${a.x + W + 40},${y1} ${b.x + W + 40},${y2} ${b.x + W},${y2}` : `M${x1},${y1} C${(x1 + x2) / 2},${y1} ${(x1 + x2) / 2},${y2} ${x2},${y2}`;
+    const dash = freshEdges.has(keyOf(e)) && !committed ? ' stroke-dasharray="5 4"' : "";
+    svg += `<path class="edge" d="${d}"${dash}><title>${esc(e.relation + "：" + (e.evidence ?? ""))}</title></path>`;
+    svg += `<text class="elabel" x="${same ? a.x + W + 24 : (x1 + x2) / 2 - 14}" y="${(y1 + y2) / 2 - 3}">${esc(e.relation)}</text>`;
   }
-  for (const [id, n] of nodes) {
-    const p = pos[id], hot = candidates.has(id);
-    svg += `<rect x="${p.x}" y="${p.y}" width="${W}" height="${H}" rx="4" fill="var(--panel)" stroke="${colors[n.type] ?? "var(--muted)"}" stroke-width="${hot ? 3 : 1.2}"><title>${esc(id + " " + (n.label ?? n.text ?? ""))}</title></rect>`;
-    svg += `<text x="${p.x + 5}" y="${p.y + 13}" font-weight="600">${esc(id)}</text><text x="${p.x + 5}" y="${p.y + 27}">${esc(String(n.label ?? n.text ?? "").slice(0, 17))}</text>`;
+  for (const [id, n] of entries) {
+    const p = pos[id], pending = fresh.has(id) && !committed, hot = candidates.has(id);
+    svg += `<g><title>${esc(id + " " + (n.label ?? ""))}</title><rect x="${p.x}" y="${p.y}" width="${W}" height="${H}" rx="4" fill="var(--panel)" stroke="${colors[n.type] ?? "var(--muted)"}" stroke-width="${hot ? 3.2 : 1.3}"${pending ? ' stroke-dasharray="5 4"' : ""}/>` +
+      `<text x="${p.x + 6}" y="${p.y + 16}" font-weight="700">${esc(id)}</text><text x="${p.x + 6}" y="${p.y + 34}">${esc(String(n.label ?? "").slice(0, 22))}</text></g>`;
   }
-  const width = 10 + 3 * (W + 40) + 40;
-  return `<div class="kv">topic ${esc(header.current_topic)} 在这次调用时的图谱，读自提示词的 header；粗框是这次调用给出的候选。</div>` +
-    `<div id="graph" style="overflow:auto"><svg width="${width}" height="${height}">${svg}</svg></div>`;
+  $("bench").innerHTML = `<svg width="${10 + 3 * (W + GAP)}" height="${height}" role="img" aria-label="topic 图谱">${svg}</svg>`;
 }
 
 drawStrip();
-const start = new URLSearchParams(location.hash.slice(1));
-tab = start.get("tab") ?? tab;
-show(+(start.get("call") ?? 1) - 1);
+const startAt = new URLSearchParams(location.hash.slice(1)).get("frame");
+go(+(startAt ?? 1) - 1);
 </script>
 </body>
 </html>
