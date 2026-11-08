@@ -1337,7 +1337,7 @@ def _prompt(
     head = head() if callable(head) else head
     low = _round_low(step)
     so_far = render_round_so_far(items, low, step.index, digests, in_force)
-    current = f"<当前单元>\n{_render_unit(step.unit, digests)}\n</当前单元>"
+    current = f"<当前单元>\n{render_unit(step.unit, digests)}\n</当前单元>"
     if tail:
         current = f"{current}\n\n{tail}"
     rest = count(system) + count(head) + count(so_far) + count(current)
@@ -1374,7 +1374,8 @@ def _header(unit: Unit, topics: Sequence[tuple[str, str]], extra: dict[str, obje
     return f"<header>\n{json.dumps(header, ensure_ascii=False, indent=2)}\n</header>"
 
 
-def _render_unit(unit: Unit, digests: Digests) -> str:
+def render_unit(unit: Unit, digests: Digests) -> str:
+    """The unit as the <当前单元> block shows it; a user segment is marked inside its message."""
     if not isinstance(unit, UserSegment):
         return round_entry(unit, digests)
     body, segment = unit.message.body, unit.segment

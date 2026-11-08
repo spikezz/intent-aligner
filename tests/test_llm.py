@@ -412,7 +412,7 @@ def test_live_call_stays_isolated(backend: llm.Backend, tmp_path: Path) -> None:
 def test_asker_logs_every_call_with_its_subject(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    replies = iter(
+    replies: Iterator[llm.LLMReply | LLMError] = iter(
         [
             llm.LLMReply(text="{}", session_id="s1", transcript=tmp_path / "s1.jsonl"),
             LLMError("truncated", tmp_path / "s2.jsonl"),
