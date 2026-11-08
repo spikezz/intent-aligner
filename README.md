@@ -64,6 +64,12 @@ $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
 
 第 2 步写出的是原始记录，只改成了缩进排版，字段内容不变。
 
+### 结果目录和重跑
+
+第 4 到 6 步的结果按“对话 + 模型”放在同一个目录 `corpus/results/<platform>-<seed>-<模型>/` 下：`digests.jsonl`、`segments.jsonl` 和 `extract/`，也就是上面命令里的 `$OUT`。
+
+第 4 到 6 步重跑时都从已经写出的结果继续，只补缺少的部分，所以结果齐全时重跑不调用模型。续跑不检查模型是否和之前相同，所以换模型时要换一个目录，否则同一份结果里会混着两个模型的回答。第 6 步发现对话或切分结果和 `assignments.jsonl` 对不上时会报错停止，这时也要换一个 `--out` 目录。要完全重跑，先把这个目录里的 `digests.jsonl`、`segments.jsonl` 和 `extract/` 移走。
+
 ### 调用 LLM
 
 轨迹提取器可以通过 Claude Code、Codex 或 pi 的命令行调用模型，也可以直接通过 HTTP 调用 Hive Frame 网关上的本地模型。`compress`、`segment` 和 `extract` 的 `--backend` 只接受 `claude`、`codex` 和 `hive`，`pi` 只能在下面的 `intent_aligner.llm` 和手动测试工具里使用。每次调用都是独立的一问一答，prompt 从标准输入读入，回复打印到标准输出，对话记录的路径打印到标准错误。
