@@ -10,4 +10,7 @@ corpus/*
 corpus/results/*
 !corpus/results/README.md
 !corpus/results/segment-intents-comparison.md
+!corpus/results/claude-5a1f0c1a-qwen/
+corpus/results/claude-5a1f0c1a-qwen/*
+!corpus/results/claude-5a1f0c1a-qwen/animation/
 llm-home/

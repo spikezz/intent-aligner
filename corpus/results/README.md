@@ -37,6 +37,10 @@ Qwen：
 - topic 归属（只判断 topic 的那次运行，结果已经不在目录里）：299 个单元，296 个归到 T001，3 个归到 T002“记录 Claude Code 因 Opus 5.5 安全护栏拦截消息而返回 API 错误……”。T002 的三个单元都是对话末尾的观测：一条被拦截后合成的 AI 回复和之后的两条观测；sol 把它们归在 T001。没有 `needs_review`，调用 T 调用 162 次，每次第一次回答就通过。
 - 工具记录压缩：3 次，和 sol 相同。
 
+## 提取流程动画
+
+`claude-5a1f0c1a-qwen/animation/extraction-flow.html` 以一次模型端点调用为单位，逐帧回放 Qwen 主循环的提取过程，用浏览器直接打开即可。它由同目录的 `build.py` 根据 `extract/`、`digests.jsonl` 和 `segments.jsonl` 生成，重新生成时在这个目录运行 `python build.py`。提示词、校验规则等由代码确定的内容来自 `fixed.py`。
+
 ## 重跑
 
 ```bash
