@@ -65,7 +65,7 @@ N 由第 5 步的 `--window-rounds` 设定，默认值是 2。回放从 `run.sh`
 ### 回放一次运行
 
 ```bash
-$PY -m intent_aligner.replay corpus/results/claude-87eeb4bd-sol --out replay.html
+$PY -m intent_aligner.replay corpus/results/claude-5a1f0c1a-sol-l1 --out replay.html
 ```
 
 `intent_aligner.replay` 读结果目录的 `run.sh`，找到对话、模型和三步写出的文件，再把这次运行的每一次模型调用连同 `llm-home/` 里的原始请求和回答写成一个自包含的 HTML 页面，用浏览器直接打开。运行还没结束时加 `--watch 30`，工具会每 30 秒用已有的数据重新生成页面，页面也每 30 秒重新载入，停在你正在看的那一帧；播放时等播放停下才载入，按 Ctrl-C 结束。页面按时间顺序逐帧回放每次调用，播放时每帧分四拍：请求发出、端点处理、回答返回、代码校验。没有调用模型的抽取单元也占一帧，页面会说明代码为什么直接处理了它。

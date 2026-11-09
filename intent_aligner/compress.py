@@ -340,7 +340,10 @@ def _until(items: list[Item], uuid: str | None) -> list[Item]:
     for index, item in enumerate(items):
         if isinstance(item, UserMessage) and item.source.uuid == uuid:
             return items[:index]
-    raise ValueError(f"No user message {uuid}; uuids are in corpus/units/*.jsonl.")
+    raise ValueError(
+        f"No user message {uuid}; the units file that `python -m intent_aligner.units` writes "
+        "for this conversation lists every uuid."
+    )
 
 
 def main() -> None:
