@@ -103,7 +103,7 @@ pre mark { background: var(--feedback); color: inherit; outline: 1px solid var(-
 .write.bad { color: var(--bad); }
 details.more { margin-top: 8px; font-size: 12px; }
 details.more summary { cursor: pointer; color: var(--muted); }
-#bench { height: 75vh; min-height: 420px; margin-top: 6px; border: 1px solid var(--line); border-radius: 4px; resize: vertical; overflow: hidden; }
+#bench { height: 75vh; min-height: 200px; margin-top: 6px; border: 1px solid var(--line); border-radius: 4px; resize: vertical; overflow: hidden; }
 #gnote { font-size: 12px; color: var(--muted); margin-top: 6px; overflow-wrap: anywhere; }
 .skip { color: var(--warn); }
 @media (prefers-reduced-motion: reduce) { .pkt { display: none; } .wire.busy .end { animation: none; } * { transition: none !important; } }
@@ -142,6 +142,12 @@ details.more summary { cursor: pointer; color: var(--muted); }
     </div>
     <div id="dag"></div>
   </details>
+  <section class="box" id="gbox">
+    <div class="head"><span class="ftitle" id="gtitle"></span><button id="relayout" class="relayout">重新自动排版</button></div>
+    <div class="legend"><span>实线框和实线边：已经写入存储</span> · <span>虚线：这个单元刚产生、在单元最后一次调用之后提交</span> · <span>粗框：这次调用 header 里的候选</span> · <span>虚线大框：topic 里有边的节点</span> · <span>左边的虚线框：一条边都没有的节点</span> · <span style="color:var(--I)">I 用户的意图</span> · <span style="color:var(--A)">I AI 的意图</span> · <span style="color:var(--G)">G 工具调用的聚合</span> · <span style="color:var(--O)">O 观测</span> · <span style="color:var(--O)">红色点线 validates：聚合的观测检验这个聚合的意图所带的预期</span></div>
+    <div id="bench"></div>
+    <p id="gnote"></p>
+  </section>
   <section class="box">
     <div class="head"><span class="badge" id="badge"></span><span class="ftitle" id="ftitle"></span><span id="verdict"></span></div>
     <div class="kv" id="fmeta"></div>
@@ -153,13 +159,6 @@ details.more summary { cursor: pointer; color: var(--muted); }
     <div class="wire" id="wire"><div class="pkt" id="pkt"></div><div class="end" id="endpoint"></div></div>
     <div class="col" id="c2"><h2>模型的回答</h2><div id="reply"></div></div>
     <div class="col" id="c3"><h2>代码校验与写入</h2><div id="checks"></div></div>
-  </section>
-  <section class="box">
-    <div class="head"><span class="ftitle" id="gtitle"></span><button id="relayout" class="relayout">重新自动排版</button></div>
-    <div class="legend"><span>实线框和实线边：已经写入存储</span> · <span>虚线：这个单元刚产生、在单元最后一次调用之后提交</span> · <span>粗框：这次调用 header 里的候选</span> · <span>虚线大框：topic 里有边的节点</span> · <span>左边的虚线框：一条边都没有的节点</span> · <span style="color:var(--I)">I 用户的意图</span> · <span style="color:var(--A)">I AI 的意图</span> · <span style="color:var(--G)">G 工具调用的聚合</span> · <span style="color:var(--O)">O 观测</span> · <span style="color:var(--O)">红色点线 validates：聚合的观测检验这个聚合的意图所带的预期</span></div>
-    <p class="note" id="gempty"></p>
-    <div id="bench"></div>
-    <p id="gnote"></p>
   </section>
 </div>
 <script>/*GRAPH_LIBRARIES*/</script>
@@ -633,18 +632,31 @@ function animate(isCall) {
 
 /* ---------- the topic graph each unit builds on ---------- */
 const keyOf = e => JSON.stringify([e.from, e.to, e.relation]);
-const before = [];          /* before[k]: every topic's graph just before unit k was committed */
+/* unitsDoneAt[n]: how many units were committed when frame n ran. Units run one at a time, so a frame
+   that belongs to no unit (compression, segmentation) comes after every unit framed before it. */
+const unitsDoneAt = [];
 {
-  const state = {};
-  PAGE.graphs.forEach((g, k) => {
-    before.push(state[g.topic] ? {nodes: {...state[g.topic].nodes}, edges: [...state[g.topic].edges]} : {nodes: {}, edges: []});
-    if (!g.topic) return;
-    const s = state[g.topic] ??= {nodes: {}, edges: []};
+  let last = -1;
+  for (const f of frames) {
+    const k = unitOf(f.call?.subject ?? f.skip.id);
+    unitsDoneAt.push(k >= 0 ? k : last + 1);
+    last = Math.max(last, k);
+  }
+}
+function graphAfter(units, topic) {
+  const s = {nodes: {}, edges: []};
+  for (const g of PAGE.graphs.slice(0, units)) {
+    if (g?.topic !== topic) continue;
     for (const id of g.removed) delete s.nodes[id];
     Object.assign(s.nodes, g.nodes);
     const gone = new Set(g.removed_edges.map(keyOf));
     s.edges = s.edges.filter(e => !gone.has(keyOf(e))).concat(g.edges);
-  });
+  }
+  return s;
+}
+function lastTopic(units) {
+  for (let k = Math.min(units, PAGE.graphs.length) - 1; k >= 0; k--) if (PAGE.graphs[k]?.topic) return PAGE.graphs[k].topic;
+  return null;
 }
 
 /* Graph drawing: Cytoscape with the dagre layered layout. Positions the viewer drags are kept per run
@@ -707,12 +719,17 @@ function layoutGraph() {
   const left = box.x1 - ORPHAN_GAP - cols * (cellW + ORPHAN_COL_GAP) + ORPHAN_COL_GAP;
   orphans.forEach((n, i) => n.position({x: left + Math.floor(i / rows) * (cellW + ORPHAN_COL_GAP) + cellW / 2, y: box.y1 + (i % rows) * rowH + rowH / 2}));
   cy.nodes().forEach(n => { if (own[n.id()]) n.position(own[n.id()]); });
-  cy.fit(undefined, 24);
+  /* The box takes the graph's shape at full width, so the fit fills it instead of leaving bands above and below. */
+  const all = cy.elements().boundingBox(), pad = 24, bench = $("bench");
+  const fitted = (bench.clientWidth - 2 * pad) * all.h / all.w + 2 * pad;
+  bench.style.height = Math.round(Math.min(Math.max(fitted, 200), innerHeight * 0.85)) + "px";
+  cy.resize();
+  cy.fit(undefined, pad);
 }
 
 function ensureGraph() {
   if (cy) return;
-  cy = cytoscape({container: $("bench"), style: graphStyle(), minZoom: 0.15, maxZoom: 3, boxSelectionEnabled: false});
+  cy = cytoscape({container: $("bench"), style: graphStyle(), minZoom: 0.15, maxZoom: 3, wheelSensitivity: 0.2, boxSelectionEnabled: false});
   cy.on("dragfree", "node", e => {
     const n = e.target; if (n.isParent()) return;
     (dragged[shownTopic] ??= {})[n.id()] = {...n.position()}; saveDragged();
@@ -728,35 +745,31 @@ function ensureGraph() {
   $("relayout").onclick = () => { delete dragged[shownTopic]; saveDragged(); layoutGraph(); };
 }
 
-function showGraph(visible, note) {
-  $("bench").hidden = $("relayout").hidden = $("gnote").hidden = !visible;
-  $("gempty").hidden = visible; $("gempty").textContent = note ?? "";
-}
-
 function drawBench(f, job) {
-  const k = job?.stage === "LOOP" ? unitOf(job.id) : -1, g = PAGE.graphs[k];
-  if (k < 0 || !g) {
-    $("gtitle").textContent = "图谱";
-    showGraph(false, k < 0 ? "抽取阶段还没有开始，这一步不读也不写图谱。" : "这个单元没有落盘记录。"); return;
-  }
-  const topic = g.topic ?? job.record?.assignment?.topic;
-  if (!topic) { $("gtitle").textContent = "图谱"; showGraph(false, "这个单元不属于任何 topic，不改动图谱。"); return; }
-  const c = f.call;
+  ensureGraph();
+  const k = job?.stage === "LOOP" ? unitOf(job.id) : -1, g = k >= 0 ? PAGE.graphs[k] : null;
+  const c = f.call, header = c ? headerOf(c.prompt) : null, unitsDone = unitsDoneAt[current];
+  /* A unit still running has no record yet, and call T does not know its topic: those frames show the topic
+     the header names, else the one the last committed unit went to. */
+  const own = g?.topic ?? header?.current_topic;
+  const topic = own ?? lastTopic(unitsDone);
+  const base = topic ? graphAfter(unitsDone, topic) : {nodes: {}, edges: []};
+  const changes = g?.topic && g.topic === topic ? g : null;
   const committed = !c || (beat >= 3 && callsOf[c.subject].at(-1) === f.i);
-  const base = before[k];
-  const nodes = {...base.nodes}, fresh = new Set(), freshEdges = new Set(g.edges.map(keyOf));
-  if (committed) for (const id of g.removed) delete nodes[id];
-  for (const [id, n] of Object.entries(g.nodes)) { nodes[id] = n; fresh.add(id); }
-  const gone = new Set(g.removed_edges.map(keyOf));
-  const edges = base.edges.filter(e => !committed || !gone.has(keyOf(e))).concat(g.edges);
-  const header = c ? headerOf(c.prompt) : null;
+  const nodes = {...base.nodes}, fresh = new Set(), freshEdges = new Set((changes?.edges ?? []).map(keyOf));
+  let edges = base.edges;
+  if (changes) {
+    if (committed) for (const id of changes.removed) delete nodes[id];
+    for (const [id, n] of Object.entries(changes.nodes)) { nodes[id] = n; fresh.add(id); }
+    const gone = new Set(changes.removed_edges.map(keyOf));
+    edges = edges.filter(e => !committed || !gone.has(keyOf(e))).concat(changes.edges);
+  }
   const candidates = new Set((header?.candidates ?? []).map(x => typeof x === "string" ? x : x.id));
   const entries = Object.entries(nodes);
-  $("gtitle").textContent = `图谱（${entries.length} 个节点，${edges.length} 条边${committed ? "，本单元的改动已提交" : "，虚线是本单元还没提交的改动"}）`;
-  if (!entries.length) { showGraph(false, `${topic} ${PAGE.topics[topic] ?? ""}：这个 topic 的图谱目前还是空的。`); return; }
-  showGraph(true); ensureGraph();
-  /* The container may just have been unhidden; Cytoscape keeps its old (zero) size until told. */
-  cy.resize();
+  const state = changes ? (committed ? "本单元的改动已提交" : "虚线是本单元还没提交的改动")
+    : k >= 0 && !g ? "这个单元还没有落盘，显示它开始前的图谱"
+    : own ? "本单元不改动图谱" : topic ? `${topic} 到这一帧为止的图谱` : "还没有 topic";
+  $("gtitle").textContent = `图谱（${entries.length} 个节点，${edges.length} 条边，${state}）`;
   const colors = {intent: "--I", aggregate: "--G", observation: "--O", aggregate_observation: "--O"};
   const done = new Set(edges.filter(e => e.relation === "satisfies").map(e => e.to));
   const colorOf = n => cssVar(n.type === "intent" && n.actor === "ai" ? "--A" : colors[n.type] ?? "--muted");
@@ -809,7 +822,7 @@ document.addEventListener("click", e => {
   if (summary) setTimeout(() => { opened[summary.textContent] = summary.parentElement.open; });
 });
 function saveView() {
-  const view = {opened, page: scrollY, scrolled: [...document.querySelectorAll(SCROLLED)].map(x => [x.scrollTop, x.scrollLeft]),
+  const view = {opened, graphTop: $("gbox").getBoundingClientRect().top, scrolled: [...document.querySelectorAll(SCROLLED)].map(x => [x.scrollTop, x.scrollLeft]),
     bench: $("bench").style.height, topic: shownTopic, graph: cy ? {zoom: cy.zoom(), pan: cy.pan()} : null};
   try { sessionStorage.setItem(VIEW_KEY, JSON.stringify(view)); } catch { /* the reload then starts from the defaults */ }
 }
@@ -821,7 +834,8 @@ function restoreView() {
   if (view.bench) $("bench").style.height = view.bench;
   if (cy && view.graph && view.topic === shownTopic) { cy.resize(); cy.viewport({zoom: view.graph.zoom, pan: view.graph.pan}); }
   document.querySelectorAll(SCROLLED).forEach((x, i) => { if (view.scrolled[i]) [x.scrollTop, x.scrollLeft] = view.scrolled[i]; });
-  scrollTo(0, view.page);
+  /* The page keeps the graph where the viewer had it: the dependency graph above it grows while a run is watched. */
+  scrollTo(0, $("gbox").getBoundingClientRect().top + scrollY - view.graphTop);
 }
 
 drawStrip();
