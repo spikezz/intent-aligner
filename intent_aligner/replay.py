@@ -936,17 +936,24 @@ def _shown(source: str, expression: ast.expr) -> str | None:
 def window_rules(window_rounds: int) -> list[str]:
     """The constants and docstrings that decide what a prompt's windows hold."""
     constants = [
-        f"window.PROMPT_BUDGET = {window.PROMPT_BUDGET:,}（{window.TOKENIZER} 的 token）",
-        f"--window-rounds = {window_rounds}（这次运行的值，放不下时逐轮减少到 1）",
+        f"window.PROMPT_BUDGET = {window.PROMPT_BUDGET:,} token（调用 T 和切分"
+        "的 header 里全部 topic 的图谱 graphs 不计入；其他调用 header 里当前 topic 的图谱 graph 计入）",
+        f"--window-rounds = {window_rounds}（这次运行的值。放不下时先压缩最旧的工具记录，"
+        "全部压缩过仍然放不下才逐轮减少，1 轮也放不下时这个单元标记 needs_review）",
+        f"window.COMPRESSION_BATCH = {window.COMPRESSION_BATCH:,}（一次压缩至少累积这么多 token 的工具记录）",
+        f"compress.MESSAGE_ROOM = {compress.MESSAGE_ROOM:,}（压缩提示词里的发言超过这么多 token 时只给开头）",
+        f"window.FOLLOWING_ITEMS = {window.FOLLOWING_ITEMS}，window.FOLLOWING_BUDGET = "
+        f"{window.FOLLOWING_BUDGET:,}（调用 G 的 <此后的对话>）",
         f"FEEDBACK_ROOM：compress {compress.FEEDBACK_ROOM:,}，segment {segment.FEEDBACK_ROOM:,}，"
         f"extract {extract.FEEDBACK_ROOM:,}",
     ]
     documented = (
-        window.window_text,
+        extract._prompt,
+        extract._fitted_prompt,
+        extract._within_budget,
+        extract._compress_oldest,
         window.render_items,
         window.render_following,
-        window.round_entry,
-        extract._fitted_prompt,
     )
     return constants + [
         f"{f.__module__.rsplit('.', 1)[-1]}.{f.__name__}：{inspect.getdoc(f)}" for f in documented
