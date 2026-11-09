@@ -1,6 +1,6 @@
 # 运行结果
 
-`claude-87eeb4bd-sol/` 是对话 `corpus/merged/claude-87eeb4bd.jsonl` 按现行规则依次跑压缩、切分和主循环的结果，模型是 Codex 的 gpt-6.1-sol，思考强度 xhigh，窗口 `--window-rounds 2`，这次运行的主循环还没有结束。`claude-87eeb4bd-qwen-pool/` 只跑主循环，模型是 Hive 上的 `qwen38-pool`，思考强度 xhigh，窗口也是 2 轮；它直接读 `claude-87eeb4bd-sol/` 的压缩和切分结果，所以两次运行的差别只有主循环用的模型，这次运行还没有开始。
+`claude-87eeb4bd-sol/` 是对话 `corpus/merged/claude-87eeb4bd.jsonl` 按现行规则依次跑压缩、切分和主循环的结果，模型是 Codex 的 gpt-6.1-sol，思考强度 xhigh，窗口 `--window-rounds 2`，这次运行的主循环还没有结束。
 
 下面的内容说明 `claude-5a1f0c1a-*` 目录。
 
