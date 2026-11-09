@@ -17,13 +17,12 @@ flowchart TD
     START([开始：合并后的对话文件]) --> CUT
     CUT["代码：按时间顺序切成单元<br/>用户消息 / AI 发言 / 用户信号 / 工具调用 / 观测<br/>跳过思考、状态行、压缩摘要"]
     CUT --> ZIP
-    ZIP["LLM：两级压缩工具操作<br/>第一级：每个调用的意图<br/>[意图文本, evidence, explicit, note] + 对象<br/>每个结果的概括<br/>第二级：每两次发言之间的工具操作一段概括"]
-    ZIP --> SEG
-    SEG["LLM 指针：把每次发言<br/>切成首尾相接的段落<br/>每段附带意图<br/>[意图文本, evidence, explicit, note]"]
-    SEG --> PTR
+    ZIP["LLM：并行做第一级压缩<br/>每个调用的意图 [意图文本, evidence, explicit, note] + 对象<br/>每个结果的概括"]
+    ZIP --> PTR
 
     PTR["代码：指针移到下一个单元"]
-    PTR --> ISRES{是工具结果？<br/>用户拒绝产生的结果除外}
+    PTR --> PREP["LLM：发言切出下一段，附带意图，带全部 topic 的图谱<br/>其他单元直接往下走"]
+    PREP --> ISRES{是工具结果？<br/>用户拒绝产生的结果除外}
     ISRES -- 是 --> INHERIT["代码：沿用产生它的工具调用的 topic"]
     ISRES -- 否 --> T["调用 T：这个单元属于哪个 topic？<br/>输出 已有 topic 编号<br/>或 NEW + 新 topic 的标题"]
     T --> VT{"校验 T<br/>编号在 topic 列表里？<br/>NEW 时标题非空？"}
@@ -111,7 +110,7 @@ flowchart TD
     VD -.-> NR
     NR -.-> PTR
 
-    class A,ASSIGN,B,BACKFILL,C,COVER,CTX,CTXD,CUT,D,DONE,END,FINAL,G,GASSIGN,HALT,HAS,INHERIT,ISRES,KIND,L,LHAS,MSGEND,NEWT,NR,ONODE,PEND,PTR,RET,RETD,SEG,SEGI,SPAN,SRC,START,T,TRIG,VA,VB,VC,VD,VG,VL,VT,WRITE,ZIP,ZIPI done
+    class A,ASSIGN,B,BACKFILL,C,COVER,CTX,CTXD,CUT,D,DONE,END,FINAL,G,GASSIGN,HALT,HAS,INHERIT,ISRES,KIND,L,LHAS,MSGEND,NEWT,NR,ONODE,PEND,PREP,PTR,RET,RETD,SEGI,SPAN,SRC,START,T,TRIG,VA,VB,VC,VD,VG,VL,VT,WRITE,ZIP,ZIPI done
 
 ```
 

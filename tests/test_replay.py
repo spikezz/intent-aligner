@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,11 +22,12 @@ from intent_aligner.replay import (
     literal_ranges,
     literal_texts,
     parse_run,
+    read_exchange,
 )
 from intent_aligner.store import Stores
 from intent_aligner.window import Digests
 
-SOL_RUN = TOOL_ROOT / "corpus" / "results" / "claude-87eeb4bd-sol"
+SOL_RUN = TOOL_ROOT / "corpus" / "results" / "claude-5a1f0c1a-sol-l1"
 T0 = datetime(2026, 11, 8, 19, 0, tzinfo=UTC)
 
 
@@ -82,7 +84,7 @@ def test_errored_call_fails() -> None:
 
 needs_sol = pytest.mark.skipif(
     not (SOL_RUN / "run.sh").exists() or not (LLM_HOME / "codex").exists(),
-    reason="needs the claude-87eeb4bd-sol run and its codex transcripts",
+    reason="needs the claude-5a1f0c1a-sol-l1 run and its codex transcripts",
 )
 
 
@@ -91,7 +93,7 @@ def test_run_sh_names_the_runs_files() -> None:
     run = parse_run(SOL_RUN)
     got = (run.merged.name, run.backend, run.model, run.digests, run.extract)
     expected = (
-        "claude-87eeb4bd.jsonl",
+        "claude-5a1f0c1a.jsonl",
         "codex",
         "gpt-6.1-sol",
         SOL_RUN / "digests.jsonl",
@@ -110,7 +112,6 @@ def test_old_run_matches_every_call_its_records_account_for() -> None:
     expected = {
         ("L1", "call"): len(digests.calls),
         ("L1", "result"): sum(len(r.summaries) for r in digests.results.values()),
-        ("L2", "round"): len(digests.rounds),
         ("SEG", "segment"): sum(len(s) for s in conversation.segments.values()),
         ("LOOP", "topic"): sum(a.attempts for a in conversation.assignments),
         ("LOOP", "round"): len((run.extract / "tool_compressions.jsonl").read_text().splitlines()),
@@ -147,15 +148,6 @@ def test_window_reports_the_rounds_really_sent() -> None:
 
 
 @needs_sol
-def test_only_rounds_with_tool_work_are_compression_jobs() -> None:
-    run = parse_run(SOL_RUN)
-    page = build_page(run, None, None)
-    got = {j.id.removeprefix("round:") for j in page.jobs if j.stage == "L2"}
-    expected = set(Conversation.load(run).digests.rounds)
-    assert got == expected, f"{got!r} vs {expected!r}"
-
-
-@needs_sol
 def test_needs_review_units_have_a_route_with_their_unsent_steps() -> None:
     page = build_page(parse_run(SOL_RUN), None, None)
     units = [j for j in page.jobs if j.stage == "LOOP"]
@@ -165,6 +157,19 @@ def test_needs_review_units_have_a_route_with_their_unsent_steps() -> None:
         if bool(j.route) != bool((j.record["assignment"] or {}).get("needs_review"))
     ]
     assert wrong == [], wrong
+
+
+def test_codex_reasoning_summaries_are_read_from_the_transcript(tmp_path: Path) -> None:
+    events = [
+        {"type": "request", "model": "m", "system_prompt": "s", "prompt": "p"},
+        {"type": "item.completed", "item": {"type": "reasoning", "text": "甲"}},
+        {"type": "item.completed", "item": {"type": "reasoning", "text": "乙"}},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "{}"}},
+    ]
+    path = tmp_path / "t.jsonl"
+    path.write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
+    exchange = read_exchange(path)
+    assert exchange is not None and exchange.reasoning == "甲\n\n乙", exchange
 
 
 def test_prompt_literals_cover_the_tags_of_a_prompt() -> None:

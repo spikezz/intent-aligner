@@ -23,6 +23,7 @@ import inspect
 import json
 import re
 import shlex
+import time
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -43,10 +44,10 @@ from intent_aligner.extract import (
     load_compressions,
     load_segments,
     render_unit,
-    walk,
+    walk_so_far,
 )
 from intent_aligner.llm import CALLS_FILE, LLM_HOME, TRUNCATED_FEEDBACK, CallRecord
-from intent_aligner.segment import Segment, message_window
+from intent_aligner.segment import Segment
 from intent_aligner.store import IntentNode, Stores
 from intent_aligner.units import (
     SPEAKER_NAMES,
@@ -56,7 +57,7 @@ from intent_aligner.units import (
     ToolCall,
     conversation_units,
 )
-from intent_aligner.window import Digests, load_digests, qwen_tokens, round_entry
+from intent_aligner.window import Digests, load_digests, round_entry
 
 TEMPLATE = Path(__file__).with_name("replay.html")
 
@@ -65,7 +66,7 @@ TEMPLATE = Path(__file__).with_name("replay.html")
 STEPS: dict[str, tuple[str, str]] = {
     compress.CALL_SYSTEM_PROMPT: ("L1", "call"),
     compress.RESULT_SYSTEM_PROMPT: ("L1", "result"),
-    compress.ROUND_SYSTEM_PROMPT: ("L2", "round"),
+    compress.ROUND_SYSTEM_PROMPT: ("LOOP", "round"),
     segment.SYSTEM_PROMPT: ("SEG", "segment"),
     extract.T_SYSTEM_PROMPT: ("LOOP", "topic"),
     extract.A_SYSTEM_PROMPT: ("LOOP", "signal"),
@@ -183,12 +184,15 @@ def read_exchange(path: Path) -> Exchange | None:
         return None
     reply: str | None = None
     reasoning: str | None = None
+    summaries: list[str] = []
     usage: dict[str, Any] = {}
     finish = "no reply"
     for line in lines[1:]:
         kind = line.get("type")
         if kind == "item.completed" and line["item"]["type"] == "agent_message":
             reply, finish = str(line["item"]["text"]), "stop"
+        elif kind == "item.completed" and line["item"]["type"] == "reasoning":
+            summaries.append(str(line["item"]["text"]))
         elif kind == "turn.completed":
             usage = line["usage"]
         elif kind == "response" and line["status"] != 200:
@@ -206,7 +210,7 @@ def read_exchange(path: Path) -> Exchange | None:
         prompt=request["prompt"],
         schema=request.get("json_schema"),
         reply=reply,
-        reasoning=reasoning,
+        reasoning="\n\n".join(summaries) if summaries else reasoning,
         usage=usage,
         finish=finish,
         ended=datetime.fromtimestamp(path.stat().st_mtime, UTC),
@@ -248,7 +252,7 @@ class Conversation:
         digests = load_digests(run.digests) if run.digests.exists() else Digests()
         segments = load_segments(run.segments) if run.segments.exists() else {}
         done = run.extract / "assignments.jsonl"
-        steps = list(walk(items, segments)) if segments else []
+        steps = walk_so_far(items, segments, digests)
         round_of: dict[str, str] = {}
         opening = ""
         for item in items:
@@ -296,13 +300,22 @@ class Call:
         return self.started or self.exchange.ended
 
 
+def _stage(ask: str) -> str:
+    """Stage from the log record: a run's system prompts may be older than this code's."""
+    if ask in ("call", "result"):
+        return "L1"
+    if ask == "segment":
+        return "SEG"
+    return "LOOP"
+
+
 def logged_calls(run: Run) -> list[Call] | None:
     """The calls named by the run's calls.jsonl files, or None for a run older than them."""
-    logs = [(run.digests.parent / CALLS_FILE, False), (run.extract / CALLS_FILE, True)]
-    if not any(path.exists() for path, _ in logs):
+    logs = [run.digests.parent / CALLS_FILE, run.extract / CALLS_FILE]
+    if not any(path.exists() for path in logs):
         return None
     calls = []
-    for path, in_extract in logs:
+    for path in logs:
         if not path.exists():
             continue
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -315,7 +328,7 @@ def logged_calls(run: Run) -> list[Call] | None:
                 subject = f"{subject}:{len(_split(exchange.prompt)[0])}"
             calls.append(
                 Call(
-                    stage="LOOP" if in_extract else STEPS[exchange.system][0],
+                    stage=_stage(record.ask),
                     ask=record.ask,
                     subject=subject,
                     started=record.started,
@@ -457,15 +470,7 @@ class _JobFinder:
             return []
         done, rest = _split(prompt)
         indexes = self.messages_by_body.get(done + rest, [])
-        items, digests = self.conversation.items, self.conversation.digests
-        if len(indexes) > 1:
-            indexes = [
-                i
-                for i in indexes
-                if prompt.startswith(
-                    f"<此前的对话>\n{message_window(items, i, digests, qwen_tokens, self.conversation.window_rounds)}\n</此前的对话>"
-                )
-            ] or indexes
+        items = self.conversation.items
         return [f"message:{items[i].source.uuid}:{len(done)}" for i in indexes]
 
     def unit(self, candidates: list[str], prompt: str) -> str:
@@ -752,7 +757,7 @@ RULE_SOURCES: dict[str, tuple[str, ...]] = {
     "call": ("compress._compress_call", "compress._ask_until_valid"),
     "result": ("compress._compress_result", "compress._ask_until_valid"),
     "round": ("compress.summarize_trajectory", "compress._ask_until_valid"),
-    "segment": ("segment._next_segment", "segment.locate_end"),
+    "segment": ("segment.next_segment", "segment.locate_end"),
     "topic": ("extract._assign.parse", "extract._ask_until_valid"),
     "signal": ("extract._with_intents.parse_a", "extract._ask_until_valid"),
     "registry": ("extract._match_intents.parse_b", "extract._ask_until_valid"),
@@ -879,16 +884,14 @@ def window_rules(window_rounds: int) -> list[str]:
     constants = [
         f"window.PROMPT_BUDGET = {window.PROMPT_BUDGET:,}（{window.TOKENIZER} 的 token）",
         f"--window-rounds = {window_rounds}（这次运行的值，放不下时逐轮减少到 1）",
-        f"window.FOLLOWING_ITEMS = {window.FOLLOWING_ITEMS}，"
-        f"window.FOLLOWING_BUDGET = {window.FOLLOWING_BUDGET:,}",
         f"FEEDBACK_ROOM：compress {compress.FEEDBACK_ROOM:,}，segment {segment.FEEDBACK_ROOM:,}，"
         f"extract {extract.FEEDBACK_ROOM:,}",
     ]
     documented = (
         window.window_text,
-        window.render_round_so_far,
-        window.round_entry,
+        window.render_items,
         window.render_following,
+        window.round_entry,
         extract._fitted_prompt,
     )
     return constants + [
@@ -900,7 +903,7 @@ class Job(BaseModel):
     """A node of the page's DAG: one job of the run and the record it wrote.
 
     `column` is the round it belongs to (0 before the first speech); `after`
-    lists the jobs whose output it reads. `speaker` names who made the speech an L2 or
+    lists the jobs whose output it reads. `speaker` names who made the speech a
     SEG job works from. `route` is set on an extract unit marked needs_review: the letters
     of the calls its path goes through, so the page can show the ones that were never sent;
     a letter ending in ? runs only if a model answer the unit did not get asks for it.
@@ -929,10 +932,9 @@ def run_jobs(conversation: Conversation, extract_dir: Path, stores: Stores) -> l
     `stores` starts empty and has each unit folded in, because whether a unit needs a
     call depends on the graph as it stood when the unit ran.
 
-    A speech's segments run one after another and read the round summaries of the
-    window before it; only a round with tool work has a summary, and so a job. Extract units run in a single chain. The barriers between
-    commands (all L1, then all L2, then segmentation, then extraction) are drawn by
-    the page from the stages themselves.
+    A speech's segments run one after another. Extract units run in a single chain. The
+    barrier between the commands (all L1, then the main loop) is drawn by the page from
+    the stages themselves.
     """
     items, digests = conversation.items, conversation.digests
     made: list[Job] = []
@@ -940,20 +942,12 @@ def run_jobs(conversation: Conversation, extract_dir: Path, stores: Stores) -> l
     columns: list[int] = []
     bodies: dict[str, str] = {}
     speakers: dict[str, str] = {}
-    worked: set[str] = set()
     for item in items:
         if isinstance(item, Speech):
             rounds.append(item.source.uuid)
             bodies[item.source.uuid] = item.body
             speakers[item.source.uuid] = SPEAKER_NAMES[item.speaker]
         elif isinstance(item, ToolCall):
-            opening = rounds[-1] if rounds else ""
-            if opening not in worked:
-                worked.add(opening)
-                label = bodies[opening][:40] if rounds else "首次发言之前"
-                made.append(
-                    _round_job(opening, label, len(rounds), speakers.get(opening, ""), digests)
-                )
             record = {
                 "call": _dump(digests.calls.get(item.tool_use_id)),
                 "result": _dump(digests.results.get(item.tool_use_id)),
@@ -970,9 +964,6 @@ def run_jobs(conversation: Conversation, extract_dir: Path, stores: Stores) -> l
             )
         columns.append(len(rounds))
     for n, uuid in enumerate(rounds):
-        windowed = [
-            f"round:{r}" for r in rounds[max(0, n - conversation.window_rounds) : n] if r in worked
-        ]
         previous: list[str] = []
         for part in conversation.segments.get(uuid, []):
             job_id = f"message:{uuid}:{part.start}"
@@ -982,7 +973,7 @@ def run_jobs(conversation: Conversation, extract_dir: Path, stores: Stores) -> l
                     stage="SEG",
                     label=f"{part.start}–{part.end}",
                     column=n + 1,
-                    after=windowed + previous,
+                    after=previous,
                     speaker=speakers[uuid],
                     text=bodies[uuid],
                     record=part.model_dump(mode="json"),
@@ -993,7 +984,7 @@ def run_jobs(conversation: Conversation, extract_dir: Path, stores: Stores) -> l
     compressions = load_compressions(compressions_path) if compressions_path.exists() else []
     log_path = extract_dir / "run.log"
     log = log_path.read_text(encoding="utf-8").splitlines() if log_path.exists() else []
-    steps = walk(items, conversation.segments)
+    steps = walk_so_far(items, conversation.segments, conversation.digests)
     for position, (block, step) in enumerate(zip(conversation.units, steps, strict=True)):
         index = conversation.unit_items[position]
         assignment = (
@@ -1064,18 +1055,6 @@ def _log_lines(log: Sequence[str], assignment: Assignment) -> list[str]:
     return [line for line in log if all(mark in line for mark in marks)]
 
 
-def _round_job(uuid: str, label: str, column: int, speaker: str, digests: Digests) -> Job:
-    return Job(
-        id=f"round:{uuid}",
-        stage="L2",
-        label=label,
-        column=column,
-        after=[],
-        speaker=speaker,
-        record=_dump(digests.rounds.get(uuid)),
-    )
-
-
 def _dump(model: BaseModel | None) -> Any:
     return None if model is None else model.model_dump(mode="json")
 
@@ -1101,7 +1080,7 @@ def graph_changes(run: Run, conversation: Conversation) -> list[GraphChange]:
     stores = Stores(merged_file=str(run.merged), items=conversation.items)
     before: dict[str, tuple[dict[str, Any], list[Any]]] = {}
     changes: list[GraphChange] = []
-    steps = walk(conversation.items, conversation.segments)
+    steps = walk_so_far(conversation.items, conversation.segments, conversation.digests)
     for step, record in zip(steps, conversation.assignments, strict=False):
         into_stores(stores, step, record)
         topic = record.topic
@@ -1192,7 +1171,6 @@ def build_page(run: Run, since: datetime | None, until: datetime | None) -> Page
         topics={a.topic: a.new_title for a in conversation.assignments if a.topic and a.new_title},
         files={
             "L1": str(run.digests),
-            "L2": str(run.digests),
             "SEG": str(run.segments),
             "LOOP": str(run.extract / "assignments.jsonl"),
             "inline": str(run.extract / "tool_compressions.jsonl"),
@@ -1200,7 +1178,6 @@ def build_page(run: Run, since: datetime | None, until: datetime | None) -> Page
         unplaced=[str(p) for p in unplaced],
         attempts={
             "L1": compress.MAX_ATTEMPTS,
-            "L2": compress.MAX_ATTEMPTS,
             "SEG": segment.MAX_ATTEMPTS,
             "topic": extract.T_ATTEMPTS,
             "LOOP": extract.CALL_ATTEMPTS,
@@ -1225,10 +1202,40 @@ def _check_alone(run: Run, since: datetime | None, until: datetime | None) -> No
             )
 
 
-def render(page: Page) -> str:
-    """The template with the page data inlined."""
+def render(page: Page, refresh_seconds: int | None) -> str:
+    """The template with the page data inlined; a page with `refresh_seconds` reloads itself."""
     data = page.model_dump_json().replace("</", "<\\/")
-    return TEMPLATE.read_text(encoding="utf-8").replace("/*PAGE_DATA*/null", data)
+    refresh = "null" if refresh_seconds is None else str(refresh_seconds)
+    template = TEMPLATE.read_text(encoding="utf-8")
+    return template.replace("/*PAGE_DATA*/null", data).replace("/*REFRESH_SECONDS*/null", refresh)
+
+
+def _publish(args: argparse.Namespace) -> None:
+    """Replace the page in one step, so a reload never reads a half-written file."""
+    page = build_page(parse_run(args.run.resolve()), args.since, args.until)
+    partial = args.out.with_name(f"{args.out.name}.partial")
+    partial.write_text(render(page, args.watch), encoding="utf-8")
+    partial.replace(args.out)
+    stages: dict[str, int] = defaultdict(int)
+    for call in page.calls:
+        stages[call.stage] += 1
+    print(
+        f"{len(page.calls)} calls {dict(stages)}, {len(page.unplaced)} unplaced -> {args.out}",
+        flush=True,
+    )
+
+
+def _watch(args: argparse.Namespace) -> None:
+    """Rebuild forever; a rebuild that fails leaves the last good page for the next try.
+
+    The run is still appending to its files, so the last line of one can be half written.
+    """
+    while True:
+        try:
+            _publish(args)
+        except (OSError, ValueError) as error:
+            print(f"Rebuild failed, keeping the last page: {error}", flush=True)
+        time.sleep(args.watch)
 
 
 def main() -> None:
@@ -1238,13 +1245,14 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True, help="HTML page to write")
     parser.add_argument("--since", type=_time, help="ignore transcripts before this time")
     parser.add_argument("--until", type=_time, help="ignore transcripts after this time")
+    parser.add_argument(
+        "--watch", type=int, metavar="SECONDS", help="rebuild and reload the page every SECONDS"
+    )
     args = parser.parse_args()
-    page = build_page(parse_run(args.run.resolve()), args.since, args.until)
-    args.out.write_text(render(page), encoding="utf-8")
-    stages: dict[str, int] = defaultdict(int)
-    for call in page.calls:
-        stages[call.stage] += 1
-    print(f"{len(page.calls)} calls {dict(stages)}, {len(page.unplaced)} unplaced -> {args.out}")
+    if args.watch is None:
+        _publish(args)
+    else:
+        _watch(args)
 
 
 def _time(text: str) -> datetime:

@@ -1,16 +1,13 @@
-"""Compress the tool work of a conversation in two levels.
+"""Compress each tool call and its result, before the main loop runs (level 1).
 
-Level 1 reads each tool call and its result: the call becomes its intents and what it
-acts on, the result one sentence per chunk, read against the call's intents and full
-text. The call's intents, each with evidence in the call text, are also the intents
-the main loop records for the call, so it does not ask for them again. A call and its
-result are one job; jobs read nothing of the conversation around them and run in
-parallel.
+The call becomes its intents and what it acts on, the result one sentence per chunk,
+read against the call's intents and full text. The call's intents, each with evidence
+in the call text, are also the intents the main loop records for the call, so it does
+not ask for them again. A call and its result are one job; jobs read nothing of the
+conversation around them and run in parallel.
 
-Level 2 reads the speech that opened a round and the level-1 trajectory of the
-round (intents, targets and results, in order) and writes one passage. That passage is all a window (intent_aligner.window) shows
-of the round's tools. A trajectory too long for one prompt is summarized batch by
-batch, and the batch summaries are summarized again until one passage is left.
+summarize_trajectory is what the main loop calls when a prompt would not fit: it turns
+the oldest tool records of the window into one passage (intent_aligner.window).
 
 Usage: python -m intent_aligner.compress MERGED.jsonl --backend hive
            --model deployment/pc-qwen38-np8 --out DIGESTS.jsonl
@@ -47,7 +44,6 @@ from intent_aligner.units import (
     Speech,
     ToolCall,
     UserMessage,
-    UserSignal,
     conversation_units,
 )
 from intent_aligner.window import (
@@ -58,7 +54,7 @@ from intent_aligner.window import (
     Digest,
     Digests,
     ResultDigest,
-    RoundDigest,
+    WindowError,
     load_digests,
     qwen_tokens,
 )
@@ -94,7 +90,7 @@ RESULT_SYSTEM_PROMPT = """\
 """
 
 ROUND_SYSTEM_PROMPT = """\
-你在概括 AI 助手在两次发言之间做的全部工具操作。这段概括会放进对话记录，供人判断下一次发言的意图时阅读：读的人要靠它知道 AI 这段时间在为什么事做操作、做到了哪一步、发现了什么。<发言> 是紧挨在这段操作前面的那次发言，开头注明是用户说的还是 AI 说的，太长时只保留开头，会注明；注明了“AI 工作时发出”的用户消息，AI 也可能还在接着做之前的请求。对话开头没有发言时，没有这一项。<轨迹> 按时间顺序列出每次工具调用的意图、对象和结果，或者更细的轨迹已经写成的几段概括；太长时 <轨迹> 只是其中一段，会注明是第几段，这时只概括这一段。
+你在概括 AI 助手连续做的一段工具操作。这段概括会放进对话记录，代替这些操作的逐条记录，供人判断后面的意图时阅读：读的人要靠它知道 AI 这段时间在为什么事做操作、做到了哪一步、发现了什么。<发言> 是紧挨在这段操作前面的那次发言，开头注明是用户说的还是 AI 说的，太长时只保留开头，会注明；注明了“AI 工作时发出”的用户消息，AI 也可能还在接着做之前的请求。对话开头没有发言时，没有这一项。<轨迹> 按时间顺序列出每次工具调用的意图、对象和结果，或者更细的轨迹已经写成的几段概括；太长时 <轨迹> 只是其中一段，会注明是第几段，这时只概括这一段。
 
 回答 summary：一小段话，写出 AI 在为什么事做这些操作、最后的状态和结论、还没解决的问题。只保留和最后结论直接相关的对象和数值，例如结论依据的关键数值、改动或产出的文件；单次操作的细节和其余数值归纳进主线，不逐项列出。只供 AI 自己中转的东西不写，例如后台任务 ID 和临时输出文件名。
 """
@@ -148,15 +144,13 @@ def compress_conversation(
     done: Digests,
     ask_call: Ask,
     ask_result: Ask,
-    ask_round: Ask,
     count: Count,
     workers: int,
 ) -> Iterator[Digest]:
-    """Yield the digests missing from `done`, adding them there: level 1, then level 2.
+    """Yield the digests missing from `done`, adding them there.
 
     A failed job does not stop the others, because a long run must keep what it can;
-    LLMError is raised when any level-1 job failed (before level 2, which needs them all)
-    or after the last level-2 job.
+    LLMError is raised after the last job when any failed.
     """
     results = {
         item.tool_use_id: item
@@ -173,18 +167,6 @@ def compress_conversation(
         and (item.tool_use_id not in done.calls or item.tool_use_id in pending)
     ]
     yield from _run_jobs(jobs, done, workers)
-    rejections = {
-        item.tool_use_id: item.text
-        for item in items
-        if isinstance(item, UserSignal) and item.tool_use_id is not None
-    }
-    speeches = {item.source.uuid: item for item in items if isinstance(item, Speech)}
-    round_jobs = [
-        partial(_compress_round, round_uuid, speeches.get(round_uuid), trajectory, ask_round, count)
-        for round_uuid, trajectory in _trajectories(items, done, rejections).items()
-        if round_uuid not in done.rounds
-    ]
-    yield from _run_jobs(round_jobs, done, workers)
 
 
 def _run_jobs(
@@ -260,49 +242,21 @@ def _compress_result(
     return ResultDigest(tool_use_id=call.tool_use_id, summaries=summaries)
 
 
-def _trajectories(
-    items: Sequence[Item], digests: Digests, rejections: dict[str, str]
-) -> dict[str, list[str]]:
-    """One line per tool call, grouped by the round that made it, in timeline order."""
-    trajectories: dict[str, list[str]] = {}
-    round_uuid = ""
-    for item in items:
-        if isinstance(item, Speech):
-            round_uuid = item.source.uuid
-        elif isinstance(item, ToolCall):
-            digest = digests.calls[item.tool_use_id]
-            outcome = _outcome(item.tool_use_id, digests, rejections)
-            line = f"{item.name} 意图：{digest.purpose} 对象：{digest.targets} 结果：{outcome}"
-            trajectories.setdefault(round_uuid, []).append(" ".join(line.split()))
-    return trajectories
-
-
-def _outcome(tool_use_id: str, digests: Digests, rejections: dict[str, str]) -> str:
-    if tool_use_id in digests.results:
-        return " ".join(digests.results[tool_use_id].summaries)
-    if tool_use_id in rejections:
-        return f"用户拒绝了这次调用：{rejections[tool_use_id]}"
-    return "没有返回结果"
-
-
-def _compress_round(
-    round_uuid: str, speech: Speech | None, trajectory: list[str], ask: Ask, count: Count
-) -> list[Digest]:
-    CALL_SUBJECT.set(f"round:{round_uuid}")
-    summary = summarize_trajectory(speech, trajectory, ask, count, round_uuid)
-    return [RoundDigest(round_uuid=round_uuid, summary=summary)]
-
-
 def summarize_trajectory(
     speech: Speech | None, trajectory: list[str], ask: Ask, count: Count, where: str
 ) -> str:
-    """Level 2: one passage for `trajectory`, the lines of a round's tool work so far.
+    """One passage for `trajectory`, the level-one lines of consecutive tool records.
 
-    `ask` must carry ROUND_SYSTEM_PROMPT and SUMMARY_SCHEMA; `where` names the round
-    in the error raised when the model gives no valid answer.
+    `ask` must carry ROUND_SYSTEM_PROMPT and SUMMARY_SCHEMA; `where` names the records
+    in the errors raised. Raises WindowError when the speech leaves no room for them.
     """
     head = _speech_block(speech, count)
     room = PROMPT_BUDGET - count(ROUND_SYSTEM_PROMPT) - count(head) - FEEDBACK_ROOM - LABEL_ROOM
+    if room <= 0:
+        raise WindowError(
+            f"{where}: the compression prompt has no room left for the trajectory "
+            f"({room} tokens after the system prompt and the speech)"
+        )
     lines = trajectory
     while True:
         parts = chunks("\n".join(lines), room, count)
@@ -413,10 +367,7 @@ def main() -> None:
     log = CallLog(path=args.out.parent / CALLS_FILE)
     ask_call = asker(*llm_args, CALL_SYSTEM_PROMPT, CALL_SCHEMA, args.stream, log, "call")
     ask_result = asker(*llm_args, RESULT_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream, log, "result")
-    ask_round = asker(*llm_args, ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream, log, "round")
-    digests = compress_conversation(
-        items, done, ask_call, ask_result, ask_round, qwen_tokens, args.workers
-    )
+    digests = compress_conversation(items, done, ask_call, ask_result, qwen_tokens, args.workers)
     with args.out.open("a", encoding="utf-8") as out:
         for digest in digests:
             line = DIGEST_ADAPTER.dump_json(digest).decode()

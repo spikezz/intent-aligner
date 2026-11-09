@@ -1,7 +1,8 @@
 """The conversation window an LLM call sees around the unit it judges.
 
-The tool work of a round enters the window only as that round's one digest (see
-intent_aligner.compress), so the window is mostly what the user and the AI said.
+Tool calls and results enter the window as their level-1 digests (intent_aligner.compress),
+each in its place on the timeline. When a prompt would not fit, the main loop replaces
+the oldest of them by a passage (ToolCompression), so the newer ones stay one by one.
 A round is one speech, by the user or the AI, and everything up to the next speech.
 """
 
@@ -36,10 +37,12 @@ PROMPT_BUDGET = 9_000
 # within 7% of the qwen38 server's /tokenize, which PROMPT_BUDGET's slack absorbs.
 TOKENIZER = "Qwen/Qwen3-0.6B"
 DEFAULT_WINDOW_ROUNDS = 2
-# How far call G looks past the unit it files. Both aggregates misfiled before this
-# existed were settled within two units; the limits keep room for the earlier rounds.
+# Call G alone sees what follows its unit; these bound that text.
 FOLLOWING_ITEMS = 8
 FOLLOWING_BUDGET = 3_000
+# A passage comes to 60-160 tokens (claude-87eeb4bd), so one call frees most of this;
+# a much smaller batch would call the model again at nearly every later unit.
+COMPRESSION_BATCH = 2_000
 
 Count = Callable[[str], int]
 
@@ -74,36 +77,23 @@ class ResultDigest(BaseModel):
     summaries: list[str]
 
 
-class RoundDigest(BaseModel):
-    """All tool work of one round in one passage; `round_uuid` is its opening speech."""
-
-    model_config = ConfigDict(frozen=True)
-
-    kind: Literal["round"] = "round"
-    round_uuid: str
-    summary: str
-
-
-Digest = Annotated[CallDigest | ResultDigest | RoundDigest, Field(discriminator="kind")]
+Digest = Annotated[CallDigest | ResultDigest, Field(discriminator="kind")]
 DIGEST_ADAPTER: TypeAdapter[Digest] = TypeAdapter(Digest)
 
 
 @attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
 class Digests:
-    """The digests of one conversation; calls and results by tool_use_id, rounds by round_uuid."""
+    """The level-1 digests of one conversation, by tool_use_id."""
 
     calls: dict[str, CallDigest] = attrs.field(factory=dict)
     results: dict[str, ResultDigest] = attrs.field(factory=dict)
-    rounds: dict[str, RoundDigest] = attrs.field(factory=dict)
 
     def add(self, digest: Digest) -> None:
         """File `digest` under its kind."""
         if isinstance(digest, CallDigest):
             self.calls[digest.tool_use_id] = digest
-        elif isinstance(digest, ResultDigest):
-            self.results[digest.tool_use_id] = digest
         else:
-            self.rounds[digest.round_uuid] = digest
+            self.results[digest.tool_use_id] = digest
 
 
 def window_rounds(text: str) -> int:
@@ -136,73 +126,51 @@ def qwen_tokens(text: str) -> int:
     return len(_tokenizer().encode(text).ids)
 
 
-def render_items(items: Sequence[Item], digests: Digests) -> str:
-    """The items as window text; a round's tool work appears once, at its first tool call.
-
-    A tool result can land in a later round than its call (a message queued while
-    the call ran); it is part of its call's round, so results never open an entry.
-    Raises ValueError when a round with tool calls has no digest.
-    """
-    entries: list[str] = []
-    round_uuid = ""
-    round_shown = False
-    for item in items:
-        if isinstance(item, Speech):
-            round_uuid, round_shown = item.source.uuid, False
-        if isinstance(item, ToolCall):
-            if not round_shown:
-                entries.append(f"【AI 的工具操作】\n{_round_summary(digests, round_uuid)}")
-                round_shown = True
-        elif not _is_tool_result(item):
-            entries.append(_plain_entry(item))
-    return "\n\n".join(entries)
-
-
 class ToolCompression(BaseModel):
-    """The tool calls and results among items[begin:through] of a round, as one level-2 passage.
+    """The tool calls and results among items[begin:through], as one passage.
 
-    `start` is the timeline index where the round's items begin. A round can be
-    compressed several times; each compression covers the records after the one
-    before it, and every passage stays in the window.
+    Each passage covers records no earlier passage covers, and stays in the window.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    start: int
     begin: int
     through: int
     summary: str
 
 
-def render_round_so_far(
+def covering(position: int, compressions: Sequence[ToolCompression]) -> ToolCompression | None:
+    """The passage whose range holds the timeline index `position`."""
+    return next((c for c in compressions if c.begin <= position < c.through), None)
+
+
+def render_items(
     items: Sequence[Item],
     low: int,
     index: int,
     digests: Digests,
     compressions: Sequence[ToolCompression],
 ) -> str:
-    """The current round items[low:index], each tool call and result as its level-1 digest.
+    """items[low:index] as window text, each tool call and result as its level-1 digest.
 
-    The round digest is not used here because it tells how the whole round ended,
-    which the unit in hand must not see yet. The tool records a compression covers
-    are replaced by its passage, put where the first of them was; everything else
-    keeps its place.
+    The tool records a compression covers are replaced by its passage, put where the
+    first of them shows; everything else keeps its place.
     """
     entries: list[str] = []
     placed: set[int] = set()
     for position in range(low, index):
         item = items[position]
-        covering = next((c for c in compressions if c.begin <= position < c.through), None)
-        if covering is None or not is_tool_record(item):
+        passage = covering(position, compressions)
+        if passage is None or not is_tool_record(item):
             entries.append(round_entry(item, digests))
-        elif covering.begin not in placed:
-            entries.append(f"【AI 此前的工具操作（已压缩）】\n{covering.summary}")
-            placed.add(covering.begin)
+        elif passage.begin not in placed:
+            entries.append(f"【AI 此前的工具操作（已压缩）】\n{passage.summary}")
+            placed.add(passage.begin)
     return "\n\n".join(entries)
 
 
 def round_entry(item: Item, digests: Digests) -> str:
-    """One item of the current round: a tool call or result as its level-1 digest, the rest verbatim."""
+    """One item of the window: a tool call or result as its level-1 digest, the rest verbatim."""
     if isinstance(item, ToolCall):
         call = digests.calls[item.tool_use_id]
         return f"【AI 的工具调用】\n{item.name} 意图：{call.purpose} 对象：{call.targets}"
@@ -250,31 +218,28 @@ def _plain_entry(item: Item) -> str:
     return f"【{label}】\n{item.text}"
 
 
-def _round_summary(digests: Digests, round_uuid: str) -> str:
-    if round_uuid not in digests.rounds:
-        raise ValueError(
-            f"No digest for round {round_uuid!r}; run intent_aligner.compress on this "
-            "conversation first."
-        )
-    return digests.rounds[round_uuid].summary
+def window_start(items: Sequence[Item], low: int, rounds: int) -> int:
+    """Where a window opens that holds `rounds` rounds before items[low]; 0 when fewer exist."""
+    starts = [i for i in range(low) if isinstance(items[i], Speech)]
+    return starts[-rounds] if len(starts) >= rounds else 0
 
 
 def window_text(
-    items: Sequence[Item], index: int, digests: Digests, room: int, count: Count, rounds: int
+    items: Sequence[Item],
+    low: int,
+    index: int,
+    digests: Digests,
+    compressions: Sequence[ToolCompression],
+    room: int,
+    count: Count,
+    rounds: int,
 ) -> str:
-    """The `rounds` rounds before the speech items[index], within `room` tokens.
-
-    One round fewer is tried until the text fits; raises WindowError when even one
-    round does not.
-    """
-    starts = [i for i in range(index) if isinstance(items[i], Speech)]
-    text = ""
-    for taken in range(rounds, 0, -1):
-        low = starts[-taken] if len(starts) >= taken else 0
-        text = render_items(items[low:index], digests)
-        if count(text) <= room:
-            return text
-    raise WindowError(
-        f"The 1-round window before item {index} ({items[index].source.uuid}) "
-        f"needs {count(text):,} tokens but only {room:,} are left; mark it needs_review."
-    )
+    """`rounds` rounds before items[low], then items[low:index]; WindowError over `room` tokens."""
+    start = window_start(items, low, rounds)
+    text = render_items(items, start, index, digests, compressions)
+    if count(text) > room:
+        raise WindowError(
+            f"The {rounds}-round window before item {index} ({items[index].source.uuid}) "
+            f"needs {count(text):,} tokens but only {room:,} are left; mark it needs_review."
+        )
+    return text

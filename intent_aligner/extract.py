@@ -17,17 +17,17 @@ node of the call's aggregate, one node per aggregate. Any other observation that
 satisfies nor blocks an intent stays pending, a candidate for a later triggers edge, and
 gets a node only if call C picks it.
 
-The current round enters the window as level-1 digests, one per tool call and result.
-Call G alone also sees what follows its unit (window.render_following), because an
-aggregate names what a run of operations adds up to. When the prompt would not fit the budget even with one earlier round, the
-round's tool records not yet compressed become one more level-2 passage, which stands
-in for them from then on; the passages of earlier compressions stay as they are.
+Tool work enters the window as level-1 digests, one per tool call and result. When a
+prompt would not fit, the oldest tool records of the window become one passage, batch by
+batch until it fits, so the newer records stay one by one. Call G alone also sees what
+follows its unit (window.render_following), because an aggregate names what a run of
+operations adds up to.
 
 A run writes these files under --out:
 
     assignments.jsonl      one line per unit in pointer order: its topic and its intents
                            with their ids; a rerun resumes after the last line
-    tool_compressions.jsonl  one line per compression of a current round's tool records
+    tool_compressions.jsonl  one line per passage that replaced tool records of the window
     topics.yaml            the topic list (format in docs/trajectory-extractor.md)
     topics/<id>.yaml       one store per topic; topics/unassigned.yaml for units without one
     run.log                new topics, intentless speeches and needs_review units
@@ -38,7 +38,8 @@ what the models decided, so they always agree with it.
 Usage: python -m intent_aligner.extract MERGED.jsonl --digests DIGESTS.jsonl
            --segments SEGMENTS.jsonl --backend codex --model gpt-6.1-sol
            [--window-rounds 2] --out DIR
-The digests and segments must cover the whole conversation.
+The digests (intent_aligner.compress) must cover the whole conversation. The main loop
+cuts each speech when it reaches it, with the graphs built so far, and appends to --segments.
 """
 
 from __future__ import annotations
@@ -54,7 +55,11 @@ import attrs
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from intent_aligner.compress import ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA, summarize_trajectory
+from intent_aligner.compress import (
+    ROUND_SYSTEM_PROMPT,
+    SUMMARY_SCHEMA,
+    summarize_trajectory,
+)
 from intent_aligner.intent import INTENT_SCHEMA, Intent, is_excerpt, stray_evidence
 from intent_aligner.llm import (
     CALL_SUBJECT,
@@ -65,7 +70,19 @@ from intent_aligner.llm import (
     TruncatedReply,
     asker,
 )
-from intent_aligner.segment import MessageSegments, Segment
+from intent_aligner.segment import (
+    SCHEMA as SEGMENT_SCHEMA,
+)
+from intent_aligner.segment import (
+    SYSTEM_PROMPT as SEGMENT_SYSTEM_PROMPT,
+)
+from intent_aligner.segment import (
+    MessageSegments,
+    Segment,
+    message_window,
+    next_segment,
+    review_segment,
+)
 from intent_aligner.store import (
     STORE_HEADER,
     AggregateNode,
@@ -90,19 +107,21 @@ from intent_aligner.units import (
     conversation_units,
 )
 from intent_aligner.window import (
+    COMPRESSION_BATCH,
     DEFAULT_WINDOW_ROUNDS,
     PROMPT_BUDGET,
     Count,
     Digests,
     ToolCompression,
     WindowError,
+    covering,
     is_tool_record,
     load_digests,
     qwen_tokens,
     render_following,
-    render_round_so_far,
     round_entry,
     window_rounds,
+    window_start,
     window_text,
 )
 
@@ -115,14 +134,14 @@ NEW = "NEW"
 T_SYSTEM_PROMPT = """\
 你在判断对话里的一个单元属于哪个 topic。topic 是对话里一件独立的事情：一个 session 里可以穿插几件互不相干的事，一件事也可以延续好几个 session。
 
-<header> 是结构化的信息：topics 是已经登记的 topic 列表（编号和标题）；unit 是当前单元的类型、发出者和时间，发言段落还有它在发言正文里的字符区间 chars；当前单元是工具调用时，round_topic_hint 是这一轮前一个工具调用的 topic，AI 在一轮里通常做同一件事，但它只是参考。
+<header> 是结构化的信息：topics 是已经登记的 topic 列表（编号和标题）；graphs 是每个 topic 的意图图谱，键是 topic 编号，nodes 是已经登记的意图、聚合和观测，edges 是它们之间的依赖；unit 是当前单元的类型、发出者和时间，发言段落还有它在发言正文里的字符区间 chars。
 
 <此前的对话> 是当前单元之前的对话。更早的轮次里，AI 的工具操作压成了每轮一段概括（【AI 的工具操作】）；当前这一轮已经发生的工具调用和工具结果逐条列出，每条是一句概括（【AI 的工具调用】【工具结果】）。
 
 <当前单元> 是要判断的单元。发言段落给出整次发言，用 <当前段落> 和 </当前段落> 标出要判断的那一段；工具调用给出它的意图和操作对象的概括。
 
 回答两项：
-- topic：当前单元做的事属于哪个已有 topic，就回答它的编号；和已有的 topic 都不是同一件事时，回答 NEW。
+- topic：当前单元在继续、执行或支撑某个 topic 图谱里的意图时，回答这个 topic 的编号；和已有 topic 的图谱都接不上时，回答 NEW。
 - title：topic 为 NEW 时，写新 topic 的标题，一句完整的话，写清楚这件事是什么；topic 不是 NEW 时为空字符串。
 """
 
@@ -176,8 +195,8 @@ G_SYSTEM_PROMPT = """\
 <此前的对话> 是这个工具调用之前的对话。<当前单元> 是这个工具调用的意图和操作对象的概括。<本单元的意图> 按顺序列出这个调用的每个底层意图：编号、文本和原文依据。<此后的对话> 是这个工具调用之后接着发生的事，用来看清这个操作最终是为了做成什么；要回答的只有 <本单元的意图> 里的意图。
 
 按 <本单元的意图> 的顺序，每个底层意图回答一项：
-- aggregate：这个操作是在继续某个已有聚合做的事时，回答那个聚合的编号；它在做一件已有聚合都没有覆盖的事时，回答 NEW。一个聚合对应用户会用一句话提出的一件事，也就是要做成的一样东西：为做成同一样东西进行的准备、编写、提交、运行和检查结果，都属于同一个聚合。比如写任务分发脚本、提交小规模测试、查看测试输出，合起来是“跑通关键帧生成流程”这一个聚合。换一个文件、换一条命令、换到下一个步骤，只要还在做成同一样东西，就继续用同一个聚合。
-- title：aggregate 是 NEW 时，写这个聚合的标准文本：一句完整的话，说明这一串操作最终要做成什么，要涵盖 <此后的对话> 里为做成同一样东西继续进行的操作，比如先检查依赖、再安装、再运行分析，标题写“完成歌曲结构分析”；<此后的对话> 里开始做成另一样东西的操作不算在内。标题要脱离对话也能看懂，只写要做成的目标，类名、参数名、文件名、行号和命令都留在底层意图里。aggregate 是已有编号时写空字符串。同一个调用里多个底层意图做的是同一件新事时，title 写成完全相同的文本，它们会归入同一个新聚合。
+- aggregate：这个操作是在继续某个已有聚合做的事时，回答那个聚合的编号；它在做一件已有聚合都没有覆盖的事时，回答 NEW。一个聚合是 current_topic 里的一段工具操作，范围比 topic 小。比如写任务分发脚本、提交小规模测试、查看测试输出，合起来是“跑通关键帧生成流程”这一个聚合。
+- title：aggregate 是 NEW 时，写这个聚合的标准文本：一句完整的话，说明这一串操作最终要做成什么，要涵盖 <此后的对话> 里为做成同一样东西继续进行的操作，比如先检查依赖、再安装、再运行分析，标题写“完成歌曲结构分析”；<此后的对话> 里开始做成另一样东西的操作不算在内。这个聚合不能涵盖 current_topic 的全部操作，能涵盖就说明粒度太粗。标题要脱离对话也能看懂，只写要做成的目标，类名、参数名、文件名、行号和命令都留在底层意图里。aggregate 是已有编号时写空字符串。同一个调用里多个底层意图做的是同一件新事时，title 写成完全相同的文本，它们会归入同一个新聚合。
 """
 
 L_SYSTEM_PROMPT = """\
@@ -539,7 +558,7 @@ class _DAnswer(BaseModel):
 
 @attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
 class Asks:
-    """The model behind each call; `round` must carry the level-2 prompt of intent_aligner.compress."""
+    """The model behind each call; `round` must carry compress.ROUND_SYSTEM_PROMPT."""
 
     topic: Ask
     signal: Ask
@@ -551,6 +570,7 @@ class Asks:
     outcome_summary: Ask
     outcome_update: Ask
     round: Ask
+    segment: Ask
 
 
 @attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
@@ -581,6 +601,26 @@ def walk(items: Sequence[Item], segments: dict[str, list[Segment]]) -> Iterator[
                 yield _Step(unit=unit, index=index, round_start=round_start)
         else:
             yield _Step(unit=item, index=index, round_start=round_start)
+
+
+def walk_so_far(
+    items: Sequence[Item], segments: dict[str, list[Segment]], digests: Digests
+) -> list[_Step]:
+    """The units a run has reached: those before the first one still lacking its segments or digest."""
+    reached: list[Item] = []
+    for item in items:
+        if isinstance(item, Speech) and item.source.uuid not in segments:
+            break
+        if isinstance(item, ToolCall) and item.tool_use_id not in digests.calls:
+            break
+        if (
+            isinstance(item, Observation)
+            and item.tool_use_id is not None
+            and item.tool_use_id not in digests.results
+        ):
+            break
+        reached.append(item)
+    return list(walk(reached, segments))
 
 
 def unit_ref(unit: Unit) -> UnitRef:
@@ -618,25 +658,31 @@ def extract_units(
     count: Count,
     stores: Stores,
     window_rounds: int,
-) -> Iterator[Assignment | ToolCompression]:
-    """Yield a record for every unit after the `done` ones, and each new compression.
+) -> Iterator[Assignment | ToolCompression | MessageSegments]:
+    """Yield a record for every unit after the `done` ones, and what was made on the way.
 
-    The units run one at a time because each call sees the topics and intents
-    registered before it. `stores` takes every record, the `done` ones replayed
-    first, so it holds the stores as of the last record yielded. A compression is
-    yielded before the record whose prompt needed it.
+    The units run one at a time because each call sees the graphs built before it, so
+    a speech is cut right before its segments run: every segment missing from
+    `segments` is yielded when made, and added to it. `stores` takes every record, the
+    `done` ones replayed first, so it holds the stores as of the last record yielded. A
+    compression is yielded before the record whose prompt needed it.
     Raises ValueError when `done` no longer lines up with the conversation's units.
     """
-    compressions: dict[int, list[ToolCompression]] = {}
-    for earlier in compressed:
-        compressions.setdefault(earlier.start, []).append(earlier)
+    compressions = list(compressed)
     topics = [(a.topic, a.new_title) for a in done if a.topic and a.new_title]
     context = _Context(
-        items=items, digests=digests, topics=topics, count=count, window_rounds=window_rounds
+        items=items,
+        digests=digests,
+        topics=topics,
+        count=count,
+        window_rounds=window_rounds,
+        stores=stores,
     )
     call_topics: dict[str, str | None] = {}
-    round_hint: str | None = None
-    for position, step in enumerate(walk(items, segments)):
+    position = 0
+
+    def process(step: _Step) -> Iterator[Assignment | ToolCompression]:
+        nonlocal position
         ref = unit_ref(step.unit)
         if position < len(done):
             record = done[position]
@@ -647,10 +693,9 @@ def extract_units(
                 )
             into_stores(stores, step, record)
         else:
+            window = _Round(in_force=compressions, ask=asks.round)
             CALL_SUBJECT.set(f"unit:{position}")
-            hint = round_hint if isinstance(step.unit, ToolCall) else None
-            window = _Round(in_force=compressions.setdefault(_round_low(step), []), ask=asks.round)
-            record = _assign(step, ref, context, hint, window, call_topics, asks.topic)
+            record = _assign(step, ref, context, window, call_topics, asks.topic)
             if record.new_title is not None:
                 assert record.topic is not None
                 topics.append((record.topic, record.new_title))
@@ -663,22 +708,99 @@ def extract_units(
             into_stores(stores, step, record)
             yield from window.fresh
             yield record
-        if isinstance(step.unit, SpeechSegment):
-            round_hint = None
-        elif isinstance(step.unit, ToolCall):
+        if isinstance(step.unit, ToolCall):
             call_topics[step.unit.tool_use_id] = record.topic
-            round_hint = record.topic
+        position += 1
+
+    round_start: int | None = None
+    for index, item in enumerate(items):
+        if isinstance(item, Speech):
+            round_start = index
+            for made in _speech_segments(index, item, segments, compressions, context, asks):
+                if isinstance(made, Segment):
+                    unit = SpeechSegment(speech=item, segment=made)
+                    yield from process(_Step(unit=unit, index=index, round_start=round_start))
+                else:
+                    yield made
+        else:
+            yield from process(_Step(unit=item, index=index, round_start=round_start))
+
+
+def _graphs(stores: Stores) -> dict[str, object]:
+    return {
+        topic: graph_with_status(store.meta.graph)
+        for topic, store in stores.stores.items()
+        if topic is not None
+    }
+
+
+def _graphs_block(stores: Stores) -> str:
+    """The header of segmentation, which runs before a topic is known."""
+    header = {"graphs": _graphs(stores)}
+    return f"<header>\n{json.dumps(header, ensure_ascii=False, indent=2)}\n</header>"
+
+
+def _speech_segments(
+    index: int,
+    speech: Speech,
+    segments: dict[str, list[Segment]],
+    compressions: list[ToolCompression],
+    context: _Context,
+    asks: Asks,
+) -> Iterator[Segment | MessageSegments | ToolCompression]:
+    """The segments of `speech` in order, each made only when the one before has been processed."""
+    uuid, body = speech.source.uuid, speech.body
+    if uuid not in segments and not body:
+        segments[uuid] = []
+        yield MessageSegments(uuid=uuid, segments=[])
+        return
+    known = segments.get(uuid)
+    yielded = 0
+    while True:
+        if known is not None and yielded < len(known):
+            segment = known[yielded]
+        elif known is not None and (not known or known[-1].end >= len(body)):
+            return
+        else:
+            window = _Round(in_force=compressions, ask=asks.round)
+            start = 0 if known is None else known[-1].end
+            segment = _make_segment(index, speech, start, context, window, asks.segment)
+            yield from window.fresh
+            known = segments.setdefault(uuid, [])
+            known.append(segment)
+            yield MessageSegments(uuid=uuid, segments=[segment])
+        yield segment
+        yielded += 1
+
+
+def _make_segment(
+    index: int, speech: Speech, start: int, context: _Context, window: _Round, ask: Ask
+) -> Segment:
+    CALL_SUBJECT.set(f"message:{speech.source.uuid}")
+
+    def fitted(rounds: int) -> str:
+        return message_window(
+            context.items, index, context.digests, window.in_force, context.count, rounds
+        )
+
+    try:
+        text = _within_budget(index, index, context, window, fitted)
+    except WindowError as error:
+        print(f"needs_review: {error}", file=sys.stderr, flush=True)
+        return review_segment(speech, start, 0)
+    return next_segment(_graphs_block(context.stores), text, speech, start, ask)
 
 
 @attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
 class _Context:
-    """What every prompt of one run is built from; `topics` grows as topics open."""
+    """What every prompt of one run is built from; `topics` and `stores` grow as units run."""
 
     items: Sequence[Item]
     digests: Digests
     topics: Sequence[tuple[str, str]]
     count: Count
     window_rounds: int
+    stores: Stores
 
 
 def _round_low(step: _Step) -> int:
@@ -690,10 +812,10 @@ def _round_low(step: _Step) -> int:
 
 @attrs.define(slots=True, kw_only=True)
 class _Round:
-    """The compressions of the round shown before one unit; `fresh` are the ones made for it.
+    """The passages in force around one unit; `fresh` are the ones made for it.
 
-    `in_force` is the run's own list for the round, so a compression made for one
-    call of a unit is in force for its later calls and for the units after it.
+    `in_force` is the run's own list, so a passage made for one call of a unit is in
+    force for its later calls and for the units after it.
     """
 
     in_force: list[ToolCompression]
@@ -701,46 +823,87 @@ class _Round:
     fresh: list[ToolCompression] = attrs.field(factory=list)
 
 
+def _within_budget(
+    low: int, index: int, context: _Context, window: _Round, attempt: Callable[[int], str]
+) -> str:
+    """`attempt(rounds)`, compressing the oldest tool records until it fits.
+
+    A round is given up only when no tool record is left to compress, because dropping
+    it loses what was said as well. Raises WindowError when one round does not fit.
+    """
+    rounds = context.window_rounds
+    while True:
+        try:
+            return attempt(rounds)
+        except WindowError:
+            if _compress_oldest(low, index, rounds, context, window):
+                continue
+            if rounds == 1:
+                raise
+            rounds -= 1
+
+
+def _compress_oldest(low: int, index: int, rounds: int, context: _Context, window: _Round) -> bool:
+    """Turn the oldest tool records of the window into one passage; False when none are left.
+
+    A batch stays inside one round, because its passage is written against that round's
+    speech.
+    """
+    items, digests, count = context.items, context.digests, context.count
+    batch: list[int] = []
+    used = 0
+    for position in range(window_start(items, low, rounds), index):
+        item = items[position]
+        if isinstance(item, Speech) and batch:
+            break
+        if is_tool_record(item) and covering(position, window.in_force) is None:
+            batch.append(position)
+            used += count(round_entry(item, digests))
+            if used >= COMPRESSION_BATCH:
+                break
+    if not batch:
+        return False
+    lines = [" ".join(round_entry(items[position], digests).split()) for position in batch]
+    speeches = [item for item in items[: batch[0]] if isinstance(item, Speech)]
+    summary = summarize_trajectory(
+        speeches[-1] if speeches else None,
+        lines,
+        window.ask,
+        count,
+        f"items {batch[0]} to {batch[-1]}",
+    )
+    compression = ToolCompression(begin=batch[0], through=batch[-1] + 1, summary=summary)
+    window.in_force.append(compression)
+    window.fresh.append(compression)
+    return True
+
+
 def _fitted_prompt(
     step: _Step,
     context: _Context,
     system: str,
-    head: str | Callable[[], str],
+    head: str,
     window: _Round,
     tail: str = "",
+    *,
+    uncharged: int = 0,
 ) -> str:
-    """The prompt of one call, compressing the round first when it would not fit otherwise.
+    """The prompt of one call, compressing tool records first when it would not fit otherwise.
 
-    The detector is the prompt itself: with one earlier round, it must fit the budget.
     A tool result calls nothing, so the records it adds are checked at the next unit
     that does. Raises WindowError when the prompt does not fit even after compressing.
-    `head` is a callable when what it lists depends on the compressions in force.
     """
-    try:
-        return _prompt(step, context, system, head, window.in_force, tail)
-    except WindowError:
-        low = _round_low(step)
-        begin = window.in_force[-1].through if window.in_force else low
-        pending = [item for item in context.items[begin : step.index] if is_tool_record(item)]
-        if not pending:
-            raise
-    lines = [" ".join(round_entry(item, context.digests).split()) for item in pending]
-    opening = context.items[low]
-    speech = opening if isinstance(opening, Speech) else None
-    summary = summarize_trajectory(
-        speech, lines, window.ask, context.count, f"round at item {low} up to item {step.index}"
-    )
-    compression = ToolCompression(start=low, begin=begin, through=step.index, summary=summary)
-    window.in_force.append(compression)
-    window.fresh.append(compression)
-    return _prompt(step, context, system, head, window.in_force, tail)
+
+    def fitted(rounds: int) -> str:
+        return _prompt(step, context, system, head, window.in_force, tail, uncharged, rounds)
+
+    return _within_budget(_round_low(step), step.index, context, window, fitted)
 
 
 def _assign(
     step: _Step,
     ref: UnitRef,
     context: _Context,
-    hint: str | None,
     window: _Round,
     call_topics: dict[str, str | None],
     ask: Ask,
@@ -748,9 +911,10 @@ def _assign(
     unit = step.unit
     if isinstance(unit, Observation) and unit.tool_use_id is not None:
         return Assignment(unit=ref, topic=call_topics[unit.tool_use_id], attempts=0)
-    head = _header(unit, context.topics, {"round_topic_hint": hint})
+    head = _header(unit, context.topics, {"graphs": _graphs(context.stores)})
+    uncharged = context.count(head) - context.count(_header(unit, context.topics, {}))
     try:
-        prompt = _fitted_prompt(step, context, T_SYSTEM_PROMPT, head, window)
+        prompt = _fitted_prompt(step, context, T_SYSTEM_PROMPT, head, window, uncharged=uncharged)
     except WindowError as error:
         return Assignment(
             unit=ref, topic=None, needs_review=True, review_reason=str(error), attempts=0
@@ -1074,24 +1238,19 @@ def _actor(unit: Unit) -> Literal["user", "ai"]:
 
 
 def _visible_pending(
-    step: _Step, topic: str, in_force: Sequence[ToolCompression], context: _Context, stores: Stores
+    step: _Step, topic: str, context: _Context, stores: Stores
 ) -> dict[str, PendingObservation]:
-    """The pending observations of `topic` the window shows one by one, keyed by call C's handle.
+    """The pending observations of `topic` the window shows, keyed by call C's handle.
 
     Only pushed observations wait here, because a tool result lives on its aggregate's node.
-    One leaves when it is compressed away or falls outside the window's rounds.
+    One leaves when it falls outside the window's rounds.
     """
-    low = _round_low(step)
-    compressed_up_to = in_force[-1].through if in_force else low
-    opened = [i for i in range(low) if isinstance(context.items[i], Speech)]
-    earliest = opened[-context.window_rounds :][0] if opened else low
-    shown: dict[str, PendingObservation] = {}
-    for index, pending in stores.pending.items():
-        in_current = compressed_up_to <= index < step.index
-        raw_earlier = earliest <= index < low
-        if pending.topic == topic and (in_current or raw_earlier):
-            shown[f"P{index}"] = pending
-    return shown
+    earliest = window_start(context.items, _round_low(step), context.window_rounds)
+    return {
+        f"P{index}": pending
+        for index, pending in stores.pending.items()
+        if pending.topic == topic and earliest <= index < step.index
+    }
 
 
 def _unit_nodes(record: Assignment, topic: str, stores: Stores) -> dict[str, dict[str, str]]:
@@ -1132,20 +1291,17 @@ def _relate(
         for name, (start, end, meaning) in _C_RELATIONS.items()
     ]
 
-    def head() -> str:
-        visible = _visible_pending(step, topic, window.in_force, context, stores)
-        offered = [{"id": handle, "text": p.text} for handle, p in visible.items()]
-        more: dict[str, object] = {
-            "relations": relations,
-            "unit_intents": list(unit_nodes.values()),
-        }
-        return _graph_header(step, context, topic, stores, [*known, *offered], more)
-
+    pending = _visible_pending(step, topic, context, stores)
+    offered = [{"id": handle, "text": p.text} for handle, p in pending.items()]
+    more: dict[str, object] = {
+        "relations": relations,
+        "unit_intents": list(unit_nodes.values()),
+    }
+    head = _graph_header(step, context, topic, stores, [*known, *offered], more)
     try:
         prompt = _fitted_prompt(step, context, C_SYSTEM_PROMPT, head, window)
     except WindowError as error:
         return _review(record, str(error))
-    pending = _visible_pending(step, topic, window.in_force, context, stores)
     own_aggregate = {
         i: node.aggregate for i, node in known.items() if isinstance(node, AggregateObservationNode)
     }
@@ -1216,10 +1372,18 @@ def _parse_outcomes(reply: str, candidates: Sequence[str], needs_summary: bool) 
     return answer
 
 
-def _outcome_edges(node_id: str, answer: _DAnswer, evidence: str) -> list[Edge]:
+def _outcome_edges(
+    node_id: str, answer: _DAnswer, evidence: str, earlier: dict[tuple[str, str], str]
+) -> list[Edge]:
+    """Edges of the answer; one `earlier` already holds keeps the evidence it was first given."""
     return [
         Edge.model_validate(
-            {"from": node_id, "to": o.target, "relation": o.relation, "evidence": evidence}
+            {
+                "from": node_id,
+                "to": o.target,
+                "relation": o.relation,
+                "evidence": earlier.get((o.target, o.relation), evidence),
+            }
         )
         for o in answer.outcomes
     ]
@@ -1301,7 +1465,7 @@ def _observe(
             return record.model_copy(update={"pending_text": text})
         node_id = stores.next_observation_id()
         built = NewObservation(id=node_id, item=step.index, label=text, source=source)
-        edges = _outcome_edges(node_id, judged, unit.source.uuid)
+        edges = _outcome_edges(node_id, judged, unit.source.uuid, {})
         return record.model_copy(update={"edges": edges, "observations": [built]})
 
     if not aggregates:
@@ -1325,7 +1489,12 @@ def _observe(
         node_id = existing or stores.next_observation_id(opened)
         opened += existing is None
         updated.append(NewAggregateObservation(id=node_id, aggregate=aggregate, label=label))
-        all_edges.extend(_outcome_edges(node_id, judged, unit.tool_use_id))
+        earlier: dict[tuple[str, str], str] = {
+            (e.to, e.relation): e.evidence
+            for e in stores.stores[topic].meta.graph.edges
+            if e.from_ == node_id
+        }
+        all_edges.extend(_outcome_edges(node_id, judged, unit.tool_use_id, earlier))
     return record.model_copy(update={"edges": all_edges, "aggregate_observations": updated})
 
 
@@ -1427,37 +1596,26 @@ def _prompt(
     step: _Step,
     context: _Context,
     system: str,
-    head: str | Callable[[], str],
+    head: str,
     in_force: Sequence[ToolCompression],
     tail: str,
+    uncharged: int,
+    rounds: int,
 ) -> str:
-    """The prompt of one call for `step`; raises WindowError when even one earlier round does not fit.
+    """The prompt of one call for `step`; raises WindowError when the window does not fit.
 
-    The window is the earlier rounds (as in segmentation) followed by the current
-    round up to this unit, so the unit sees what led to it but not how the round ended.
-    `tail` follows the current unit; `system` only counts against the budget.
+    The window ends right before this unit, so the unit sees what led to it but not how
+    its round ended. `tail` follows the current unit; `system` only counts against the
+    budget, and `uncharged` tokens of the head (the graphs) do not.
     """
     items, digests, count = context.items, context.digests, context.count
-    round_start = step.round_start
-    head = head() if callable(head) else head
-    low = _round_low(step)
-    so_far = render_round_so_far(items, low, step.index, digests, in_force)
     current = f"<当前单元>\n{render_unit(step.unit, digests)}\n</当前单元>"
     if tail:
         current = f"{current}\n\n{tail}"
-    rest = count(system) + count(head) + count(so_far) + count(current)
-    room = PROMPT_BUDGET - rest - FEEDBACK_ROOM
-    if room < 0:
-        raise WindowError(
-            f"The current round up to item {step.index} ({items[step.index].source.uuid}) "
-            f"needs {-room:,} tokens more than the budget; mark it needs_review."
-        )
-    earlier = (
-        ""
-        if round_start is None
-        else window_text(items, round_start, digests, room, count, context.window_rounds)
+    room = PROMPT_BUDGET - count(system) - count(head) + uncharged - count(current) - FEEDBACK_ROOM
+    window = window_text(
+        items, _round_low(step), step.index, digests, in_force, room, count, rounds
     )
-    window = "\n\n".join(part for part in (earlier, so_far) if part)
     return f"{head}\n\n<此前的对话>\n{window}\n</此前的对话>\n\n{current}"
 
 
@@ -1527,10 +1685,14 @@ def load_compressions(path: Path) -> list[ToolCompression]:
 
 
 def load_segments(path: Path) -> dict[str, list[Segment]]:
-    """The segments file of intent_aligner.segment, by message uuid."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    parsed = [MessageSegments.model_validate_json(line) for line in lines]
-    return {message.uuid: message.segments for message in parsed}
+    """The segments file, by speech uuid; a speech can span lines, or have none yet."""
+    segments: dict[str, list[Segment]] = {}
+    if not path.exists():
+        return segments
+    for line in path.read_text(encoding="utf-8").splitlines():
+        message = MessageSegments.model_validate_json(line)
+        segments.setdefault(message.uuid, []).extend(message.segments)
+    return segments
 
 
 def log_lines(assignment: Assignment) -> list[str]:
@@ -1582,6 +1744,7 @@ def main() -> None:
         )
 
     asks = Asks(
+        segment=ask("segment", SEGMENT_SYSTEM_PROMPT, SEGMENT_SCHEMA),
         topic=ask("topic", T_SYSTEM_PROMPT, T_SCHEMA),
         signal=ask("signal", A_SYSTEM_PROMPT, A_SCHEMA),
         registry=ask("registry", B_SYSTEM_PROMPT, B_SCHEMA),
@@ -1610,13 +1773,18 @@ def main() -> None:
         assignments_path.open("a", encoding="utf-8") as out,
         compressions_path.open("a", encoding="utf-8") as compressions,
         (args.out / "run.log").open("a", encoding="utf-8") as log,
+        args.segments.open("a", encoding="utf-8") as segment_file,
     ):
         for assignment in results:
+            if isinstance(assignment, MessageSegments):
+                segment_file.write(assignment.model_dump_json() + "\n")
+                segment_file.flush()
+                continue
             if isinstance(assignment, ToolCompression):
                 compressions.write(assignment.model_dump_json() + "\n")
                 compressions.flush()
                 print(
-                    f"compressed the tool records of items {assignment.start}-"
+                    f"compressed the tool records of items {assignment.begin}-"
                     f"{assignment.through - 1}",
                     flush=True,
                 )

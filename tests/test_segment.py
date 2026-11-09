@@ -13,14 +13,11 @@ from intent_aligner import segment
 from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, LLMError, TruncatedReply
 from intent_aligner.segment import (
     AnchorError,
-    MessageSegments,
+    Segment,
     locate_end,
-    segment_conversation,
-    segment_message,
+    next_segment,
 )
 from intent_aligner.units import Source, UserMessage
-from intent_aligner.window import Count
-from tests.test_window import DIGESTS, TIMELINE
 
 # The opening of the playground message (c88f10d9) and its hand-cut boundaries 0, 67, 88.
 BODY = (
@@ -99,6 +96,14 @@ def _answer(end: str, evidence: str | None = None, *, explicit: bool = True, not
     return json.dumps({"intents": [intent], "segment_end": end}, ensure_ascii=False)
 
 
+def segment_message(window: str, message: UserMessage, ask: Ask) -> list[Segment]:
+    segments: list[Segment] = []
+    while not segments or segments[-1].end < len(message.body):
+        start = segments[-1].end if segments else 0
+        segments.append(next_segment("<header/>", window, message, start, ask))
+    return segments
+
+
 def test_segments_tile_the_body() -> None:
     script = _Script(_answer("基础设施，"), _answer("The Wind Remembers.wav"))
     segments = segment_message("", _message(BODY), script)
@@ -111,7 +116,11 @@ def test_prompt_carries_the_window_first() -> None:
     script = _Script(_answer("好的。"))
     segment_message("【AI】\n要我继续吗？", _message("好的。"), script)
 
-    assert script.prompts[0].startswith("<此前的对话>\n【AI】\n要我继续吗？"), script.prompts[0]
+    assert (
+        script.prompts[0]
+        .removeprefix("<header/>\n\n")
+        .startswith("<此前的对话>\n【AI】\n要我继续吗？")
+    ), script.prompts[0]
 
 
 def test_ambiguous_anchor_switches_to_copy_from_start() -> None:
@@ -180,38 +189,3 @@ def _whole_rest(prompt: str) -> str:
     found = re.search(r"<剩余>\n(.*)\n</剩余>", prompt, re.DOTALL)
     assert found, prompt
     return _answer(found.group(1))
-
-
-def _run(ask: Ask, done: set[str], count: Count = len) -> list[MessageSegments]:
-    return list(segment_conversation(TIMELINE, DIGESTS, done, ask, count, 2, 2))
-
-
-def test_every_message_not_done_is_segmented() -> None:
-    made = _run(_whole_rest, {"u2"})
-
-    assert sorted(m.uuid for m in made) == ["a1", "u1", "u3"], made
-    assert all(len(m.segments) == 1 and not m.segments[0].needs_review for m in made), made
-
-
-def test_a_window_that_does_not_fit_gives_one_review_segment() -> None:
-    made = _run(_whole_rest, set(), count=lambda text: 1_000 * len(text))
-
-    assert {(m.uuid, len(m.segments), m.segments[0].needs_review) for m in made} == {
-        ("a1", 1, True),
-        ("u1", 1, True),
-        ("u2", 1, True),
-        ("u3", 1, True),
-    }, made
-
-
-def test_a_backend_failure_keeps_the_other_messages() -> None:
-    def ask(prompt: str) -> str:
-        if "<剩余>\n第二条" in prompt:
-            raise LLMError("backend down")
-        return _whole_rest(prompt)
-
-    made: list[MessageSegments] = []
-    with pytest.raises(LLMError, match="1 of 4 messages failed"):
-        made.extend(segment_conversation(TIMELINE, DIGESTS, set(), ask, len, 2, 2))
-
-    assert sorted(m.uuid for m in made) == ["a1", "u1", "u3"], made

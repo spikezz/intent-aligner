@@ -8,53 +8,27 @@ excerpt code checks against the located segment, and whether the speaker said it
 the model inferred it, so the main loop takes speech segments' intents from here and
 does not ask call A for them.
 
-The prompt also carries the window before the message (intent_aligner.window),
-so the digests of its conversation must exist first (intent_aligner.compress).
+The prompt also carries the window before the message (intent_aligner.window) and
+the header of intent graphs built so far; the main loop asks for one segment at a
+time, so each sees the nodes the speech's earlier segments registered. The graphs
+are not charged to the prompt budget.
 
 A segment the model cannot place, or a message whose window does not fit, becomes
 one `needs_review` segment running to the end of the body, so the segments of every
 message still tile it.
-
-Usage: python -m intent_aligner.segment MERGED.jsonl --digests DIGESTS.jsonl
-           --backend codex --model gpt-6.1-sol --out SEGMENTS.jsonl [--workers 8]
-           [--window-rounds N]
-Every speech of the conversation is segmented; the output is appended to as
-messages finish, so a stopped run resumes where it was.
 """
 
 from __future__ import annotations
 
-import argparse
 import sys
-from collections.abc import Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+from collections.abc import Sequence
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from intent_aligner.intent import INTENT_SCHEMA, Intent, stray_evidence
-from intent_aligner.llm import (
-    CALL_SUBJECT,
-    CALLS_FILE,
-    TRUNCATED_FEEDBACK,
-    Ask,
-    CallLog,
-    LLMError,
-    TruncatedReply,
-    asker,
-)
-from intent_aligner.units import SPEAKER_NAMES, Item, Speech, conversation_units
-from intent_aligner.window import (
-    DEFAULT_WINDOW_ROUNDS,
-    PROMPT_BUDGET,
-    Count,
-    Digests,
-    WindowError,
-    load_digests,
-    qwen_tokens,
-    window_rounds,
-    window_text,
-)
+from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, TruncatedReply
+from intent_aligner.units import SPEAKER_NAMES, Item, Speech
+from intent_aligner.window import PROMPT_BUDGET, Count, Digests, ToolCompression, window_text
 
 MAX_ATTEMPTS = 4
 CONTEXT_CHARS = 30
@@ -62,7 +36,7 @@ CONTEXT_CHARS = 30
 FEEDBACK_ROOM = 2_000
 
 SYSTEM_PROMPT = """\
-你在把对话里的一次发言按意图切成连续的段落。发言可能是用户说的，也可能是 AI 对用户说的，<说话的一方> 写明是谁。<此前的对话> 是这次发言之前的对话，其中每一轮的工具操作已经压缩成一段概括（【AI 的工具操作】）；它只用来理解说话的一方在回应什么、指的是什么，不切分它。要切的发言分成两部分：<已处理> 是前面已经切好的文本，<剩余> 是还没有切的文本。你只确定下一段：它从 <剩余> 的第一个字符开始，到哪里结束由你判断。
+你在把对话里的一次发言按意图切成连续的段落。发言可能是用户说的，也可能是 AI 对用户说的，<说话的一方> 写明是谁。<header> 的 graphs 是到目前为止每个 topic 的意图图谱（键是 topic 编号），用它看清说话的一方在接着做哪件事，指代的是哪个已有意图。<此前的对话> 是这次发言之前的对话，其中每一轮的工具操作已经压缩成一段概括（【AI 的工具操作】）；它只用来理解说话的一方在回应什么、指的是什么，不切分它。要切的发言分成两部分：<已处理> 是前面已经切好的文本，<剩余> 是还没有切的文本。你只确定下一段：它从 <剩余> 的第一个字符开始，到哪里结束由你判断。
 
 一段是一串连续的文本，其中表达的意图集合保持不变；意图集合一变，这一段就结束。一个句子可以被切成几段，几句话也可以是一段。本身没有意图的内容（客套话、粘贴进来的材料、日志、表格、图片标记 [Image #N]）归入用到它、说明它或回应它的那一段，不单独成段。
 
@@ -114,7 +88,7 @@ class Segment(BaseModel):
 
 
 class MessageSegments(BaseModel):
-    """One line of the segments file: a user message and the segments that tile its body."""
+    """One line of the segments file: the segments of a speech made since its last line."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -178,9 +152,10 @@ def _around(rest: str, i: int, length: int) -> str:
     )
 
 
-def build_prompt(window: str, message: Speech, start: int, feedback: str) -> str:
-    """The window, the speaker, the speech split at the pointer, its images, and any retry feedback."""
+def build_prompt(header: str, window: str, message: Speech, start: int, feedback: str) -> str:
+    """The header, the window, the speaker, the speech split at the pointer, its images, and any retry feedback."""
     parts = [
+        header,
         f"<此前的对话>\n{window}\n</此前的对话>",
         f"<说话的一方>\n{SPEAKER_NAMES[message.speaker]}\n</说话的一方>",
         f"<已处理>\n{message.body[:start]}\n</已处理>",
@@ -193,28 +168,18 @@ def build_prompt(window: str, message: Speech, start: int, feedback: str) -> str
     return "\n\n".join(parts)
 
 
-def segment_message(window: str, message: Speech, ask: Ask) -> list[Segment]:
-    """Walk the pointer through the body; `ask` sends one prompt and returns the reply text.
+def next_segment(header: str, window: str, message: Speech, start: int, ask: Ask) -> Segment:
+    """The segment at the pointer `start`; `ask` sends one prompt and returns the reply text.
 
     A segment still not located after MAX_ATTEMPTS calls takes the rest of the body
     as one `needs_review` segment, because the pointer cannot move past it.
     """
-    segments: list[Segment] = []
-    start = 0
-    while start < len(message.body):
-        segment = _next_segment(window, message, start, ask)
-        segments.append(segment)
-        start = segment.end
-    return segments
-
-
-def _next_segment(window: str, message: Speech, start: int, ask: Ask) -> Segment:
     feedback = ""
     from_start = False
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             answer = SegmentAnswer.model_validate_json(
-                ask(build_prompt(window, message, start, feedback))
+                ask(build_prompt(header, window, message, start, feedback))
             )
             end = locate_end(message.body, start, answer.segment_end, from_start=from_start)
         except TruncatedReply:
@@ -244,10 +209,11 @@ def _next_segment(window: str, message: Speech, start: int, ask: Ask) -> Segment
         file=sys.stderr,
         flush=True,
     )
-    return _review_segment(message, start, MAX_ATTEMPTS)
+    return review_segment(message, start, MAX_ATTEMPTS)
 
 
-def _review_segment(message: Speech, start: int, attempts: int) -> Segment:
+def review_segment(message: Speech, start: int, attempts: int) -> Segment:
+    """The rest of the body from `start` as one segment for a human to look at."""
     return Segment(
         start=start,
         end=len(message.body),
@@ -259,113 +225,16 @@ def _review_segment(message: Speech, start: int, attempts: int) -> Segment:
 
 
 def message_window(
-    items: Sequence[Item], index: int, digests: Digests, count: Count, rounds: int
+    items: Sequence[Item],
+    index: int,
+    digests: Digests,
+    compressions: Sequence[ToolCompression],
+    count: Count,
+    rounds: int,
 ) -> str:
     """The window for segmenting items[index], sized so the longest prompt still fits."""
     message = items[index]
     assert isinstance(message, Speech)
-    rest = count(SYSTEM_PROMPT) + count(build_prompt("", message, 0, ""))
-    return window_text(items, index, digests, PROMPT_BUDGET - rest - FEEDBACK_ROOM, count, rounds)
-
-
-def segment_conversation(
-    items: Sequence[Item],
-    digests: Digests,
-    done: set[str],
-    ask: Ask,
-    count: Count,
-    workers: int,
-    rounds: int,
-) -> Iterator[MessageSegments]:
-    """Yield the segments of every speech whose uuid is not in `done`, as each finishes.
-
-    A backend failure does not stop the other messages, because a long run must keep
-    what it can; LLMError is raised after the last one if any failed.
-    """
-    jobs = {
-        index: item
-        for index, item in enumerate(items)
-        if isinstance(item, Speech) and item.source.uuid not in done
-    }
-    failures: list[LLMError] = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(_segment_at, items, index, message, digests, ask, count, rounds)
-            for index, message in jobs.items()
-        ]
-        for future in as_completed(futures):
-            try:
-                yield future.result()
-            except LLMError as error:
-                failures.append(error)
-                print(error, file=sys.stderr, flush=True)
-    if failures:
-        raise LLMError(
-            f"{len(failures)} of {len(jobs)} messages failed, the rest are written; rerun the "
-            f"same command to retry only those. First failure: {failures[0]}"
-        )
-
-
-def _segment_at(
-    items: Sequence[Item],
-    index: int,
-    message: Speech,
-    digests: Digests,
-    ask: Ask,
-    count: Count,
-    rounds: int,
-) -> MessageSegments:
-    CALL_SUBJECT.set(f"message:{message.source.uuid}")
-    try:
-        window = message_window(items, index, digests, count, rounds)
-    except WindowError as error:
-        print(f"needs_review: {error}", file=sys.stderr, flush=True)
-        segments = [_review_segment(message, 0, 0)]
-    else:
-        segments = segment_message(window, message, ask)
-    return MessageSegments(uuid=message.source.uuid, segments=segments)
-
-
-def load_done(path: Path) -> set[str]:
-    """The uuids of the messages already in a segments file."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    return {MessageSegments.model_validate_json(line).uuid for line in lines}
-
-
-def main() -> None:
-    """CLI entry point: segment every speech of one conversation, appending to --out."""
-    parser = argparse.ArgumentParser(description="Segment speech with an LLM.")
-    parser.add_argument("merged", type=Path)
-    parser.add_argument("--digests", type=Path, required=True)
-    parser.add_argument("--backend", choices=["claude", "codex", "hive"], required=True)
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], default="xhigh")
-    parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--workers", type=int, default=8, help="np8 serves 8 slots")
-    parser.add_argument("--window-rounds", type=window_rounds, default=DEFAULT_WINDOW_ROUNDS)
-    parser.add_argument(
-        "--stream",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="hive only: read the reply as a stream or as one block",
-    )
-    args = parser.parse_args()
-
-    items = list(conversation_units(args.merged))
-    done = load_done(args.out) if args.out.exists() else set()
-    log = CallLog(path=args.out.parent / CALLS_FILE)
-    ask = asker(
-        args.backend, args.model, args.effort, SYSTEM_PROMPT, SCHEMA, args.stream, log, "segment"
-    )
-    results = segment_conversation(
-        items, load_digests(args.digests), done, ask, qwen_tokens, args.workers, args.window_rounds
-    )
-    with args.out.open("a", encoding="utf-8") as out:
-        for result in results:
-            out.write(result.model_dump_json() + "\n")
-            out.flush()
-            print(f"{result.uuid}: {len(result.segments)} segments", flush=True)
-
-
-if __name__ == "__main__":
-    main()
+    rest = count(SYSTEM_PROMPT) + count(build_prompt("", "", message, 0, ""))
+    room = PROMPT_BUDGET - rest - FEEDBACK_ROOM
+    return window_text(items, index, index, digests, compressions, room, count, rounds)

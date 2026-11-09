@@ -13,7 +13,8 @@ from intent_aligner.window import (
     FOLLOWING_ITEMS,
     CallDigest,
     Digests,
-    RoundDigest,
+    ResultDigest,
+    ToolCompression,
     WindowError,
     render_following,
     render_items,
@@ -68,49 +69,58 @@ TIMELINE: list[Item] = [
     _user("u3", "第三条"),
 ]
 DIGESTS = Digests(
-    rounds={u: RoundDigest(round_uuid=u, summary=f"概括{u}") for u in ("a1", "u1", "u2")},
+    calls={c: _call_digest(c, f"意图{c}", "t") for c in ("c1", "c2", "c3")},
+    results={c: ResultDigest(tool_use_id=c, summaries=[f"结果{c}"]) for c in ("c1", "c2", "c3")},
 )
 
 
 def test_the_rounds_parameter_sets_how_far_back_the_window_reaches() -> None:
-    three = window_text(TIMELINE, 7, DIGESTS, 10_000, len, 3)
-    two = window_text(TIMELINE, 7, DIGESTS, 10_000, len, 2)
+    three = window_text(TIMELINE, 7, 7, DIGESTS, [], 10_000, len, 3)
+    two = window_text(TIMELINE, 7, 7, DIGESTS, [], 10_000, len, 2)
 
     assert three.startswith("【用户】\n第一条"), three
     assert two.startswith("【AI】\n好的"), "what the AI said opens a round of its own"
-    assert "x" * 100 not in three, "tool results must enter only through the round digest"
+    assert "x" * 100 not in three, "tool results must enter only through their digests"
 
 
-def test_a_round_shows_its_tool_work_once() -> None:
-    timeline = [TIMELINE[0], _call("c1"), _result("c1"), _call("c2"), _result("c2")]
-    text = render_items(timeline, DIGESTS)
+def test_tool_records_show_one_by_one_in_place() -> None:
+    timeline: list[Item] = [
+        TIMELINE[0],
+        _call("c1"),
+        _result("c1"),
+        _user("u9", "排队"),
+        _result("c2"),
+    ]
+    text = render_items(timeline, 0, len(timeline), DIGESTS, [])
 
-    assert text == "【用户】\n第一条\n\n【AI 的工具操作】\n概括u1", text
-
-
-def test_a_result_in_a_later_round_opens_no_entry() -> None:
-    timeline = [TIMELINE[0], _call("c1"), _user("u9", "排队的消息"), _result("c1")]
-
-    assert render_items(timeline, DIGESTS).endswith("【用户】\n排队的消息"), (
-        "no digest needed for u9"
+    expected = (
+        "【用户】\n第一条\n\n【AI 的工具调用】\nBash 意图：意图c1 对象：t\n\n"
+        "【工具结果】\n结果c1\n\n【用户】\n排队\n\n【工具结果】\n结果c2"
     )
+    assert text == expected, f"{text!r} vs {expected!r}"
 
 
-def test_falls_back_to_one_round() -> None:
-    two = len(window_text(TIMELINE, 7, DIGESTS, 10_000, len, 2))
-    text = window_text(TIMELINE, 7, DIGESTS, two - 1, len, 2)
+def test_a_passage_shows_once_and_replaces_only_tool_records() -> None:
+    timeline: list[Item] = [
+        _user("u1", "第一条"),
+        _call("c1"),
+        _user("u9", "排队"),
+        _result("c1"),
+        _call("c2"),
+    ]
+    passage = ToolCompression(begin=1, through=4, summary="概括")
+    text = render_items(timeline, 0, len(timeline), DIGESTS, [passage])
 
-    assert text.startswith("【用户】\n第二条"), text
+    expected = (
+        "【用户】\n第一条\n\n【AI 此前的工具操作（已压缩）】\n概括\n\n【用户】\n排队\n\n"
+        "【AI 的工具调用】\nBash 意图：意图c2 对象：t"
+    )
+    assert text == expected, f"{text!r} vs {expected!r}"
 
 
-def test_one_round_too_long_raises() -> None:
+def test_a_window_over_its_room_raises() -> None:
     with pytest.raises(WindowError, match="needs_review"):
-        window_text(TIMELINE, 7, DIGESTS, 5, len, 2)
-
-
-def test_missing_round_digest_names_the_fix() -> None:
-    with pytest.raises(ValueError, match=r"run intent_aligner\.compress"):
-        render_items([_user("u9", "新"), _call("c9")], DIGESTS)
+        window_text(TIMELINE, 7, 7, DIGESTS, [], 5, len, 2)
 
 
 def _many_calls(n: int) -> tuple[list[Item], Digests]:

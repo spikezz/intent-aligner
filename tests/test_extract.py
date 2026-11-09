@@ -19,13 +19,14 @@ from intent_aligner.extract import (
     Assignment,
     UnitRef,
     extract_units,
+    load_segments,
     log_lines,
     topics_from,
     write_topic_files,
 )
 from intent_aligner.intent import Intent
 from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, TruncatedReply
-from intent_aligner.segment import Segment
+from intent_aligner.segment import MessageSegments, Segment
 from intent_aligner.store import (
     UNASSIGNED_FILE,
     Stores,
@@ -41,14 +42,14 @@ from intent_aligner.window import (
     Digests,
     ResultDigest,
     ToolCompression,
-    render_round_so_far,
+    render_items,
 )
-from tests.test_window import DIGESTS, TIMELINE, _call, _call_digest, _result, _source, _user
+from tests.test_segment import _whole_rest
+from tests.test_window import TIMELINE, _call, _call_digest, _result, _source, _user
 
 FULL = Digests(
     calls={c: _call_digest(c, f"意图{c}", f"对象{c}") for c in ("c1", "c2")},
     results={c: ResultDigest(tool_use_id=c, summaries=[f"结果{c}"]) for c in ("c1", "c2")},
-    rounds=DIGESTS.rounds,
 )
 
 
@@ -82,6 +83,10 @@ def _new_then_first(prompts: list[str]) -> Ask:
         return json.dumps({"topic": topics[0]["id"], "title": ""})
 
     return ask
+
+
+def _not_asked(prompt: str) -> str:
+    raise AssertionError(f"every digest and segment of this test already exists: {prompt[:200]}")
 
 
 def _no_round(prompt: str) -> str:
@@ -144,6 +149,8 @@ def _assignments(
     relation: Ask = _no_edges,
     outcome: Ask = _no_outcomes,
     outcome_update: Ask = _no_outcomes_summary,
+    round_ask: Ask = _no_round,
+    segment: Ask = _not_asked,
 ) -> list[Assignment]:
     asks = Asks(
         topic=ask,
@@ -155,7 +162,8 @@ def _assignments(
         outcome=outcome,
         outcome_summary=_no_outcomes_summary,
         outcome_update=outcome_update,
-        round=_no_round,
+        round=round_ask,
+        segment=segment,
     )
     stores = stores or Stores(merged_file="merged.jsonl", items=items)
     segments = {"a1": [], **segments}
@@ -215,18 +223,42 @@ def test_a_new_topic_is_listed_for_the_next_unit() -> None:
     assert _header(prompts[1])["topics"] == [{"id": "T001", "title": "做第一件事"}], prompts[1]
 
 
-def test_only_tool_calls_get_the_round_hint() -> None:
-    prompts: list[str] = []
-    _run(_new_then_first(prompts))
-    hints = [_header(p).get("round_topic_hint") for p in prompts]
+def test_segments_are_made_in_the_loop_seeing_the_graphs_so_far() -> None:
+    made: dict[str, list[str]] = {"segment": [], "t": []}
 
-    assert hints == [None, None, None, None, None, None], (
-        f"{hints}: c1 and c2 are each the first call of their round"
+    def recording(name: str, answer: Ask) -> Ask:
+        def ask(prompt: str) -> str:
+            made[name].append(prompt)
+            return answer(prompt)
+
+        return ask
+
+    timeline = [*TIMELINE[:1], *TIMELINE[2:]]
+    got = _assignments(
+        timeline,
+        {},
+        FULL,
+        recording("t", _new_then_first([])),
+        segment=recording("segment", _whole_rest),
     )
-    timeline = [*TIMELINE[:4], TIMELINE[2].model_copy(update={"tool_use_id": "c2"})]
-    prompts.clear()
-    _assignments(timeline, SEGMENTS, FULL, _new_then_first(prompts))
-    assert _header(prompts[-1]).get("round_topic_hint") == "T001", prompts[-1]
+
+    speeches = {a.unit.uuid for a in got if a.unit.kind == "user_segment"}
+    assert speeches == {"u1", "u2", "u3"}, got
+    assert _header(made["segment"][0])["graphs"] == {}, made["segment"][0]
+    assert "T001" in str(_header(made["segment"][-1])["graphs"]), made["segment"][-1]
+    assert "T001" in str(_header(made["t"][-1])["graphs"]), made["t"][-1]
+
+
+def test_segments_written_one_per_line_load_as_one_speech(tmp_path: Path) -> None:
+    path = tmp_path / "segments.jsonl"
+    lines = [
+        MessageSegments(uuid="u1", segments=[_segment(0, 2)]),
+        MessageSegments(uuid="u1", segments=[_segment(2, 3)]),
+    ]
+    path.write_text("".join(m.model_dump_json() + "\n" for m in lines), encoding="utf-8")
+
+    got = [(s.start, s.end) for s in load_segments(path)["u1"]]
+    assert got == [(0, 2), (2, 3)], got
 
 
 def test_a_segment_is_marked_inside_the_whole_message() -> None:
@@ -248,15 +280,17 @@ def test_the_current_round_shows_level_one_digests_up_to_the_unit() -> None:
     _run(_new_then_first(prompts))
     c2 = prompts[4]
 
-    assert "【AI 的工具操作】\n概括a1" in c2, "earlier rounds come as round digests"
+    assert "【AI 的工具调用】\nBash 意图：意图c1 对象：对象c1" in c2, (
+        "earlier rounds show level one"
+    )
     assert "概括u2" not in c2, "the round in hand must not show how it ended"
     assert c2.endswith(
         "<当前单元>\n【AI 的工具调用】\nBash 意图：意图c2 对象：对象c2\n</当前单元>"
     ), c2
 
 
-def test_render_round_so_far_shows_calls_and_results() -> None:
-    text = render_round_so_far(TIMELINE, 0, 4, FULL, [])
+def test_render_items_shows_calls_and_results() -> None:
+    text = render_items(TIMELINE, 0, 4, FULL, [])
 
     assert text == (
         "【用户】\n第一条\n\n【AI】\n好的\n\n"
@@ -334,11 +368,6 @@ def test_a_rerun_refuses_assignments_that_no_longer_line_up() -> None:
 
     with pytest.raises(ValueError, match="start a new --out"):
         _run(_new_then_first([]), done)
-
-
-def test_a_message_without_segments_is_refused() -> None:
-    with pytest.raises(ValueError, match=r"intent_aligner\.segment"):
-        _assignments(TIMELINE, {}, FULL, _new_then_first([]))
 
 
 def test_topic_files_follow_the_store_format(tmp_path: Path) -> None:
@@ -779,12 +808,6 @@ LONG_DIGESTS = Digests(
 LONG_SEGMENTS: dict[str, list[Segment]] = {"u1": [_segment(0, 4)], "a1": []}
 
 
-@pytest.fixture
-def no_following(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Call G's look-ahead also spends budget, which would hide where a compression is due."""
-    monkeypatch.setattr("intent_aligner.extract.render_following", lambda *_: "")
-
-
 def _heavy_results(text: str) -> int:
     """Each level-1 result costs 1,000 tokens, so the round outgrows the budget after a few."""
     return len(text) + 1000 * text.count("【工具结果】")
@@ -808,23 +831,29 @@ def _long_run(
         outcome_summary=_no_outcomes_summary,
         outcome_update=_no_outcomes_summary,
         round=ask_round,
+        segment=_not_asked,
     )
     stores = Stores(merged_file="merged.jsonl", items=LONG)
     events = extract_units(
         LONG, LONG_SEGMENTS, LONG_DIGESTS, [], compressed or [], asks, _heavy_results, stores, 2
     )
-    return list(events)
+    return [e for e in events if isinstance(e, Assignment | ToolCompression)]
 
 
-def test_a_round_is_compressed_only_when_the_prompt_would_not_fit(no_following: None) -> None:
+@pytest.fixture
+def no_following(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Call G's lookahead would trigger compressions before T's prompts need them."""
+    monkeypatch.setattr("intent_aligner.extract.render_following", lambda *_: "")
+
+
+def test_the_oldest_records_are_compressed_only_when_the_prompt_would_not_fit(
+    no_following: None,
+) -> None:
     t_prompts: list[str] = []
     events = _long_run([], t_prompts)
     first = next(e for e in events if isinstance(e, ToolCompression))
-    after = events[events.index(first) + 1]
 
-    assert isinstance(after, Assignment) and after.unit.uuid == LONG[first.through].source.uuid, (
-        after
-    )
+    assert first.begin == 2, f"the oldest tool record is item 2: {first}"
     assert not any(isinstance(e, Assignment) and e.needs_review for e in events), events
     budget = PROMPT_BUDGET - FEEDBACK_ROOM
     before = [p for p in t_prompts if "已压缩" not in p]
@@ -843,9 +872,10 @@ def test_the_passage_replaces_only_tool_records() -> None:
         "\n【用户】\n做一件事\n\n【AI】\n好的，我开始\n\n【AI 此前的工具操作（已压缩）】\n压缩"
     ), window
     assert "意图0 " not in window, "compressed calls must not show again"
+    assert "【AI 的工具调用】" in window, "the newer records stay one by one"
 
 
-def test_each_compression_is_its_own_level_two_passage() -> None:
+def test_each_compression_is_its_own_passage() -> None:
     round_prompts: list[str] = []
     t_prompts: list[str] = []
     events = _long_run(round_prompts, t_prompts)
@@ -885,13 +915,15 @@ def test_earlier_passages_count_against_the_budget(no_following: None) -> None:
 def test_what_call_g_sees_ahead_counts_against_the_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first_through = [next(e for e in _long_run([], []) if isinstance(e, ToolCompression)).through]
-    monkeypatch.setattr("intent_aligner.extract.render_following", lambda *_: "")
-    first_through.append(
-        next(e for e in _long_run([], []) if isinstance(e, ToolCompression)).through
-    )
+    def first_compression() -> int:
+        events = _long_run([], [])
+        return next(i for i, e in enumerate(events) if isinstance(e, ToolCompression))
 
-    assert first_through[0] < first_through[1], first_through
+    with_following = first_compression()
+    monkeypatch.setattr("intent_aligner.extract.render_following", lambda *_: "")
+    without = first_compression()
+
+    assert with_following < without, f"{with_following} vs {without}"
 
 
 def test_call_g_alone_sees_what_follows_the_unit() -> None:
@@ -919,6 +951,38 @@ def test_call_g_alone_sees_what_follows_the_unit() -> None:
     assert "意图c2" in following, aggregate_prompts[0]
     assert match_prompts, "c2 joins an aggregate that has members"
     assert all("<此后的对话>" not in p for p in match_prompts), match_prompts
+
+
+def test_an_earlier_round_is_compressed_before_the_current_one(no_following: None) -> None:
+    items: list[Item] = [_user("u1", "第一轮")]
+    items += [r for n in range(7) for r in (_call(f"c{n}"), _result(f"c{n}"))]
+    items += [_user("u2", "第二轮")]
+    items += [r for n in range(7, 11) for r in (_call(f"c{n}"), _result(f"c{n}"))]
+    digests = Digests(
+        calls={f"c{n}": _call_digest(f"c{n}", f"意图{n}") for n in range(11)},
+        results={
+            f"c{n}": ResultDigest(tool_use_id=f"c{n}", summaries=[f"结果{n}"]) for n in range(11)
+        },
+    )
+    segments = {"u1": [_segment(0, 3)], "u2": [_segment(0, 3)]}
+    asks = Asks(
+        topic=_new_then_first([]),
+        signal=_no_signal_intents,
+        registry=_all_new,
+        aggregate=_one_aggregate,
+        tool_intent=_no_repeats,
+        relation=_no_edges,
+        outcome=_no_outcomes,
+        outcome_summary=_no_outcomes_summary,
+        outcome_update=_no_outcomes_summary,
+        round=lambda _: json.dumps({"summary": "压缩"}),
+        segment=_not_asked,
+    )
+    stores = Stores(merged_file="merged.jsonl", items=items)
+    events = list(extract_units(items, segments, digests, [], [], asks, _heavy_results, stores, 2))
+    first = next(e for e in events if isinstance(e, ToolCompression))
+
+    assert (first.begin, first.through <= 15) == (1, True), first
 
 
 ONE_ROUND: list[Item] = [
@@ -970,7 +1034,7 @@ def test_an_update_replaces_the_text_and_the_edges_of_the_aggregates_node() -> N
     assert node.type == "aggregate_observation" and node.aggregate == "G001", node
     assert node.label == "合并", node
     assert [(e.from_, e.to, e.relation, e.evidence) for e in graph.edges] == [
-        ("O001", "G001", "satisfies", "c2")
+        ("O001", "G001", "satisfies", "c1")
     ], graph.edges
     status = graph_with_status(graph)["nodes"]["G001"]["status"]  # type: ignore[index]
     assert status == "已完成", status

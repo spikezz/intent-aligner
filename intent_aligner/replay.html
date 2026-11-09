@@ -161,14 +161,15 @@ details.more summary { cursor: pointer; color: var(--muted); }
 </div>
 <script>
 const PAGE = /*PAGE_DATA*/null;
-const STAGES = ["L1", "L2", "SEG", "LOOP"];
-const STAGE_NAMES = {L1: "第一层压缩（工具调用和结果）", L2: "第二层压缩（一轮的工具操作）", SEG: "切分发言", LOOP: "逐单元抽取"};
-const STAGE_COLORS = {L1: "var(--l1)", L2: "var(--l2)", SEG: "var(--seg)", LOOP: "var(--loop)"};
-const ASK_NAMES = {call: "压缩工具调用", result: "压缩工具结果", round: "压缩一轮的工具操作", segment: "切分", topic: "T 归入 topic",
+const REFRESH_SECONDS = /*REFRESH_SECONDS*/null;
+const STAGES = ["L1", "SEG", "LOOP"];
+const STAGE_NAMES = {L1: "第一层压缩（工具调用和结果）", SEG: "切分发言", LOOP: "逐单元抽取"};
+const STAGE_COLORS = {L1: "var(--l1)", SEG: "var(--seg)", LOOP: "var(--loop)"};
+const ASK_NAMES = {call: "压缩工具调用", result: "压缩工具结果", round: "概括最旧的工具记录", segment: "切分", topic: "T 归入 topic",
   signal: "A 信号意图", registry: "B 登记意图", aggregate: "G 归入聚合", tool_intent: "L 底层意图", relation: "C 连边",
   outcome: "D 观察结果", outcome_summary: "D 观察结果（摘要）", outcome_update: "D 更新聚合的观测"};
 const LETTER = {topic: "T", signal: "A", registry: "B", aggregate: "G", tool_intent: "L", relation: "C", outcome: "D", outcome_summary: "D", outcome_update: "D", round: "压"};
-const STOPS = [["L1", "第一层压缩"], ["L2", "第二层压缩"], ["SEG", "切分"], ["T", "T 归 topic"], ["A", "A 信号意图"], ["B", "B 登记意图"],
+const STOPS = [["L1", "第一层压缩"], ["SEG", "切分"], ["T", "T 归 topic"], ["A", "A 信号意图"], ["B", "B 登记意图"],
   ["G", "G 归聚合"], ["L", "L 底层意图"], ["C", "C 连边"], ["D", "D 观察结果"]];
 const VERDICT_NAMES = {accepted: "已接受", rejected: "被驳回", failed: "失败"};
 const calls = PAGE.calls, jobs = PAGE.jobs;
@@ -326,7 +327,7 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
   const col = j => j.column - first;
   const columns = Math.max(0, ...jobs.filter(j => j.stage !== "LOOP").map(col)) + 1;
   const by = (s) => { const m = {}; for (const j of jobs.filter(j => j.stage === s)) (m[col(j)] ??= []).push(j); return m; };
-  const tools = by("L1"), rounds = by("L2"), segs = by("SEG");
+  const tools = by("L1"), segs = by("SEG");
   const rowsOf = (m, per) => Math.max(1, ...Object.values(m).map(l => Math.ceil(l.length / per)));
   const out = [], bars = [];
   let y = 26;
@@ -348,33 +349,17 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
     out.push("</g>");
   });
   y += rowsOf(tools, PER_ROW) * 16 + 26;
-  barrier(y - 12, "全部第一层任务结束后，第二层压缩才开始（compress.py 先后两次 _run_jobs）");
-
-  bandLabel("L2", y);
-  for (const [c, list] of Object.entries(rounds)) list.forEach(j => {
-    const x = LEFT + c * COL_W;
-    layout[j.id] = {x, y, w: COL_W - 18, h: 16};
-    out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" x="${x}" y="${y}" width="${COL_W - 18}" height="16" rx="2"><title>${esc(j.id + "\n" + j.label)}</title></rect>`);
-    out.push(`<text x="${x + 3}" y="${y + 12}" pointer-events="none" style="fill:#fff">${esc(j.label.slice(0, 9))}</text>`);
-    cells.push({id: j.id});
-  });
-  y += 16 + 36;
-  barrier(y - 14, `compress 命令结束后才运行 segment；每次发言的窗口最多读它前面 ${PAGE.window_rounds} 轮，细线连着实际放进窗口、并且有工具操作的那些轮`);
+  barrier(y - 12, "compress 命令结束后才运行 extract；切分和单元都在主循环里严格一个接一个，每一步读前面写好的图谱");
 
   bandLabel("SEG", y);
-  const windows = [];
   for (const [c, list] of Object.entries(segs)) list.forEach((j, k) => {
     const x = LEFT + c * COL_W + (k % SEG_PER_ROW) * SEG_W, yy = y + Math.floor(k / SEG_PER_ROW) * 18;
     layout[j.id] = {x, y: yy, w: SEG_W - 6, h: 12};
     if (k % SEG_PER_ROW) out.push(`<line class="chain" x1="${x - 6}" y1="${yy + 6}" x2="${x}" y2="${yy + 6}"/>`);
     out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" x="${x}" y="${yy}" width="${SEG_W - 6}" height="12" rx="2"><title>${esc(j.id + "\n字符 " + j.label)}</title></rect>`);
     cells.push({id: j.id});
-    const seen = calls[callsOf[j.id]?.at(-1)]?.window_seen;
-    for (const a of j.after) if (a.startsWith("round:") && layout[a] && (!seen || seen.includes(a.slice(6)))) windows.push([layout[a], layout[j.id]]);
   });
-  for (const [a, b] of windows) out.push(`<path class="window" d="M${a.x + a.w / 2},${a.y + a.h} C${a.x + a.w / 2},${(a.y + a.h + b.y) / 2} ${b.x + b.w / 2},${(a.y + a.h + b.y) / 2} ${b.x + b.w / 2},${b.y}"/>`);
   y += rowsOf(segs, SEG_PER_ROW) * 18 + 34;
-  barrier(y - 14, "segment 命令结束后才运行 extract；单元严格一个接一个，每个单元读前面单元写好的图谱");
 
   bandLabel("LOOP", y);
   unitJobs.forEach((j, k) => {
@@ -413,9 +398,8 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
   document.getElementById("dagnote").textContent =
     `第一层压缩：${toolJobs.length} 个工具调用各是一个任务，一共调用模型 ${l1} 次。任务内部是串行的：先压调用，再压结果，因为压结果的提示词要带上调用的意图；` +
     `其中 ${multi} 个结果太长，被分成几段逐段压缩（加粗的右块，旁边的数字是段数）。任务之间互不依赖，可以并行。` +
-    `第二层压缩要等全部第一层任务结束才开始，有工具操作的 ${jobs.filter(j => j.stage === "L2").length} 轮各是一个任务。` +
-    `切分在 compress 命令之后运行：${messages} 次发言之间并行，一共切出 ${jobs.filter(j => j.stage === "SEG").length} 段；同一次发言里的段只能一段接一段地切，因为下一段从上一段的结尾开始。` +
-    `抽取在切分之后运行：${unitJobs.length} 个单元严格串行，单元内部的调用也串行。各单元的调用序列：${top}。“压”是提示词放不下时临时调用的本轮压缩。红色的字母是这个单元没有发给模型的步骤：带 ✗ 的是路线上一定要走、但没有发出去的步骤；带 ? 的是要不要走取决于没有拿到的模型回答。点图里的方块可以跳到对应的调用。`;
+    `压缩结束后进入主循环：${messages} 次发言一段一段切，一共切出 ${jobs.filter(j => j.stage === "SEG").length} 段，每切出一段就处理一段。` +
+    `主循环里的 ${unitJobs.length} 个单元严格串行，单元内部的调用也串行。各单元的调用序列：${top}。“压”是提示词放不下时把最旧的工具记录概括成一段。红色的字母是这个单元没有发给模型的步骤：带 ✗ 的是路线上一定要走、但没有发出去的步骤；带 ? 的是要不要走取决于没有拿到的模型回答。点图里的方块可以跳到对应的调用。`;
 })();
 
 function paintDag(f) {
@@ -470,7 +454,7 @@ function draw() {
   history.replaceState(null, "", `#frame=${current + 1}`);
   const cur = $("cursor");
   if (cur) { const x = stripX(times[current], strip.clientWidth || 800); cur.setAttribute("x1", x); cur.setAttribute("x2", x); }
-  const letter = c?.stage === "LOOP" ? (c.ask === "round" ? "L2" : LETTER[c.ask]) : (c?.stage ?? null);
+  const letter = c?.stage === "LOOP" ? LETTER[c.ask] : (c?.stage ?? null);
   const unsent = job ? unsentOf(job).map(step => step.replace("?", "")) : [];
   document.querySelectorAll(".rail .stop").forEach(s => {
     s.classList.toggle("on", s.dataset.k === letter);
@@ -680,6 +664,8 @@ function drawBench(f, job) {
 drawStrip();
 const startAt = new URLSearchParams(location.hash.slice(1)).get("frame");
 go(+(startAt ?? 1) - 1);
+// A reload would cut off a running playback, so it waits until playback stops.
+if (REFRESH_SECONDS !== null) setInterval(() => { if (timer === null) location.reload(); }, REFRESH_SECONDS * 1000);
 </script>
 </body>
 </html>

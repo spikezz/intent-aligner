@@ -26,27 +26,15 @@ $PY -m intent_aligner.units corpus/merged/claude-5a1f0c1a.jsonl --out corpus/uni
 ```
 
 ```bash
-# 4. 把一个对话的工具操作分两级压缩。第一级写出每个工具调用的意图（每个意图附带原文摘录 evidence、
-#    是明说还是推断 explicit 和推断依据 note）和它针对的具体对象，把它的
-#    结果对照调用的意图和全文压成一句话（太长的结果按行切段，每段一句），一个调用和它的结果是一个任务，
-#    任务之间互相独立，--workers 个并行。第二级把一轮里全部的意图、对象和结果压成一段概括。
-#    一轮从一次发言开始，到下一次发言之前结束；第二级同时看开启这一轮的发言。输出边跑边追加，中断后重跑会从断点继续；--until 在这条用户消息之前停下。
+# 4. 把工具调用和工具结果并行压缩成第一级概括，输出边跑边追加，中断后重跑会从断点继续
 OUT=corpus/results/claude-5a1f0c1a-qwen38
-mkdir -p $OUT
+mkdir -p $OUT/extract
 $PY -m intent_aligner.compress corpus/merged/claude-5a1f0c1a.jsonl \
-    --backend hive --model deployment/pc-qwen38-np8 \
-    --out $OUT/digests.jsonl
+    --backend hive --model deployment/pc-qwen38-np8 --workers 8 --out $OUT/digests.jsonl
 
-# 5. 把对话里的每次发言（用户消息或 AI 对用户说的一段话）按意图切成连续的段落，每行一次发言。每个意图附带原文摘录 evidence、
-#    是明说还是推断（explicit）和推断依据 note。--workers 次发言并行，
-#    输出边跑边追加，中断后重跑会从断点继续。第 4 步必须先对整个对话跑完（不加 --until）
-$PY -m intent_aligner.segment corpus/merged/claude-5a1f0c1a.jsonl \
-    --digests $OUT/digests.jsonl \
-    --backend hive --model deployment/pc-qwen38-np8 --out $OUT/segments.jsonl
-
-# 6. 指针按时间顺序逐个走过单元（发言换成第 5 步的段落），判断每个单元属于哪个 topic，再把发言的意图
-#    对照 topic 里同一方的已有意图，把工具调用的底层意图归入聚合并在聚合内去重，再建立意图之间的关系，判断观测的影响。
-#    工具结果沿用它的调用的 topic；每个单元要调用模型的次数取决于单元类型。第 4、5 步都必须先对整个对话跑完
+# 5. 指针按时间顺序逐个走过单元，每一步都带着此时全部 topic 的意图图谱：发言一段一段切分，判断单元属于哪个 topic，
+#    对照已有意图，把工具调用的底层意图归入聚合并在聚合内去重，建立意图之间的关系，判断观测的影响。
+#    全程串行，输出边跑边追加，中断后重跑会从断点继续。
 $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
     --digests $OUT/digests.jsonl --segments $OUT/segments.jsonl \
     --backend hive --model deployment/pc-qwen38-np8 --out $OUT/extract
@@ -54,13 +42,13 @@ $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
 
 第 3 步输出的单元有 `user_message`（用户消息全文，附带图片路径）、`ai_text`（AI 对用户说的一段话）、`user_signal`、`tool_call` 和 `observation`。用户消息和 AI 说的话都算发言，用同样的方式处理。
 
-第 5 步的模型除了这次发言，还会看到它之前 N 轮对话；N 轮放不下时依次减少一轮。一轮是一次发言，加上它之后、下一次发言之前的全部内容。这些对话里，每一轮的工具操作只显示第 4 步写出的那一段概括，所以这次发言之前的对话必须先压缩过。
+切分时模型除了这次发言，还会看到全部 topic 的意图图谱和它之前 N 轮对话。一轮是一次发言，加上它之后、下一次发言之前的全部内容。这些对话里，工具操作显示第一级压缩的结果，放不下时最旧的一批工具操作会换成一段概括，所以第 5 步之前必须先跑完第 4 步。
 
-N 由第 5、6 步的 `--window-rounds` 设定，默认值是 2，这两步要用同一个值。回放从 `run.sh` 里的第 6 步命令读这个值，命令里没有写时按默认值显示。
+N 由第 5 步的 `--window-rounds` 设定，默认值是 2。回放从 `run.sh` 里的这条命令读这个值，命令里没有写时按默认值显示。
 
-第 5 步里，模型重试几次仍然定位不到段落结尾，或者连一轮对话都放不进窗口时，剩下的文本成为一段 `needs_review: true`、意图为空的段落，原因打印在标准错误里。
+切分时，模型重试几次仍然定位不到段落结尾，或者连一轮对话都放不进窗口时，剩下的文本成为一段 `needs_review: true`、意图为空的段落，原因打印在标准错误里。
 
-第 6 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（发言和用户信号的意图节点、工具调用的意图聚合节点、聚合的观测节点、其他观测节点、边、成对存放的工具调用和结果，以及段落；意图节点的 `actor` 标明是用户的还是 AI 的）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic、整次没有意图的发言和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：一轮太长、模型看到的内容放不下时，还没压缩过的工具操作会压缩成一段话，之前压缩出的段落保持不变，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
+第 5 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（发言和用户信号的意图节点、工具调用的意图聚合节点、聚合的观测节点、其他观测节点、边、成对存放的工具调用和结果，以及段落；意图节点的 `actor` 标明是用户的还是 AI 的）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic、整次没有意图的发言和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：模型看到的内容放不下时，最旧的一批工具操作会压缩成一段话，较新的保持逐条，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
 
 第 1 步完成后，`corpus/index.json` 会列出每个合并后的对话，包括成员 session、记录条数、丢弃的 fork 复制品数量，以及损坏的行。
 
@@ -68,11 +56,11 @@ N 由第 5、6 步的 `--window-rounds` 设定，默认值是 2，这两步要�
 
 ### 结果目录和重跑
 
-第 4 到 6 步的结果按“对话 + 模型”放在同一个目录 `corpus/results/<platform>-<seed>-<模型>/` 下：`digests.jsonl`、`segments.jsonl` 和 `extract/`，也就是上面命令里的 `$OUT`。
+第 4、5 步的结果按“对话 + 模型”放在同一个目录 `corpus/results/<platform>-<seed>-<模型>/` 下：`digests.jsonl`、`segments.jsonl` 和 `extract/`，也就是上面命令里的 `$OUT`。
 
-第 4 到 6 步重跑时都从已经写出的结果继续，只补缺少的部分，所以结果齐全时重跑不调用模型。续跑不检查模型是否和之前相同，所以换模型时要换一个目录，否则同一份结果里会混着两个模型的回答。第 6 步发现对话或切分结果和 `assignments.jsonl` 对不上时会报错停止，这时也要换一个 `--out` 目录。要完全重跑，先把这个目录里的 `digests.jsonl`、`segments.jsonl` 和 `extract/` 移走。
+第 4、5 步重跑时从已经写出的结果继续，只补缺少的部分，所以结果齐全时重跑不调用模型。续跑不检查模型是否和之前相同，所以换模型时要换一个目录，否则同一份结果里会混着两个模型的回答。它发现对话或切分结果和 `assignments.jsonl` 对不上时会报错停止，这时也要换一个 `--out` 目录。要完全重跑，先把这个目录里的 `digests.jsonl`、`segments.jsonl` 和 `extract/` 移走。
 
-第 4、5 步在结果目录下、第 6 步在 `extract/` 下各写一份 `calls.jsonl`，每次模型调用一行：调用的是哪一种（`call`、`segment`、`topic` 等）、为哪个任务调用（`tool:<tool_use_id>`、`round:<轮的 uuid>`、`message:<发言 uuid>`、`unit:<单元序号>`）、开始和结束时间、对话记录的路径，失败时还有错误信息。
+第 5 步在 `extract/` 下写一份 `calls.jsonl`，每次模型调用一行：调用的是哪一种（`call`、`segment`、`topic` 等）、为哪个任务调用（`tool:<tool_use_id>`、`round:<轮的 uuid>`、`message:<发言 uuid>`、`unit:<单元序号>`）、开始和结束时间、对话记录的路径，失败时还有错误信息。
 
 ### 回放一次运行
 
@@ -80,11 +68,11 @@ N 由第 5、6 步的 `--window-rounds` 设定，默认值是 2，这两步要�
 $PY -m intent_aligner.replay corpus/results/claude-87eeb4bd-sol --out replay.html
 ```
 
-`intent_aligner.replay` 读结果目录的 `run.sh`，找到对话、模型和三步写出的文件，再把这次运行的每一次模型调用连同 `llm-home/` 里的原始请求和回答写成一个自包含的 HTML 页面，用浏览器直接打开。页面按时间顺序逐帧回放每次调用，播放时每帧分四拍：请求发出、端点处理、回答返回、代码校验。没有调用模型的抽取单元也占一帧，页面会说明代码为什么直接处理了它。
+`intent_aligner.replay` 读结果目录的 `run.sh`，找到对话、模型和三步写出的文件，再把这次运行的每一次模型调用连同 `llm-home/` 里的原始请求和回答写成一个自包含的 HTML 页面，用浏览器直接打开。运行还没结束时加 `--watch 30`，工具会每 30 秒用已有的数据重新生成页面，页面也每 30 秒重新载入，停在你正在看的那一帧；播放时等播放停下才载入，按 Ctrl-C 结束。页面按时间顺序逐帧回放每次调用，播放时每帧分四拍：请求发出、端点处理、回答返回、代码校验。没有调用模型的抽取单元也占一帧，页面会说明代码为什么直接处理了它。
 
 每一帧显示下面这些内容：
 
-- 流程条标出当前阶段，第 6 步标到具体的调用（T、A、B、G、L、C、D）。
+- 流程条标出当前阶段，主循环标到具体的调用（T、A、B、G、L、C、D）。
 - 当前任务的原文：抽取单元的全文和它所属的 topic，或者发言里正在切分的那一段。
 - 发给端点的请求：请求行里的设置、system、提示词和上下文窗口的规则。提示词里源码写死的文字和随任务变化的文字用不同底色区分，重问时附上的反馈另外标出来。
 - 模型的回答、推理、用量和 schema。
@@ -97,7 +85,7 @@ $PY -m intent_aligner.replay corpus/results/claude-87eeb4bd-sol --out replay.htm
 
 ### 调用 LLM
 
-轨迹提取器可以通过 Claude Code、Codex 或 pi 的命令行调用模型，也可以直接通过 HTTP 调用 Hive Frame 网关上的本地模型。`compress`、`segment` 和 `extract` 的 `--backend` 只接受 `claude`、`codex` 和 `hive`，`pi` 只能在下面的 `intent_aligner.llm` 和手动测试工具里使用。每次调用都是独立的一问一答，prompt 从标准输入读入，回复打印到标准输出，对话记录的路径打印到标准错误。
+轨迹提取器可以通过 Claude Code、Codex 或 pi 的命令行调用模型，也可以直接通过 HTTP 调用 Hive Frame 网关上的本地模型。`extract` 的 `--backend` 只接受 `claude`、`codex` 和 `hive`，`pi` 只能在下面的 `intent_aligner.llm` 和手动测试工具里使用。每次调用都是独立的一问一答，prompt 从标准输入读入，回复打印到标准输出，对话记录的路径打印到标准错误。
 
 ```bash
 echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.llm \
@@ -108,7 +96,7 @@ echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.ll
 - `--backend` 可以是 `claude`、`codex`、`pi` 或 `hive`。`--model` 按对应命令行的写法给出，pi 的写法是 `provider/model-id`，hive 的写法是网关 `/v1/models` 列出的 `deployment/<部署名>`。
 - `hive` 不经过任何 agent 命令行，发给网关的请求里只有系统提示和用户 prompt。网关地址默认是 `http://127.0.0.1:8790`，可以用环境变量 `HIVE_FRAME_URL` 改。思考参数按网关为这个部署声明的模型协议设置：Qwen 模板的模型打开思考，`low` 给 2048 个思考 token 的预算，`medium`、`high`、`xhigh` 都给 9216 个，这样单槽 18,944 token 里还放得下 prompt 和答案。
 - `--effort` 可以是 `low`、`medium`、`high` 或 `xhigh`，默认是 `xhigh`。
-- `--stream` 和 `--no-stream` 决定 `hive` 用流式还是整块接收回复，默认是流式，对其他后端没有影响。`--no-stream` 的请求如果超过网关 1200 秒的读取超时，这个槽位就会一直被占着，直到部署重启。`compress`、`segment` 和 `extract` 也有这两个选项。
+- `--stream` 和 `--no-stream` 决定 `hive` 用流式还是整块接收回复，默认是流式，对其他后端没有影响。`--no-stream` 的请求如果超过网关 1200 秒的读取超时，这个槽位就会一直被占着，直到部署重启。`extract` 也有这两个选项。
 - `--schema` 是可选的 JSON schema，给出时回复就是满足它的 JSON。pi 不支持这个参数。
 - 调用产生的对话记录只写进 `--home` 指定的目录，默认是工具根目录下的 `llm-home/`。对话记录不会出现在日常使用的 `~/.claude/projects`、`~/.codex/sessions` 或 `~/.pi/agent/sessions` 里。
 
