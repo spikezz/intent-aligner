@@ -326,7 +326,7 @@ D_UPDATE_SYSTEM_PROMPT = (
     + """
 这个工具结果属于聚合 aggregate，aggregate_observation 是这个聚合到上一个结果为止的观测。
 
-另外回答 summary：把 aggregate_observation 和这个结果合成一句完整的话，说明这个聚合现在的情况，脱离对话也能看懂。只写结果里实际出现的事实，还没有结果的就写还没有结果。
+另外回答 summary：根据这个结果，在 aggregate_observation 的基础上重写成一句完整的话，说明这个聚合现在做到了哪一步，和聚合的标题在同一层，脱离对话也能看懂。还没有结果的就写还没有结果。
 
 outcomes 回答合并后的观测现在表明的全部结果：之前成立并且仍然成立的要继续写，已经不成立的不写。
 """
