@@ -736,8 +736,33 @@ def _graphs(stores: Stores) -> dict[str, object]:
 
 def _graphs_block(stores: Stores) -> str:
     """The header of segmentation, which runs before a topic is known."""
-    header = {"graphs": _graphs(stores)}
-    return f"<header>\n{json.dumps(header, ensure_ascii=False, indent=2)}\n</header>"
+    return header_block({"graphs": _graphs(stores)})
+
+
+def header_block(header: dict[str, object]) -> str:
+    """The <header> block of a prompt, one topic, graph node or edge per line (see workflow.md)."""
+    members = [f"{_compact(key)}:{_spread(value, key)}" for key, value in header.items()]
+    return "<header>\n{\n" + ",\n".join(members) + "\n}\n</header>"
+
+
+# The header fields whose members each take a line; under "graphs" each member is a graph.
+_SPREAD_KEYS = frozenset({"topics", "graphs", "graph", "nodes", "edges"})
+
+
+def _spread(value: object, key: str) -> str:
+    if key not in _SPREAD_KEYS or not value:
+        return _compact(value)
+    if isinstance(value, dict):
+        inner = ((k, "graph" if key == "graphs" else k) for k in value)
+        members = [f"{_compact(k)}:{_spread(value[k], kind)}" for k, kind in inner]
+        return "{\n" + ",\n".join(members) + "\n}"
+    if isinstance(value, list):
+        return "[\n" + ",\n".join(_compact(v) for v in value) + "\n]"
+    return _compact(value)
+
+
+def _compact(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _speech_segments(
@@ -1641,7 +1666,7 @@ def _header(unit: Unit, topics: Sequence[tuple[str, str]], extra: dict[str, obje
         "unit": described,
         **{key: value for key, value in extra.items() if value is not None},
     }
-    return f"<header>\n{json.dumps(header, ensure_ascii=False, indent=2)}\n</header>"
+    return header_block(header)
 
 
 def render_unit(unit: Unit, digests: Digests) -> str:

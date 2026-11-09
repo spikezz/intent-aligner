@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from intent_aligner.corpus import TOOL_ROOT
-from intent_aligner.extract import into_stores, walk
+from intent_aligner.extract import header_block, into_stores, walk
 from intent_aligner.llm import LLM_HOME
 from intent_aligner.replay import (
     RULE_SOURCES,
@@ -23,6 +23,7 @@ from intent_aligner.replay import (
     literal_texts,
     parse_run,
     read_exchange,
+    readable,
 )
 from intent_aligner.store import Stores
 from intent_aligner.window import Digests
@@ -206,3 +207,36 @@ def test_graph_changes_add_up_to_the_final_graphs() -> None:
     got = {topic: (nodes[topic], edges[topic]) for topic in nodes}
     expected = {topic: (g["nodes"], g["edges"]) for topic, g in graphs.items()}
     assert got == expected, f"{got!r} vs {expected!r}"
+
+
+def _flat(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+@needs_sol
+def test_the_page_shows_the_header_the_model_got_indented() -> None:
+    """Each graph node and edge is one line for the model; the page's indented copy parses equal."""
+    calls = [json.loads(line) for line in (SOL_RUN / "extract" / "calls.jsonl").open()]
+    shown = 0
+    for call in calls:
+        exchange = read_exchange(Path(call["transcript"]))
+        if exchange is None or "<header>" not in exchange.prompt:
+            continue
+        before, rest = exchange.prompt.split("<header>\n", 1)
+        old, after = rest.split("\n</header>", 1)
+        header = json.loads(old)
+        sent = before + header_block(header) + after
+        lines = sent.split("<header>\n", 1)[1].split("\n</header>", 1)[0].splitlines()
+        on_lines = {line.rstrip(",") for line in lines}
+        for graph in [header.get("graph"), *header.get("graphs", {}).values()]:
+            if graph is None:
+                continue
+            entries = [_flat(k) + ":" + _flat(v) for k, v in graph["nodes"].items()]
+            entries += [_flat(edge) for edge in graph["edges"]]
+            missing = [e for e in entries if e not in on_lines]
+            assert not missing, f"not one line each: {missing[:2]}"
+        page = readable(sent)
+        assert json.loads(page.split("<header>\n", 1)[1].split("\n</header>", 1)[0]) == header
+        assert page.startswith(before) and page.endswith(after), call["transcript"]
+        shown += 1
+    assert shown, "no extract prompt with a header in the run"

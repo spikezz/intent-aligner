@@ -482,10 +482,11 @@ class _JobFinder:
         positions = [int(c.split(":")[1]) for c in candidates]
         ahead = [p for p in positions if p >= self.unit_pointer] or positions
         items, unit_items = self.conversation.items, self.conversation.unit_items
+        header = _header_of(prompt)
         stamped = [
             p
             for p in ahead
-            if f'"timestamp": "{items[unit_items[p]].source.timestamp.isoformat()}"' in prompt
+            if header["unit"]["timestamp"] == items[unit_items[p]].source.timestamp.isoformat()
         ]
         self.unit_pointer = (stamped or ahead)[0]
         return f"unit:{self.unit_pointer}"
@@ -624,9 +625,9 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
                     ended=exchange.ended,
                     transcript=str(exchange.path),
                     request=exchange.request,
-                    prompt=exchange.prompt,
-                    fixed=literal_ranges(exchange.prompt, literals),
-                    feedback_at=len(base) if k else None,
+                    prompt=readable(exchange.prompt),
+                    fixed=literal_ranges(readable(exchange.prompt), literals),
+                    feedback_at=len(readable(base)) if k else None,
                     window_seen=window_seen,
                     window_limit=window_limit,
                     reply=exchange.reply,
@@ -636,6 +637,27 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
                 )
             )
     return sorted(judged, key=lambda a: (a.started or a.ended, a.ended))
+
+
+HEADER = re.compile(r"<header>\n(.*?)\n</header>", re.S)
+
+
+def _header_of(prompt: str) -> Any:
+    match = HEADER.search(prompt)
+    if match is None:
+        raise ValueError(f"an extract prompt without a <header> block: {prompt[:200]!r}")
+    return json.loads(match.group(1))
+
+
+def readable(prompt: str) -> str:
+    """The prompt with its header indented for people; the model got the compact layout."""
+    return HEADER.sub(
+        lambda m: (
+            f"<header>\n{json.dumps(json.loads(m.group(1)), ensure_ascii=False, indent=2)}\n</header>"
+        ),
+        prompt,
+        count=1,
+    )
 
 
 def _window_seen(call: Call, conversation: Conversation) -> tuple[list[str] | None, int]:
