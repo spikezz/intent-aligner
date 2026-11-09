@@ -26,7 +26,14 @@ from intent_aligner.extract import (
 from intent_aligner.intent import Intent
 from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, TruncatedReply
 from intent_aligner.segment import Segment
-from intent_aligner.store import UNASSIGNED_FILE, Stores, TopicStore, dump_store, load_store
+from intent_aligner.store import (
+    UNASSIGNED_FILE,
+    Stores,
+    TopicStore,
+    dump_store,
+    graph_with_status,
+    load_store,
+)
 from intent_aligner.units import AIText, Item, Observation, UserSignal
 from intent_aligner.window import (
     PROMPT_BUDGET,
@@ -136,6 +143,7 @@ def _assignments(
     stores: Stores | None = None,
     relation: Ask = _no_edges,
     outcome: Ask = _no_outcomes,
+    outcome_update: Ask = _no_outcomes_summary,
 ) -> list[Assignment]:
     asks = Asks(
         topic=ask,
@@ -146,6 +154,7 @@ def _assignments(
         relation=relation,
         outcome=outcome,
         outcome_summary=_no_outcomes_summary,
+        outcome_update=outcome_update,
         round=_no_round,
     )
     stores = stores or Stores(merged_file="merged.jsonl", items=items)
@@ -345,7 +354,10 @@ def test_topic_files_follow_the_store_format(tmp_path: Path) -> None:
         ]
     }, listing
     nodes = {i: (n.type, n.label) for i, n in store.meta.graph.nodes.items()}
-    assert nodes == {"G001": ("aggregate", "调查项目")}, nodes
+    assert nodes == {
+        "G001": ("aggregate", "调查项目"),
+        "O001": ("aggregate_observation", "概括"),
+    }, nodes
     spans = [(s.id, s.kind, s.chars, [i.id for i in s.intents]) for s in store.spans]
     assert spans == [
         ("S001", "user_text", (0, 2), []),
@@ -449,7 +461,7 @@ def test_a_complete_match_keeps_the_registered_id_once_per_unit() -> None:
     }
 
     assert [i.id for i in by_id["u2(0, 3)"].intents] == ["I001"], by_id
-    assert list(stores.topic_nodes("T001")) == ["I001", "G001"], "a match registers nothing"
+    assert list(stores.topic_nodes("T001")) == ["I001", "G001", "O001"], "a match registers nothing"
 
 
 def test_an_incomplete_match_registers_a_refining_intent() -> None:
@@ -461,7 +473,7 @@ def test_an_incomplete_match_registers_a_refining_intent() -> None:
     )
     second = next(a for a in records if a.unit.uuid == "u2")
 
-    got = [(i.id, i.label, i.refines) for i in second.intents]
+    got = [(i.id, i.label, i.details_of) for i in second.intents]
     assert got == [("I002", "细化", "I001"), ("I003", "另一件", None)], got
 
 
@@ -507,7 +519,7 @@ def test_call_g_files_tool_intents_and_only_aggregates_enter_the_graph() -> None
 
     assert _header(prompts[0])["candidates"] == [], prompts[0]
     assert _header(prompts[1])["candidates"] == ["G001"], prompts[1]
-    assert list(stores.topic_nodes("T001")) == ["G001"], stores.topic_nodes("T001")
+    assert list(stores.topic_nodes("T001")) == ["G001", "O001"], stores.topic_nodes("T001")
     span = next(s for s in stores.stores["T001"].spans if s.kind == "tool_calls")
     got = [(i.id, i.note) for i in span.intents]
     assert got == [("L001", "推断"), ("L002", "推断")], got
@@ -794,6 +806,7 @@ def _long_run(
         relation=_no_edges,
         outcome=_no_outcomes,
         outcome_summary=_no_outcomes_summary,
+        outcome_update=_no_outcomes_summary,
         round=ask_round,
     )
     stores = Stores(merged_file="merged.jsonl", items=LONG)
@@ -919,7 +932,10 @@ ONE_SEGMENT = {"u1": [_segment(0, 3)]}
 
 
 def _one_round(
-    relation: Ask = _no_edges, outcome: Ask = _no_outcomes, aggregate: Ask = _one_aggregate
+    relation: Ask = _no_edges,
+    outcome: Ask = _no_outcomes,
+    aggregate: Ask = _one_aggregate,
+    outcome_update: Ask = _no_outcomes_summary,
 ) -> tuple[list[Assignment], Stores]:
     stores = Stores(merged_file="merged.jsonl", items=ONE_ROUND)
     got = _assignments(
@@ -931,6 +947,7 @@ def _one_round(
         stores=stores,
         relation=relation,
         outcome=outcome,
+        outcome_update=outcome_update,
     )
     return got, stores
 
@@ -940,41 +957,77 @@ def _edges(stores: Stores) -> list[tuple[str, str, str, str | None]]:
     return [(e.from_, e.to, e.relation, e.span) for e in graph.edges]
 
 
-def test_call_d_builds_the_node_and_the_produces_edge() -> None:
-    answers = iter(['{"outcomes": [{"relation": "satisfies", "target": "G001"}]}'])
+def test_an_update_replaces_the_text_and_the_edges_of_the_aggregates_node() -> None:
+    _, stores = _one_round(
+        outcome=lambda prompt: '{"outcomes": [{"relation": "satisfies", "target": "G001"}]}',
+        outcome_update=lambda prompt: json.dumps(
+            {"outcomes": [{"relation": "satisfies", "target": "G001"}], "summary": "合并"}
+        ),
+    )
 
-    def outcome(prompt: str) -> str:
-        return next(answers, '{"outcomes": []}')
+    graph = stores.stores["T001"].meta.graph
+    node = graph.nodes["O001"]
+    assert node.type == "aggregate_observation" and node.aggregate == "G001", node
+    assert node.label == "合并", node
+    assert [(e.from_, e.to, e.relation, e.evidence) for e in graph.edges] == [
+        ("O001", "G001", "satisfies", "c2")
+    ], graph.edges
+    status = graph_with_status(graph)["nodes"]["G001"]["status"]  # type: ignore[index]
+    assert status == "已完成", status
 
-    _, stores = _one_round(outcome=outcome)
 
-    node = stores.stores["T001"].meta.graph.nodes["O001"]
-    assert node.type == "observation" and node.label == "结果c1", node
-    got = _edges(stores)
-    assert got == [("G001", "O001", "produces", "S002"), ("O001", "G001", "satisfies", None)], got
-    assert list(stores.pending) == [4], "the later result stays a candidate"
+def test_an_update_that_no_longer_shows_it_done_puts_the_aggregate_back_to_pending() -> None:
+    _, stores = _one_round(
+        outcome=lambda prompt: '{"outcomes": [{"relation": "satisfies", "target": "G001"}]}',
+    )
+
+    graph = stores.stores["T001"].meta.graph
+    assert graph.edges == [], graph.edges
+    status = graph_with_status(graph)["nodes"]["G001"]["status"]  # type: ignore[index]
+    assert status == "待完成", status
 
 
-def test_call_c_gives_a_picked_observation_its_node() -> None:
-    prompts: list[str] = []
+def test_calls_and_results_are_paired_outside_the_graph() -> None:
+    _, stores = _one_round()
+
+    meta = stores.stores["T001"].meta
+    got = [(p.tool_use_id, p.result) for p in meta.tool_pairs["G001"]]
+    assert got == [("c1", "结果c1"), ("c2", "结果c2")], got
+    assert sum(n.type == "aggregate_observation" for n in meta.graph.nodes.values()) == 1
+
+
+def test_an_aggregates_first_result_is_its_observation_as_summarized() -> None:
     titles = iter(["甲", "乙"])
 
     def aggregate(prompt: str) -> str:
         return json.dumps({"answers": [{"aggregate": "NEW", "title": next(titles)}]})
 
+    _, stores = _one_round(aggregate=aggregate)
+
+    nodes = stores.stores["T001"].meta.graph.nodes
+    got = [(i, n.label) for i, n in nodes.items() if n.type == "aggregate_observation"]
+    assert got == [("O001", "结果c1"), ("O002", "结果c2")], got
+
+
+def test_call_c_gives_a_picked_pushed_observation_its_node() -> None:
+    notice = Observation(
+        source=_source("n1"), origin="system", text="API 错误", tool_use_id=None, is_error=False
+    )
+    items: list[Item] = [_user("u1", "第一条"), notice, _call("c1")]
+    stores = Stores(merged_file="merged.jsonl", items=items)
+
     def relation(prompt: str) -> str:
-        prompts.append(prompt)
-        if len(prompts) == 1:
+        if "P1" not in prompt:
             return '{"edges": []}'
-        edge = {"from": "P2", "to": "G002", "relation": "triggers", "evidence": "结果c1"}
+        edge = {"from": "P1", "to": "G001", "relation": "triggers", "evidence": "API 错误"}
         return json.dumps({"edges": [edge]})
 
-    _, stores = _one_round(relation=relation, aggregate=aggregate)
+    _assignments(items, ONE_SEGMENT, FULL, _new_then_first([]), stores=stores, relation=relation)
 
-    assert {"id": "P2", "text": "结果c1"} in _header(prompts[1])["candidates"], prompts[1]  # type: ignore[operator]
-    got = _edges(stores)
-    assert got == [("G001", "O001", "produces", "S002"), ("O001", "G002", "triggers", "S003")], got
-    assert list(stores.pending) == [4], "a picked observation stops being pending"
+    node = stores.stores["T001"].meta.graph.nodes["O001"]
+    assert node.type == "observation" and node.label == "概括", node
+    assert _edges(stores) == [("O001", "G001", "triggers", "S002")], _edges(stores)
+    assert list(stores.pending) == [], "a picked observation stops being pending"
 
 
 def test_call_c_retries_a_trigger_into_the_aggregate_that_produced_the_observation() -> None:
@@ -982,9 +1035,9 @@ def test_call_c_retries_a_trigger_into_the_aggregate_that_produced_the_observati
 
     def relation(prompt: str) -> str:
         prompts.append(prompt)
-        if "P2" not in prompt or len(prompts) > 2:
+        if "O001" not in prompt or len(prompts) > 2:
             return '{"edges": []}'
-        edge = {"from": "P2", "to": "G001", "relation": "triggers", "evidence": "结果c1"}
+        edge = {"from": "O001", "to": "G001", "relation": "triggers", "evidence": "结果c1"}
         return json.dumps({"edges": [edge]})
 
     got, stores = _one_round(relation=relation)
@@ -999,9 +1052,9 @@ def test_call_c_retries_an_edge_against_the_direction_of_its_relation() -> None:
 
     def relation(prompt: str) -> str:
         prompts.append(prompt)
-        if "P2" not in prompt or len(prompts) > 2:
+        if "O001" not in prompt or len(prompts) > 2:
             return '{"edges": []}'
-        edge = {"from": "G001", "to": "P2", "relation": "triggers", "evidence": "结果c1"}
+        edge = {"from": "G001", "to": "O001", "relation": "triggers", "evidence": "结果c1"}
         return json.dumps({"edges": [edge]})
 
     got, stores = _one_round(relation=relation)
@@ -1011,20 +1064,20 @@ def test_call_c_retries_an_edge_against_the_direction_of_its_relation() -> None:
     assert _edges(stores) == [], "the rejected edge must not be stored"
 
 
-def test_an_incomplete_intent_needs_its_refines_edge() -> None:
+def test_an_incomplete_intent_serves_the_one_it_adds_to_without_asking_call_c() -> None:
     timeline: list[Item] = [_user("u1", "第一条"), _user("u2", "第二条")]
     said = Intent(text="做事", evidence="第", explicit=True, note="")
     segments = {
         u: [Segment(start=0, end=3, text="", intents=[said], attempts=1)] for u in ("u1", "u2")
     }
+    stores = Stores(merged_file="merged.jsonl", items=timeline)
 
     def registry(prompt: str) -> str:
         return json.dumps({"answers": [{"match": "I001", "complete": False}]})
 
-    got = _assignments(timeline, segments, FULL, _new_then_first([]), registry=registry)
+    _assignments(timeline, segments, FULL, _new_then_first([]), registry=registry, stores=stores)
 
-    assert got[1].needs_review and "refines" in (got[1].review_reason or ""), got[1]
-    assert got[1].intents[0].id == "I002", "a failed call C keeps the intents already settled"
+    assert _edges(stores) == [("I002", "I001", "serves", "S002")], _edges(stores)
 
 
 def test_a_failed_call_d_leaves_a_needs_review_node() -> None:

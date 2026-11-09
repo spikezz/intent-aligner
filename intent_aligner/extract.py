@@ -12,8 +12,10 @@ an aggregate, the only form tool calls take in the graph, and call L matches it
 against that aggregate's tool-call intents, so a repeated one keeps its id. The code gives new nodes
 global ids, and the unit's span goes into the topic's store (intent_aligner.store).
 Call C then links the unit's intents to the topic's nodes. An observation goes to call
-D; one that neither satisfies nor blocks an intent stays pending, a candidate for a
-later triggers edge, and gets a node only if call C picks it.
+D. A tool result is paired with its call outside the graph and updates the observation
+node of the call's aggregate, one node per aggregate. Any other observation that neither
+satisfies nor blocks an intent stays pending, a candidate for a later triggers edge, and
+gets a node only if call C picks it.
 
 The current round enters the window as level-1 digests, one per tool call and result.
 Call G alone also sees what follows its unit (window.render_following), because an
@@ -66,6 +68,8 @@ from intent_aligner.llm import (
 from intent_aligner.segment import MessageSegments, Segment
 from intent_aligner.store import (
     STORE_HEADER,
+    AggregateNode,
+    AggregateObservationNode,
     Edge,
     IntentNode,
     ObservationNode,
@@ -73,6 +77,7 @@ from intent_aligner.store import (
     PendingObservation,
     SpanIntent,
     Stores,
+    graph_with_status,
     write_stores,
 )
 from intent_aligner.units import (
@@ -240,7 +245,7 @@ B_SCHEMA = {
 C_SYSTEM_PROMPT = """\
 你在判断对话里一个单元的意图和这个 topic 的其他节点之间有什么关系。
 
-<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个单元所属的 topic；unit 是这个单元的类型、发出者和时间；graph 是这个 topic 的意图图谱，nodes 是已有节点（intent 是用户或 AI 的意图，actor 说明是谁，aggregate 是工具操作的意图聚合，observation 是观测），edges 是已有的边；unit_intents 是这个单元的意图或聚合，编号和文本；candidates 是可以连接的节点：字符串是图谱里的编号，带 id 和 text 的对象是还没有建节点的观测；relations 是可以使用的关系，from 和 to 说明两端的节点种类，intent 既指用户或 AI 的意图，也指聚合。
+<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个单元所属的 topic；unit 是这个单元的类型、发出者和时间；graph 是这个 topic 的意图图谱，nodes 是已有节点（intent 是用户或 AI 的意图，actor 说明是谁，aggregate 是工具操作的意图聚合，observation 是环境推送的观测，aggregate_observation 是一个聚合到目前为止的观测），edges 是已有的边；unit_intents 是这个单元的意图或聚合，编号和文本；candidates 是可以连接的节点：字符串是图谱里的编号，带 id 和 text 的对象是还没有建节点的观测；relations 是可以使用的关系，from 和 to 说明两端的节点种类，intent 既指用户或 AI 的意图，也指聚合。
 
 <此前的对话> 是这个单元之前的对话。<当前单元> 是这个单元。
 
@@ -249,14 +254,11 @@ C_SYSTEM_PROMPT = """\
 - relation：关系类型，含义见 relations。
 - evidence：这条关系的依据，从 <当前单元> 或 <此前的对话> 原样摘录。可以用 … 省略中间的部分，但被 … 分开的每个片段都必须原样出现，并且按原文的先后顺序排列。
 
-unit_intents 里带 refines 的意图补充了那个已有意图，必须有一条从已有意图指向它的 refines 边。意图从 A 转向 B 时，记 A 到 B 的 supersedes 边；转向由某个观测引起时，再记这个观测到 B 的 triggers 边。triggers 的 to 是用户意图，或者产生这个观测的聚合之外的聚合；同一个聚合内部，结果引出下一步操作属于这个聚合本身的推进。只记录这个单元实际表现出来的关系。
+某个观测引出这个单元的意图时，记这个观测到这个意图的 triggers 边。triggers 的 to 是用户意图，或者产生这个观测的聚合之外的聚合；同一个聚合内部，结果引出下一步操作属于这个聚合本身的推进。只记录这个单元实际表现出来的关系。
 """
 
 _C_RELATIONS: dict[str, tuple[str, str, str]] = {
-    "prerequisite": ("intent", "intent", "要做 to，必须先完成 from"),
     "serves": ("intent", "intent", "from 是实现 to 的手段"),
-    "refines": ("intent", "intent", "to 把 from 具体化或加上限定；from 是已有的意图，to 是新意图"),
-    "supersedes": ("intent", "intent", "to 修正或取代了 from；from 是旧意图，to 是新意图"),
     "triggers": ("observation", "intent", "from 这个观测引出了 to 这个意图"),
 }
 
@@ -290,13 +292,26 @@ _D_COMMON = """\
 <此前的对话> 是这个观测之前的对话。<当前单元> 是这个观测。
 
 回答 outcomes：这个观测达成或阻碍的每个已有意图各一项，都没有时是空列表。每项回答两项：
-- relation：satisfies 表示这个观测表明这个意图已经达成；blocks 表示这个观测表明这个意图没有达成，或者遇到了障碍。
+- relation：satisfies 表示这个观测表明这件事已经做成；blocks 表示这个观测表明这个意图没有达成，或者遇到了障碍。
 - target：这个意图的编号，只能是 candidates 里的编号。
 
-只记录环境给出的事实直接表明的结果。操作还在进行中、结果还说明不了意图是否达成时，不要记录。
+意图允许一直不被完成，对话结束时仍然“待完成”是正常的结果。
+
+观测表明这件事已经做成时，才回答 satisfies。观测只说明事情推进了一步，或者看不出是否做成时，outcomes 里不写这个意图。
 """
 
 D_SYSTEM_PROMPT = _D_COMMON
+
+D_UPDATE_SYSTEM_PROMPT = (
+    _D_COMMON
+    + """
+这个工具结果属于聚合 aggregate，aggregate_observation 是这个聚合到上一个结果为止的观测。
+
+另外回答 summary：把 aggregate_observation 和这个结果合成一句完整的话，说明这个聚合现在的情况，脱离对话也能看懂。只写结果里实际出现的事实，还没有结果的就写还没有结果。
+
+outcomes 回答合并后的观测现在表明的全部结果：之前成立并且仍然成立的要继续写，已经不成立的不写。
+"""
+)
 
 D_SUMMARY_SYSTEM_PROMPT = (
     _D_COMMON
@@ -360,8 +375,8 @@ class UnitRef(BaseModel):
 class UnitIntent(BaseModel):
     """One intent of a unit under its registry id, with how it shows up in the unit.
 
-    `label` is set when this unit registered the node. `refines` is the existing
-    intent call B found incomplete, which call C will link to this new one. A tool
+    `label` is set when this unit registered the node. `details_of` is the existing
+    intent call B found incomplete; this new one serves it. A tool
     call's intent has its own `id` and its `aggregate`; `text` is set when this unit
     registered it, and `label` when it opened that aggregate.
     """
@@ -375,7 +390,7 @@ class UnitIntent(BaseModel):
     explicit: bool
     note: str
     label: str | None = None
-    refines: str | None = None
+    details_of: str | None = None
 
 
 class NewObservation(BaseModel):
@@ -390,6 +405,16 @@ class NewObservation(BaseModel):
     needs_review: bool = False
 
 
+class NewAggregateObservation(BaseModel):
+    """The latest text of `aggregate`'s observation node, new or updated by this unit."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    aggregate: str
+    label: str
+
+
 class Assignment(BaseModel):
     """One line of assignments.jsonl; `topic` is None when the unit is unassigned.
 
@@ -397,8 +422,9 @@ class Assignment(BaseModel):
     unit needs review; `attempts` counts call T's calls and is 0 when none was made.
     `edges` are the edges this unit set up, their spans filled in when the stores are
     folded. `observations` are the nodes it built: its own, or those its triggers edges
-    pointed at. `pending_text` is the text of an observation left without a node, and
-    `placeholder` marks a whole speech without intents.
+    pointed at. `aggregate_observations` update the nodes of a tool result's aggregates,
+    and `tool_result` is the text paired with its call. `pending_text` is the text of an
+    observation left without a node, and `placeholder` marks a whole speech without intents.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -412,6 +438,8 @@ class Assignment(BaseModel):
     attempts: int
     edges: list[Edge] = Field(default_factory=list)
     observations: list[NewObservation] = Field(default_factory=list)
+    aggregate_observations: list[NewAggregateObservation] = Field(default_factory=list)
+    tool_result: str | None = None
     pending_text: str | None = None
     placeholder: bool = False
 
@@ -482,7 +510,7 @@ class _CEdge(BaseModel):
 
     from_: str = Field(alias="from")
     to: str
-    relation: Literal["prerequisite", "serves", "refines", "supersedes", "triggers"]
+    relation: Literal["serves", "triggers"]
     evidence: str = Field(min_length=1)
 
 
@@ -497,6 +525,9 @@ class _Outcome(BaseModel):
 
     relation: Literal["satisfies", "blocks"]
     target: str
+
+
+_OBSERVATION_NODES = (AggregateObservationNode, ObservationNode)
 
 
 class _DAnswer(BaseModel):
@@ -518,6 +549,7 @@ class Asks:
     relation: Ask
     outcome: Ask
     outcome_summary: Ask
+    outcome_update: Ask
     round: Ask
 
 
@@ -1029,10 +1061,10 @@ def _match_intents(
             if all(r.id != matched.match for r in resolved):
                 resolved.append(UnitIntent(id=matched.match, **found))
             continue
-        refines = None if matched.match == NEW else matched.match
+        details_of = None if matched.match == NEW else matched.match
         node_id = stores.next_intent_id(new)
         new += 1
-        resolved.append(UnitIntent(id=node_id, label=intent.text, refines=refines, **found))
+        resolved.append(UnitIntent(id=node_id, label=intent.text, details_of=details_of, **found))
     return record.model_copy(update={"intents": resolved})
 
 
@@ -1046,9 +1078,8 @@ def _visible_pending(
 ) -> dict[str, PendingObservation]:
     """The pending observations of `topic` the window shows one by one, keyed by call C's handle.
 
-    An observation leaves when it is compressed away or only a round summary covers it,
-    which also keeps the list inside the budget: listing every observation of
-    the earlier rounds could fill the whole prompt budget by itself.
+    Only pushed observations wait here, because a tool result lives on its aggregate's node.
+    One leaves when it is compressed away or falls outside the window's rounds.
     """
     low = _round_low(step)
     compressed_up_to = in_force[-1].through if in_force else low
@@ -1056,9 +1087,8 @@ def _visible_pending(
     earliest = opened[-context.window_rounds :][0] if opened else low
     shown: dict[str, PendingObservation] = {}
     for index, pending in stores.pending.items():
-        item = context.items[index]
         in_current = compressed_up_to <= index < step.index
-        raw_earlier = earliest <= index < low and not is_tool_record(item)
+        raw_earlier = earliest <= index < low
         if pending.topic == topic and (in_current or raw_earlier):
             shown[f"P{index}"] = pending
     return shown
@@ -1072,8 +1102,6 @@ def _unit_nodes(record: Assignment, topic: str, stores: Stores) -> dict[str, dic
     for intent in record.intents:
         node_id = intent.aggregate or intent.id
         nodes.setdefault(node_id, {"id": node_id, "text": labels[node_id]})
-        if intent.refines is not None:
-            nodes[node_id]["refines"] = intent.refines
     return nodes
 
 
@@ -1118,9 +1146,10 @@ def _relate(
     except WindowError as error:
         return _review(record, str(error))
     pending = _visible_pending(step, topic, window.in_force, context, stores)
-    origins = {i: node.source for i, node in known.items() if isinstance(node, ObservationNode)}
-    origins |= {handle: observation.source for handle, observation in pending.items()}
-    observations = set(origins)
+    own_aggregate = {
+        i: node.aggregate for i, node in known.items() if isinstance(node, AggregateObservationNode)
+    }
+    observations = {i for i, n in known.items() if isinstance(n, _OBSERVATION_NODES)} | set(pending)
     allowed = {*known, *unit_nodes, *pending}
     source = _unit_source(step.unit)
     shown_input = prompt[prompt.index("<此前的对话>") :]
@@ -1138,20 +1167,12 @@ def _relate(
             kinds = tuple("observation" if e in observations else "intent" for e in ends)
             if kinds != (start, end):
                 raise ValueError(f"{edge.relation} 的方向必须是 {start} -> {end}，{ends!r} 不是。")
-            if edge.relation == "triggers" and edge.to in stores.producers(origins[edge.from_]):
+            if edge.relation == "triggers" and edge.to == own_aggregate.get(edge.from_):
                 raise ValueError(
                     f"{edge.from_} 是 {edge.to} 自己的工具调用产生的结果。同一个聚合内部，结果引出下一步操作属于这个聚合本身的推进，去掉这条 triggers 边。"
                 )
             if not is_excerpt(edge.evidence, source) and not is_excerpt(edge.evidence, shown_input):
                 raise ValueError(f"evidence {edge.evidence!r} 不是当前单元或此前对话的原文摘录。")
-        linked = {(e.from_, e.to) for e in got if e.relation == "refines"}
-        missing = [
-            (n["refines"], n["id"])
-            for n in unit_nodes.values()
-            if "refines" in n and (n["refines"], n["id"]) not in linked
-        ]
-        if missing:
-            raise ValueError(f"这些意图补充了已有意图，缺少 refines 边：{missing!r}。")
         return got
 
     answered, _, feedback = _ask_until_valid(ask, prompt, parse, CALL_ATTEMPTS)
@@ -1185,6 +1206,25 @@ def _relate(
     return record.model_copy(update={"edges": edges, "observations": built})
 
 
+def _parse_outcomes(reply: str, candidates: Sequence[str], needs_summary: bool) -> _DAnswer:
+    answer = _DAnswer.model_validate_json(reply)
+    wrong = [o.target for o in answer.outcomes if o.target not in candidates]
+    if wrong:
+        raise ValueError(f"{wrong!r} 不在 candidates 里。")
+    if needs_summary and not answer.summary.strip():
+        raise ValueError("summary 不能为空。")
+    return answer
+
+
+def _outcome_edges(node_id: str, answer: _DAnswer, evidence: str) -> list[Edge]:
+    return [
+        Edge.model_validate(
+            {"from": node_id, "to": o.target, "relation": o.relation, "evidence": evidence}
+        )
+        for o in answer.outcomes
+    ]
+
+
 def _observe(
     step: _Step,
     unit: Observation,
@@ -1194,9 +1234,11 @@ def _observe(
     asks: Asks,
     stores: Stores,
 ) -> Assignment:
-    """Call D: a node when the observation satisfies or blocks an intent, else it stays pending.
+    """Call D: which intents the observation shows done or blocked, and where its text goes.
 
-    One that cannot be judged still gets a needs_review node, so it is not silently lost.
+    A tool result updates its aggregates' observation nodes, whatever the outcomes. A
+    pushed observation gets a node only with outcomes, else it stays pending. One that
+    cannot be judged still gets a needs_review node, so it is not silently lost.
     """
     source = ObservationSource(uuid=unit.source.uuid, tool_use_id=unit.tool_use_id)
     known_text = (
@@ -1204,6 +1246,9 @@ def _observe(
         if unit.tool_use_id is not None
         else unit.text
     )
+    aggregates = stores.aggregates_of(unit.tool_use_id) if unit.tool_use_id is not None else []
+    if record.topic is not None and aggregates:
+        record = record.model_copy(update={"tool_result": known_text})
 
     def failed(reason: str) -> Assignment:
         built = NewObservation(
@@ -1220,42 +1265,68 @@ def _observe(
         return failed(record.review_reason or "The tool call that produced this has no topic.")
     if record.new_title is not None:
         stores.open_topic(topic)
-    candidates = [i for i, n in stores.topic_nodes(topic).items() if n.type != "observation"]
-    needs_summary = unit.tool_use_id is None
-    system = D_SUMMARY_SYSTEM_PROMPT if needs_summary else D_SYSTEM_PROMPT
-    ask = asks.outcome_summary if needs_summary else asks.outcome
-    try:
-        head = _graph_header(
-            step, context, topic, stores, candidates, {"relations": ["satisfies", "blocks"]}
-        )
-        prompt = _fitted_prompt(step, context, system, head, window)
-    except WindowError as error:
-        return failed(str(error))
-
-    def parse(reply: str) -> _DAnswer:
-        answer = _DAnswer.model_validate_json(reply)
-        wrong = [o.target for o in answer.outcomes if o.target not in candidates]
-        if wrong:
-            raise ValueError(f"{wrong!r} 不在 candidates 里。")
-        if needs_summary and not answer.summary.strip():
-            raise ValueError("summary 不能为空。")
-        return answer
-
-    answered, _, feedback = _ask_until_valid(ask, prompt, parse, CALL_ATTEMPTS)
-    if answered is None:
-        return failed(f"call D gave no valid answer in {CALL_ATTEMPTS} attempts: {feedback}")
-    text = answered.summary.strip() if needs_summary else known_text
-    if not answered.outcomes:
-        return record.model_copy(update={"pending_text": text})
-    node_id = stores.next_observation_id()
-    built = NewObservation(id=node_id, item=step.index, label=text, source=source)
-    edges = [
-        Edge.model_validate(
-            {"from": node_id, "to": o.target, "relation": o.relation, "evidence": text}
-        )
-        for o in answered.outcomes
+    candidates = [
+        i for i, n in stores.topic_nodes(topic).items() if isinstance(n, IntentNode | AggregateNode)
     ]
-    return record.model_copy(update={"edges": edges, "observations": [built]})
+
+    def judge(
+        system: str, ask: Ask, needs_summary: bool, more: dict[str, object]
+    ) -> _DAnswer | str:
+        """The answer of call D, or why there is none."""
+        try:
+            head = _graph_header(
+                step,
+                context,
+                topic,
+                stores,
+                candidates,
+                {"relations": ["satisfies", "blocks"], **more},
+            )
+            prompt = _fitted_prompt(step, context, system, head, window)
+        except WindowError as error:
+            return str(error)
+        answered, _, feedback = _ask_until_valid(
+            ask, prompt, lambda r: _parse_outcomes(r, candidates, needs_summary), CALL_ATTEMPTS
+        )
+        if answered is None:
+            return f"call D gave no valid answer in {CALL_ATTEMPTS} attempts: {feedback}"
+        return answered
+
+    if unit.tool_use_id is None:
+        judged = judge(D_SUMMARY_SYSTEM_PROMPT, asks.outcome_summary, True, {})
+        if isinstance(judged, str):
+            return failed(judged)
+        text = judged.summary.strip()
+        if not judged.outcomes:
+            return record.model_copy(update={"pending_text": text})
+        node_id = stores.next_observation_id()
+        built = NewObservation(id=node_id, item=step.index, label=text, source=source)
+        edges = _outcome_edges(node_id, judged, unit.source.uuid)
+        return record.model_copy(update={"edges": edges, "observations": [built]})
+
+    if not aggregates:
+        return failed("The tool call that produced this has no aggregate to file it under.")
+    updated: list[NewAggregateObservation] = []
+    all_edges: list[Edge] = []
+    opened = 0
+    for aggregate in aggregates:
+        existing = stores.aggregate_observation(topic, aggregate)
+        if existing is None:
+            judged = judge(D_SYSTEM_PROMPT, asks.outcome, False, {"aggregate": aggregate})
+        else:
+            more: dict[str, object] = {
+                "aggregate": aggregate,
+                "aggregate_observation": stores.topic_nodes(topic)[existing].label,
+            }
+            judged = judge(D_UPDATE_SYSTEM_PROMPT, asks.outcome_update, True, more)
+        if isinstance(judged, str):
+            return failed(judged)
+        label = known_text if existing is None else judged.summary.strip()
+        node_id = existing or stores.next_observation_id(opened)
+        opened += existing is None
+        updated.append(NewAggregateObservation(id=node_id, aggregate=aggregate, label=label))
+        all_edges.extend(_outcome_edges(node_id, judged, unit.tool_use_id))
+    return record.model_copy(update={"edges": all_edges, "aggregate_observations": updated})
 
 
 def _review(record: Assignment, reason: str) -> Assignment:
@@ -1265,13 +1336,19 @@ def _review(record: Assignment, reason: str) -> Assignment:
 def into_stores(stores: Stores, step: _Step, record: Assignment) -> None:
     """Register the record's new intents and put the unit's span in its store.
 
-    An observation has no span: it becomes a node, or waits as a triggers candidate.
+    An observation has no span: it goes on a node, or waits as a triggers candidate.
     """
     unit, topic = step.unit, record.topic
     if topic is not None and topic not in stores.stores:
         stores.open_topic(topic)
     if isinstance(unit, Observation):
         _add_observations(stores, topic, record)
+        if record.tool_result is not None:
+            assert topic is not None and unit.tool_use_id is not None
+            stores.add_tool_pair(topic, unit.tool_use_id, record.tool_result)
+        for built in record.aggregate_observations:
+            assert topic is not None
+            stores.set_aggregate_observation(topic, built.id, built.aggregate, built.label)
         stores.add_edges(topic, record.edges)
         if record.pending_text is not None:
             assert topic is not None
@@ -1309,7 +1386,16 @@ def into_stores(stores: Stores, step: _Step, record: Assignment) -> None:
             topic, unit, step.index, spans, frozenset(aggregates), record.needs_review
         )
     _add_observations(stores, topic, record)
-    stores.add_edges(topic, [e.model_copy(update={"span": span}) for e in record.edges])
+    details = [
+        Edge.model_validate(
+            {"from": i.id, "to": i.details_of, "relation": "serves", "evidence": i.evidence}
+        )
+        for i in record.intents
+        if i.details_of is not None
+    ]
+    stores.add_edges(
+        topic, [e.model_copy(update={"span": span}) for e in [*details, *record.edges]]
+    )
 
 
 def _add_observations(stores: Stores, topic: str | None, record: Assignment) -> None:
@@ -1329,7 +1415,7 @@ def _graph_header(
     more: dict[str, object] | None = None,
 ) -> str:
     """The header of calls after T: the current topic and its whole graph."""
-    graph = stores.stores[topic].meta.graph.model_dump(by_alias=True, exclude_none=True)
+    graph = graph_with_status(stores.stores[topic].meta.graph)
     extra: dict[str, object] = {"current_topic": topic, "graph": graph}
     if candidates is not None:
         extra["candidates"] = candidates
@@ -1504,6 +1590,7 @@ def main() -> None:
         relation=ask("relation", C_SYSTEM_PROMPT, C_SCHEMA),
         outcome=ask("outcome", D_SYSTEM_PROMPT, D_SCHEMA),
         outcome_summary=ask("outcome_summary", D_SUMMARY_SYSTEM_PROMPT, D_SUMMARY_SCHEMA),
+        outcome_update=ask("outcome_update", D_UPDATE_SYSTEM_PROMPT, D_SUMMARY_SCHEMA),
         round=ask("round", ROUND_SYSTEM_PROMPT, SUMMARY_SCHEMA),
     )
     stores = Stores(merged_file=str(args.merged), items=items)

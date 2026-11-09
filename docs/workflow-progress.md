@@ -70,9 +70,9 @@ flowchart TD
     GASSIGN["代码：给 NEW 分配 G 编号<br/>同一个底层意图沿用原 L 编号，其余分配新 L 编号<br/>登记进 meta.tool_intents，段落引用 L 编号"]
     GASSIGN --> C
     C["调用 C：这个单元的每个意图<br/>和候选之间有关系吗？<br/>输出 [起点编号, 终点编号, relation 枚举, evidence]"]
-    C --> VC{"校验 C<br/>两端一个是本单元的意图<br/>另一个在候选列表或本单元的意图里？<br/>relation 在枚举里且方向和节点类型匹配？<br/>evidence 是单元原文或 input 的摘录？<br/>“不完整”的意图有 refines 边？"}
+    C --> VC{"校验 C<br/>两端一个是本单元的意图<br/>另一个在候选列表或本单元的意图里？<br/>relation 在枚举里且方向和节点类型匹配？<br/>evidence 是单元原文或 input 的摘录？"}
     VC -- 不通过 --> C
-    VC -- 通过 --> TRIG["代码：重复的边去重<br/>triggers 指向尚未建节点的观测时<br/>用这个观测的概括文本为它建节点<br/>是工具结果则补 produces 边"]
+    VC -- 通过 --> TRIG["代码：重复的边去重<br/>triggers 指向尚未建节点的观测时<br/>用这个观测的概括文本为它建节点"]
     TRIG --> SPAN
 
     SPAN["代码：定段落<br/>发言段落沿用切分给出的边界<br/>工具调用按合并规则并入前一段或新建段落<br/>填 id / kind / source / chars 或 tool_use_ids / text"]
@@ -82,11 +82,11 @@ flowchart TD
 
     CTXD["代码：组装 context<br/>header：topic 列表、当前 topic、<br/>单元信息、当前 topic 的整张图谱、候选<br/>input：窗口内的对话 + 这个观测<br/>工具结果给第一级压缩的概括，其他观测给原文"]
     CTXD --> RETD["代码：列出候选<br/>当前 topic 的全部意图节点（用户的和 AI 的）和聚合节点"]
-    RETD --> D["调用 D：这个观测达成或阻碍了哪些已有意图？<br/>输出 [relation, 目标编号] 列表，为空表示都没有<br/>任务通知和系统消息另外输出一句概括"]
+    RETD --> D["调用 D：这个观测表明哪些已有意图做成了或受阻了？<br/>输出 [relation, 目标编号] 列表，为空表示都没有<br/>任务通知、系统消息和聚合的第二个及以后的结果<br/>另外输出一句概括"]
     D --> VD{"校验 D<br/>relation 只能是 satisfies / blocks？<br/>目标编号在候选列表里？<br/>需要概括时概括非空？"}
     VD -- 不通过 --> D
-    VD -- "通过，列表非空" --> ONODE["代码：建观测节点<br/>是工具结果则补 produces 边"]
-    VD -- "通过，列表为空" --> PEND["代码：暂不建节点<br/>概括文本留在窗口里<br/>作为 triggers 的候选"]
+    VD -- "工具结果，或列表非空" --> ONODE["代码：工具结果写入 tool_pairs，<br/>更新聚合的观测节点，换掉它的 satisfies / blocks 边<br/>其他观测建观测节点"]
+    VD -- "任务通知或系统消息，列表为空" --> PEND["代码：暂不建节点<br/>概括文本留在窗口里<br/>作为 triggers 的候选"]
     ONODE --> FINAL
     PEND --> FINAL
 

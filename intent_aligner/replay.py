@@ -36,6 +36,7 @@ from intent_aligner import compress, extract, segment, window
 from intent_aligner.corpus import TOOL_ROOT
 from intent_aligner.extract import (
     Assignment,
+    SpeechSegment,
     Unit,
     into_stores,
     load_assignments,
@@ -46,8 +47,15 @@ from intent_aligner.extract import (
 )
 from intent_aligner.llm import CALLS_FILE, LLM_HOME, TRUNCATED_FEEDBACK, CallRecord
 from intent_aligner.segment import Segment, message_window
-from intent_aligner.store import Stores
-from intent_aligner.units import SPEAKER_NAMES, Item, Speech, ToolCall, conversation_units
+from intent_aligner.store import IntentNode, Stores
+from intent_aligner.units import (
+    SPEAKER_NAMES,
+    Item,
+    Observation,
+    Speech,
+    ToolCall,
+    conversation_units,
+)
 from intent_aligner.window import Digests, load_digests, qwen_tokens, round_entry
 
 TEMPLATE = Path(__file__).with_name("replay.html")
@@ -67,6 +75,7 @@ STEPS: dict[str, tuple[str, str]] = {
     extract.C_SYSTEM_PROMPT: ("LOOP", "relation"),
     extract.D_SYSTEM_PROMPT: ("LOOP", "outcome"),
     extract.D_SUMMARY_SYSTEM_PROMPT: ("LOOP", "outcome_summary"),
+    extract.D_UPDATE_SYSTEM_PROMPT: ("LOOP", "outcome_update"),
 }
 # The letter each extract ask goes by in review_reason ("call T gave no valid answer ...").
 LETTERS = {
@@ -78,6 +87,7 @@ LETTERS = {
     "relation": "C",
     "outcome": "D",
     "outcome_summary": "D",
+    "outcome_update": "D",
 }
 
 
@@ -749,8 +759,9 @@ RULE_SOURCES: dict[str, tuple[str, ...]] = {
     "aggregate": ("extract._file_under_aggregates.parse", "extract._ask_until_valid"),
     "tool_intent": ("extract._match_tool_intents.parse", "extract._ask_until_valid"),
     "relation": ("extract._relate.parse", "extract._ask_until_valid"),
-    "outcome": ("extract._observe.parse", "extract._ask_until_valid"),
-    "outcome_summary": ("extract._observe.parse", "extract._ask_until_valid"),
+    "outcome": ("extract._parse_outcomes", "extract._ask_until_valid"),
+    "outcome_summary": ("extract._parse_outcomes", "extract._ask_until_valid"),
+    "outcome_update": ("extract._parse_outcomes", "extract._ask_until_valid"),
 }
 
 
@@ -890,7 +901,10 @@ class Job(BaseModel):
 
     `column` is the round it belongs to (0 before the first speech); `after`
     lists the jobs whose output it reads. `speaker` names who made the speech an L2 or
-    SEG job works from. `text` is what the job works on when its
+    SEG job works from. `route` is set on an extract unit marked needs_review: the letters
+    of the calls its path goes through, so the page can show the ones that were never sent;
+    a letter ending in ? runs only if a model answer the unit did not get asks for it.
+    `text` is what the job works on when its
     prompt does not show it alone: an extract unit's block or a message's body. `log`
     are the run.log lines about an extract unit.
     """
@@ -903,13 +917,17 @@ class Job(BaseModel):
     column: int
     after: list[str]
     speaker: str = ""
+    route: list[str] = []
     text: str = ""
     log: list[str] = []
     record: Any
 
 
-def run_jobs(conversation: Conversation, extract_dir: Path) -> list[Job]:
+def run_jobs(conversation: Conversation, extract_dir: Path, stores: Stores) -> list[Job]:
     """Every job the run had to do, whether or not it called the model.
+
+    `stores` starts empty and has each unit folded in, because whether a unit needs a
+    call depends on the graph as it stood when the unit ran.
 
     A speech's segments run one after another and read the round summaries of the
     window before it; only a round with tool work has a summary, and so a job. Extract units run in a single chain. The barriers between
@@ -975,11 +993,19 @@ def run_jobs(conversation: Conversation, extract_dir: Path) -> list[Job]:
     compressions = load_compressions(compressions_path) if compressions_path.exists() else []
     log_path = extract_dir / "run.log"
     log = log_path.read_text(encoding="utf-8").splitlines() if log_path.exists() else []
-    for position, block in enumerate(conversation.units):
+    steps = walk(items, conversation.segments)
+    for position, (block, step) in enumerate(zip(conversation.units, steps, strict=True)):
         index = conversation.unit_items[position]
         assignment = (
             conversation.assignments[position] if position < len(conversation.assignments) else None
         )
+        route = (
+            _route(step.unit, assignment, stores)
+            if assignment is not None and assignment.needs_review
+            else []
+        )
+        if assignment is not None:
+            into_stores(stores, step, assignment)
         made.append(
             Job(
                 id=f"unit:{position}",
@@ -987,6 +1013,7 @@ def run_jobs(conversation: Conversation, extract_dir: Path) -> list[Job]:
                 label=block.split("\n", 2)[-1][:40],
                 column=columns[index],
                 after=[f"unit:{position - 1}"] if position else [],
+                route=route,
                 text=block,
                 log=[] if assignment is None else _log_lines(log, assignment),
                 record={
@@ -998,6 +1025,34 @@ def run_jobs(conversation: Conversation, extract_dir: Path) -> list[Job]:
             )
         )
     return made
+
+
+def _route(unit: Unit, record: Assignment, stores: Stores) -> list[str]:
+    """The call letters on `unit`'s path, given the graph before it ran.
+
+    Mirrors the branches of the extract loop. Without a topic the graph that decides
+    calls B and L is unknown, so they end in ?; so do B and C after call A, whose answer
+    decides whether the unit has intents at all.
+    """
+    store = stores.stores.get(record.topic) if record.topic is not None else None
+    if isinstance(unit, Observation):
+        return ["D"] if unit.tool_use_id is not None else ["T", "D"]
+    if isinstance(unit, ToolCall):
+        may_match = record.topic is None or (store is not None and store.meta.tool_intents)
+        return ["T", "G", *(["L?"] if may_match else []), "C"]
+    if isinstance(unit, SpeechSegment) and not unit.segment.intents:
+        return ["T"]
+    actor = unit.speech.speaker if isinstance(unit, SpeechSegment) else "user"
+    known = record.topic is not None
+    has_candidates = store is not None and any(
+        isinstance(node, IntentNode) and node.actor == actor
+        for node in store.meta.graph.nodes.values()
+    )
+    if isinstance(unit, SpeechSegment):
+        registry = ["B"] if has_candidates else [] if known else ["B?"]
+        return ["T", *registry, "C"]
+    registry = ["B?"] if has_candidates or not known else []
+    return ["T", "A", *registry, "C?"]
 
 
 def _log_lines(log: Sequence[str], assignment: Assignment) -> list[str]:
@@ -1128,7 +1183,11 @@ def build_page(run: Run, since: datetime | None, until: datetime | None) -> Page
         window=window_rules(run.window_rounds),
         window_rounds=conversation.window_rounds,
         calls=judge(calls, conversation),
-        jobs=run_jobs(conversation, run.extract),
+        jobs=run_jobs(
+            conversation,
+            run.extract,
+            Stores(merged_file=str(run.merged), items=conversation.items),
+        ),
         graphs=graph_changes(run, conversation),
         topics={a.topic: a.new_title for a in conversation.assignments if a.topic and a.new_title},
         files={

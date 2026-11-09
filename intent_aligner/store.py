@@ -21,9 +21,7 @@ from intent_aligner.units import Item, Speech, ToolCall, UserSignal
 STORE_HEADER = "# 结构和填写规则见 docs/trajectory-extractor.md（路径相对于工具根目录）\n"
 UNASSIGNED_FILE = "unassigned.yaml"
 
-Relation = Literal[
-    "prerequisite", "serves", "refines", "supersedes", "produces", "satisfies", "blocks", "triggers"
-]
+Relation = Literal["serves", "satisfies", "blocks", "triggers"]
 
 
 class IntentNode(BaseModel):
@@ -58,8 +56,18 @@ class ObservationSource(BaseModel):
     tool_use_id: str | None = None
 
 
+class AggregateObservationNode(BaseModel):
+    """How the tool calls of `aggregate` have turned out so far; only the latest state."""
+
+    model_config = ConfigDict(frozen=True)
+
+    type: Literal["aggregate_observation"] = "aggregate_observation"
+    aggregate: str
+    label: str = Field(min_length=1)
+
+
 class ObservationNode(BaseModel):
-    """An observation that moved the trajectory, or one whose extraction failed."""
+    """A pushed observation that moved the trajectory, or one whose extraction failed."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -69,7 +77,10 @@ class ObservationNode(BaseModel):
     needs_review: Literal[True] | None = None
 
 
-Node = Annotated[IntentNode | AggregateNode | ObservationNode, Field(discriminator="type")]
+Node = Annotated[
+    IntentNode | AggregateNode | AggregateObservationNode | ObservationNode,
+    Field(discriminator="type"),
+]
 
 
 class Edge(BaseModel):
@@ -97,11 +108,22 @@ class Graph(BaseModel):
     edges: list[Edge] = Field(default_factory=list)
 
 
+class ToolPair(BaseModel):
+    """A tool call and its result; `result` is the level-1 summary of the result."""
+
+    model_config = ConfigDict(frozen=True)
+
+    tool_use_id: str
+    call: str
+    result: str
+
+
 class Meta(BaseModel):
     """`topic` is None for the unassigned file.
 
-    `tool_intents` maps aggregate id -> tool-call intent id -> its text. It sits outside
-    `graph` because the graph goes into every call's header and these do not.
+    `tool_intents` maps aggregate id -> tool-call intent id -> its text, and `tool_pairs`
+    aggregate id -> its calls with their results. They sit outside `graph` because the
+    graph goes into every call's header and these do not.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -109,6 +131,7 @@ class Meta(BaseModel):
     topic: str | None
     graph: Graph = Field(default_factory=Graph)
     tool_intents: dict[str, dict[str, str]] = Field(default_factory=dict)
+    tool_pairs: dict[str, list[ToolPair]] = Field(default_factory=dict)
 
 
 class SpanSource(BaseModel):
@@ -168,6 +191,16 @@ def load_store(path: Path) -> TopicStore:
     return TopicStore.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
 
 
+def graph_with_status(graph: Graph) -> dict[str, object]:
+    """The graph as a call's header shows it: each intent and aggregate with its status."""
+    done = {e.to for e in graph.edges if e.relation == "satisfies"}
+    data = graph.model_dump(by_alias=True, exclude_none=True)
+    for node_id, node in data["nodes"].items():
+        if node["type"] in ("intent", "aggregate"):
+            node["status"] = "已完成" if node_id in done else "待完成"
+    return data
+
+
 def dump_store(store: TopicStore) -> str:
     """The store as YAML in the field order of the format, leaving out unset fields."""
     TopicStore.model_validate(store.model_dump(by_alias=True))
@@ -176,6 +209,8 @@ def dump_store(store: TopicStore) -> str:
     data["meta"] = {"topic": store.meta.topic, **data["meta"]}
     if not store.meta.tool_intents:
         del data["meta"]["tool_intents"]
+    if not store.meta.tool_pairs:
+        del data["meta"]["tool_pairs"]
     return STORE_HEADER + yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
 
 
@@ -190,10 +225,10 @@ class _OpenToolSpan:
 
 
 @attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
-class _CallSpan:
-    """The span a tool call ended up in and the aggregates its produces edges start from."""
+class _Call:
+    """What a tool call's result is paired with: the call's text and its aggregates."""
 
-    span: str
+    text: str
     aggregates: frozenset[str]
 
 
@@ -223,7 +258,7 @@ class Stores:
     spans: int = 0
     observations: int = 0
     pending: dict[int, PendingObservation] = attrs.field(factory=dict)
-    _call_spans: dict[str, _CallSpan] = attrs.field(factory=dict)
+    _calls: dict[str, _Call] = attrs.field(factory=dict)
     _open_tool_span: _OpenToolSpan | None = None
 
     def next_intent_id(self, offset: int = 0) -> str:
@@ -250,10 +285,55 @@ class Stores:
         """The observation id `offset` places after the last one given out."""
         return f"O{self.observations + 1 + offset:03d}"
 
-    def producers(self, source: ObservationSource) -> frozenset[str]:
-        """The aggregates of the tool call behind an observation; empty if no call produced it."""
-        call = self._call_spans.get(source.tool_use_id) if source.tool_use_id else None
-        return call.aggregates if call is not None else frozenset()
+    def aggregates_of(self, tool_use_id: str) -> list[str]:
+        """The aggregates of a tool call in id order; empty when the call has none."""
+        call = self._calls.get(tool_use_id)
+        return sorted(call.aggregates) if call is not None else []
+
+    def aggregate_observation(self, topic: str, aggregate: str) -> str | None:
+        """The id of `aggregate`'s observation node, None before its first result."""
+        for node_id, node in self.topic_nodes(topic).items():
+            if isinstance(node, AggregateObservationNode) and node.aggregate == aggregate:
+                return node_id
+        return None
+
+    def add_tool_pair(self, topic: str, tool_use_id: str, result: str) -> None:
+        """List the call and its result under each of the call's aggregates."""
+        call = self._calls[tool_use_id]
+        pair = ToolPair(tool_use_id=tool_use_id, call=call.text, result=result)
+        store = self.stores[topic]
+        pairs = dict(store.meta.tool_pairs)
+        for aggregate in sorted(call.aggregates):
+            pairs[aggregate] = [*pairs.get(aggregate, []), pair]
+        self.stores[topic] = store.model_copy(
+            update={"meta": store.meta.model_copy(update={"tool_pairs": pairs})}
+        )
+
+    def set_aggregate_observation(
+        self, topic: str, node_id: str, aggregate: str, label: str
+    ) -> None:
+        """Put the latest text on the node and drop its old satisfies and blocks edges.
+
+        The caller adds the edges of the new text, so an intent the latest text no
+        longer satisfies goes back to pending.
+        """
+        if node_id not in self.topic_nodes(topic):
+            if node_id != self.next_observation_id():
+                raise AssertionError(
+                    f"Registering {node_id} when the next id is {self.next_observation_id()}."
+                )
+            self.observations += 1
+        self._add_node(topic, node_id, AggregateObservationNode(aggregate=aggregate, label=label))
+        store = self.stores[topic]
+        kept = [
+            e
+            for e in store.meta.graph.edges
+            if e.from_ != node_id or e.relation not in ("satisfies", "blocks")
+        ]
+        graph = store.meta.graph.model_copy(update={"edges": kept})
+        self.stores[topic] = store.model_copy(
+            update={"meta": store.meta.model_copy(update={"graph": graph})}
+        )
 
     def add_observation(
         self,
@@ -264,7 +344,7 @@ class Stores:
         *,
         review: bool,
     ) -> None:
-        """Add an observation node and, for a tool result, one produces edge per aggregate."""
+        """Add an observation node; `node_id` must be the next global id."""
         if node_id != self.next_observation_id():
             raise AssertionError(
                 f"Registering {node_id} when the next id is {self.next_observation_id()}."
@@ -272,21 +352,6 @@ class Stores:
         node = ObservationNode(label=label, source=source, needs_review=True if review else None)
         self._add_node(topic, node_id, node)
         self.observations += 1
-        call = self._call_spans.get(source.tool_use_id) if source.tool_use_id else None
-        if call is not None:
-            produced = [
-                Edge.model_validate(
-                    {
-                        "from": aggregate,
-                        "to": node_id,
-                        "relation": "produces",
-                        "span": call.span,
-                        "evidence": label,
-                    }
-                )
-                for aggregate in sorted(call.aggregates)
-            ]
-            self.add_edges(topic, produced)
 
     def add_edges(self, topic: str | None, edges: Sequence[Edge]) -> None:
         """Append `edges`, leaving out any whose ends and relation are already recorded."""
@@ -425,7 +490,7 @@ class Stores:
             )
             self.stores[topic] = self.stores[topic].model_copy(update={"spans": spans})
             self._open_tool_span = attrs.evolve(last, item_index=item_index)
-            self._call_spans[call.tool_use_id] = _CallSpan(span=joined.id, aggregates=aggregates)
+            self._calls[call.tool_use_id] = _Call(text=call.text, aggregates=aggregates)
             return joined.id
         source = self._source(call.source.session, call.source.timestamp.isoformat())
         span = self._span(
@@ -443,7 +508,7 @@ class Stores:
                 topic=topic, position=position, aggregates=aggregates, item_index=item_index
             )
         )
-        self._call_spans[call.tool_use_id] = _CallSpan(span=span.id, aggregates=aggregates)
+        self._calls[call.tool_use_id] = _Call(text=call.text, aggregates=aggregates)
         return span.id
 
     def check_coverage(self, message: Speech) -> None:

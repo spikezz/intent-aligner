@@ -8,20 +8,20 @@
 :root {
   --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #d9d9d4;
   --l1: #3b7dd8; --l2: #7a5cc7; --seg: #d08a1e; --loop: #2f9e6a;
-  --ok: #2f9e6a; --bad: #d1453b; --warn: #d08a1e; --pending: #c9c9c3; --active: #111111;
-  --feedback: #fde7c4; --var: #fbe3c0; --var-ink: #8a5300; --code: #f1f1ee; --signal: #0b6e8a;
+  --ok: #2f9e6a; --bad: #d1453b; --review: #b5179e; --warn: #d08a1e; --pending: #c9c9c3; --active: #111111;
+  --feedback: #cfe2ff; --var: #fbe3c0; --var-ink: #8a5300; --code: #f1f1ee; --signal: #0b6e8a;
   --I: #4656b8; --A: #0f7d6b; --G: #a86a00; --O: #b3322a;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #a09f98; --line: #3a3a36;
-    --pending: #4a4a45; --active: #ffffff; --feedback: #5a4318; --var: #4a3512; --var-ink: #f0c070;
+    --pending: #4a4a45; --active: #ffffff; --feedback: #1d3f70; --var: #4a3512; --var-ink: #f0c070;
     --code: #262624; --signal: #4dbcd8; --I: #99a6f2; --A: #5fd0b5; --G: #e6ac4b; --O: #ef7f75;
   }
 }
 :root[data-theme="dark"] {
   --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #a09f98; --line: #3a3a36;
-  --pending: #4a4a45; --active: #ffffff; --feedback: #5a4318; --var: #4a3512; --var-ink: #f0c070;
+  --pending: #4a4a45; --active: #ffffff; --feedback: #1d3f70; --var: #4a3512; --var-ink: #f0c070;
   --code: #262624; --signal: #4dbcd8; --I: #99a6f2; --A: #5fd0b5; --G: #e6ac4b; --O: #ef7f75;
 }
 * { box-sizing: border-box; }
@@ -42,6 +42,7 @@ header h1 { font-size: 17px; margin: 0 0 4px; }
 .rail { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; padding: 6px 16px; background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px; }
 .rail .stop { padding: 1px 8px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); }
 .rail .stop.on { background: var(--signal); border-color: var(--signal); color: var(--panel); }
+.rail .stop.unsent { border-color: var(--bad); color: var(--bad); }
 .rail .arrow { color: var(--muted); }
 #strip { display: block; width: 100%; height: 34px; background: var(--panel); border-bottom: 1px solid var(--line); cursor: pointer; }
 .wrap { padding: 10px 16px; display: grid; gap: 10px; }
@@ -57,6 +58,7 @@ header h1 { font-size: 17px; margin: 0 0 4px; }
 #dag .window { fill: none; stroke: var(--muted); stroke-width: 0.8; opacity: 0.35; }
 #dag .chain { fill: none; stroke: var(--muted); stroke-width: 1; }
 #dag .unitText { font-size: 11px; fill: var(--ink); }
+#dag .unitText .unsent { fill: var(--bad); font-weight: 700; }
 #dag tspan.cur { fill: var(--signal); font-weight: 700; }
 .legend { font-size: 12px; color: var(--muted); margin: 6px 0; }
 .legend span.sw { display: inline-block; width: 10px; height: 10px; margin: 0 4px 0 10px; vertical-align: -1px; border-radius: 2px; }
@@ -67,6 +69,7 @@ header h1 { font-size: 17px; margin: 0 0 4px; }
 .kv { font-size: 12px; color: var(--muted); }
 .unit { font-size: 13px; }
 .unit pre { max-height: 180px; overflow: auto; }
+.reason.review { background: var(--review); color: #fff; font-weight: 600; }
 .reason { background: var(--feedback); padding: 6px 8px; border-radius: 4px; white-space: pre-wrap; font-size: 12px; margin: 6px 0; }
 .stage { display: grid; grid-template-columns: minmax(0, 1.5fr) 96px minmax(0, 1.1fr) minmax(0, 1fr); align-items: stretch; }
 @media (max-width: 1000px) { .stage { grid-template-columns: minmax(0, 1fr); gap: 8px; } .wire { height: 90px; } .wire::before, .pkt { display: none; } }
@@ -87,7 +90,7 @@ header h1 { font-size: 17px; margin: 0 0 4px; }
 .dim { opacity: .2; transition: opacity .25s; } .dim.lit { opacity: 1; }
 pre { background: var(--code); padding: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 ui-monospace, "Noto Sans Mono CJK SC", monospace; margin: 0; }
 pre .v { background: var(--var); color: var(--var-ink); }
-pre mark { background: var(--feedback); color: inherit; outline: 1px solid var(--warn); }
+pre mark { background: var(--feedback); color: inherit; outline: 1px solid var(--signal); }
 .check { font-size: 12px; padding: 2px 0 2px 20px; position: relative; }
 .check::before { content: "○"; position: absolute; left: 2px; color: var(--muted); }
 .check.ok::before { content: "✓"; color: var(--ok); }
@@ -130,6 +133,8 @@ details.more summary { cursor: pointer; color: var(--muted); }
       <span class="sw" style="background:var(--ok)"></span>已接受（按阶段着色）
       <span class="sw" style="background:var(--warn)"></span>被驳回或重问
       <span class="sw" style="background:var(--bad)"></span>失败
+      <span class="sw" style="background:var(--review)"></span>needs_review（这个任务最终没有完成）
+      <span class="sw" style="background:var(--bad)"></span>红色字母是这个单元没有发给模型的步骤。<b>G✗</b>：这一步在路线上一定要走，但是没有发出去。<b>L?</b>：这一步要不要走还不确定，因为决定它的那次模型回答没有拿到
       <span class="sw" style="background:none;border:2px solid var(--active)"></span>当前
       <span class="sw" style="background:none;border:1px dashed var(--muted)"></span>没有调用模型
       · L1 每个工具一对方块：左边压调用，右边压结果；结果分几段压时右块加粗并标段数
@@ -143,7 +148,7 @@ details.more summary { cursor: pointer; color: var(--muted); }
     <div class="unit" id="unit"></div>
   </section>
   <section class="stage">
-    <div class="col" id="c1"><h2>代码发给端点的请求：普通底色是源码里写死的文字，<span style="background:var(--var);color:var(--var-ink)">橙底</span>是随任务变化的部分，<mark style="background:var(--feedback);color:inherit">黄框</mark>是重问时追加的反馈</h2><div id="request"></div></div>
+    <div class="col" id="c1"><h2>代码发给端点的请求：普通底色是源码里写死的文字，<span style="background:var(--var);color:var(--var-ink)">橙底</span>是随任务变化的部分，<mark style="background:var(--feedback);color:inherit">蓝框</mark>是重问时追加的反馈</h2><div id="request"></div></div>
     <div class="wire" id="wire"><div class="pkt" id="pkt"></div><div class="end" id="endpoint"></div></div>
     <div class="col" id="c2"><h2>模型的回答</h2><div id="reply"></div></div>
     <div class="col" id="c3"><h2>代码校验与写入</h2><div id="checks"></div></div>
@@ -161,8 +166,8 @@ const STAGE_NAMES = {L1: "第一层压缩（工具调用和结果）", L2: "第�
 const STAGE_COLORS = {L1: "var(--l1)", L2: "var(--l2)", SEG: "var(--seg)", LOOP: "var(--loop)"};
 const ASK_NAMES = {call: "压缩工具调用", result: "压缩工具结果", round: "压缩一轮的工具操作", segment: "切分", topic: "T 归入 topic",
   signal: "A 信号意图", registry: "B 登记意图", aggregate: "G 归入聚合", tool_intent: "L 底层意图", relation: "C 连边",
-  outcome: "D 观察结果", outcome_summary: "D 观察结果（摘要）"};
-const LETTER = {topic: "T", signal: "A", registry: "B", aggregate: "G", tool_intent: "L", relation: "C", outcome: "D", outcome_summary: "D", round: "压"};
+  outcome: "D 观察结果", outcome_summary: "D 观察结果（摘要）", outcome_update: "D 更新聚合的观测"};
+const LETTER = {topic: "T", signal: "A", registry: "B", aggregate: "G", tool_intent: "L", relation: "C", outcome: "D", outcome_summary: "D", outcome_update: "D", round: "压"};
 const STOPS = [["L1", "第一层压缩"], ["L2", "第二层压缩"], ["SEG", "切分"], ["T", "T 归 topic"], ["A", "A 信号意图"], ["B", "B 登记意图"],
   ["G", "G 归聚合"], ["L", "L 底层意图"], ["C", "C 连边"], ["D", "D 观察结果"]];
 const VERDICT_NAMES = {accepted: "已接受", rejected: "被驳回", failed: "失败"};
@@ -176,6 +181,10 @@ function pretty(text) { try { return JSON.stringify(JSON.parse(text), null, 2); 
 function time(iso) { return iso ? new Date(iso).toLocaleTimeString("zh-CN", {hour12: false}) : "—"; }
 function limitOf(c) { return c.ask === "topic" ? PAGE.attempts.topic : PAGE.attempts[c.stage]; }
 function unitOf(id) { return id.startsWith("unit:") ? +id.split(":")[1] : -1; }
+function reviewOf(job) {
+  if (job?.record?.assignment?.needs_review) return job.record.assignment.review_reason;
+  return job?.record?.needs_review ? "切分没有定位到段落结尾，剩下的文本成为一段，意图为空。" : null;
+}
 function colorOf(c) { return c.verdict === "accepted" ? STAGE_COLORS[c.stage] : c.verdict === "failed" ? "var(--bad)" : "var(--warn)"; }
 function headerOf(prompt) {
   const m = prompt.match(/<header>\n([\s\S]*?)\n<\/header>/);
@@ -210,7 +219,8 @@ document.getElementById("meta").innerHTML =
     const r = rows[c.stage + "|" + c.ask] ??= {stage: c.stage, ask: c.ask, n: 0, retry: 0, rejected: 0, failed: 0};
     r.n++; if (c.attempt > 1) r.retry++; if (c.verdict === "rejected") r.rejected++; if (c.verdict === "failed") r.failed++;
   }
-  const silent = {};
+  const silent = {}, review = {};
+  for (const j of jobs) if (reviewOf(j)) review[j.stage] = (review[j.stage] ?? 0) + 1;
   for (const j of jobs) if (!called.has(j.id)) silent[j.stage] = (silent[j.stage] ?? 0) + 1;
   let html = "<tr><th>阶段</th><th>调用</th><th>次数</th><th>其中重试</th><th>被驳回</th><th>失败</th></tr>", total = 0;
   for (const s of STAGES) {
@@ -219,6 +229,7 @@ document.getElementById("meta").innerHTML =
       html += `<tr><td>${STAGE_NAMES[s]}</td><td>${ASK_NAMES[r.ask]}</td><td>${r.n}</td><td>${r.retry}</td><td>${r.rejected}</td><td>${r.failed}</td></tr>`;
     }
     if (silent[s]) html += `<tr><td>${STAGE_NAMES[s]}</td><td>没有调用模型的任务</td><td colspan="4">${silent[s]} 个</td></tr>`;
+    if (review[s]) html += `<tr style="color:var(--review);font-weight:600"><td>${STAGE_NAMES[s]}</td><td>needs_review 的任务</td><td colspan="4">${review[s]} 个，共 ${jobs.filter(j => j.stage === s).length} 个任务</td></tr>`;
   }
   html += `<tr><th>合计</th><th></th><th>${total}</th><th colspan="3"></th></tr>`;
   document.getElementById("summary").innerHTML = html;
@@ -283,6 +294,10 @@ function drawStrip() {
     const y = 4 + STAGES.indexOf(c.stage) * 6;
     svg += `<rect x="${stripX(new Date(c.started ?? c.ended).getTime(), w).toFixed(1)}" y="${y}" width="2" height="5" fill="${colorOf(c)}"/>`;
   });
+  calls.forEach((c, i) => {
+    if (reviewOf(jobById[c.subject]) && callsOf[c.subject].at(-1) === i)
+      svg += `<rect x="${stripX(new Date(c.started ?? c.ended).getTime(), w).toFixed(1)}" y="28" width="2" height="5" fill="var(--review)"/>`;
+  });
   svg += `<line id="cursor" x1="0" x2="0" y1="0" y2="34" stroke="var(--active)" stroke-width="1.5"/>`;
   strip.innerHTML = svg;
 }
@@ -298,6 +313,11 @@ const SQ = 10, PAIR = 26, PER_ROW = 4, COL_W = PER_ROW * PAIR + 18, LEFT = 44;
 const SEG_W = 20, SEG_PER_ROW = 5, PER_CHAIN = 8, BW = 132, BH = 24, GX = 14, GY = 14;
 const layout = {};        /* job id -> {x, y, w, h}, the anchor for edges */
 const cells = [];         /* every drawn node: {id, subject, ask} where ask narrows an L1 pair's half */
+const unsentOf = job => {
+  const sent = new Set((callsOf[job.id] ?? []).map(i => LETTER[calls[i].ask]));
+  return job.route.filter(step => !sent.has(step.replace("?", "")));
+};
+const unsentMark = step => step.endsWith("?") ? step : step + "✗";
 const callsOf = {};
 calls.forEach((c, i) => (callsOf[c.subject] ??= []).push(i));
 const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
@@ -363,9 +383,9 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
     else if (k) out.push(`<path class="chain" d="M${LEFT + (PER_CHAIN - 1) * (BW + GX) + BW / 2},${yy - GY} V${yy - GY / 2} H${x + BW / 2} V${yy}"/>`);
     layout[j.id] = {x, y: yy, w: BW, h: BH};
     const own = callsOf[j.id] ?? [];
-    const letters = own.length
-      ? own.map((i, n) => `<tspan id="t-${i}">${(n ? "→" : "") + LETTER[calls[i].ask]}</tspan>`).join("")
-      : `<tspan>代码直接处理</tspan>`;
+    const missing = unsentOf(j).map((s, n) => `<tspan class="unsent">${(own.length || n ? "→" : "") + unsentMark(s)}</tspan>`).join("");
+    const sentLetters = own.map((i, n) => `<tspan id="t-${i}">${(n ? "→" : "") + LETTER[calls[i].ask]}</tspan>`).join("");
+    const letters = own.length || missing ? sentLetters + missing : `<tspan>代码直接处理</tspan>`;
     out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" x="${x}" y="${yy}" width="${BW}" height="${BH}" rx="3"><title>${esc(j.id + " 第 " + (col(j) + first) + " 轮\n" + j.label)}</title></rect>`);
     out.push(`<text class="unitText" x="${x + 5}" y="${yy + 16}" pointer-events="none">${unitOf(j.id)}·${letters}</text>`);
     cells.push({id: j.id});
@@ -388,14 +408,14 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
   const toolJobs = jobs.filter(j => j.stage === "L1"), multi = toolJobs.filter(j => chunksOf(j) > 1).length;
   const l1 = calls.filter(c => c.stage === "L1").length, messages = Object.keys(segs).length;
   const patterns = {};
-  for (const j of unitJobs) { const p = (callsOf[j.id] ?? []).map(i => LETTER[calls[i].ask]).join("→") || "不调用"; patterns[p] = (patterns[p] ?? 0) + 1; }
+  for (const j of unitJobs) { const p = [...(callsOf[j.id] ?? []).map(i => LETTER[calls[i].ask]), ...unsentOf(j).map(unsentMark)].join("→") || "不调用"; patterns[p] = (patterns[p] ?? 0) + 1; }
   const top = Object.entries(patterns).sort((a, b) => b[1] - a[1]).map(([p, n]) => `${p} ${n} 个`).join("，");
   document.getElementById("dagnote").textContent =
     `第一层压缩：${toolJobs.length} 个工具调用各是一个任务，一共调用模型 ${l1} 次。任务内部是串行的：先压调用，再压结果，因为压结果的提示词要带上调用的意图；` +
     `其中 ${multi} 个结果太长，被分成几段逐段压缩（加粗的右块，旁边的数字是段数）。任务之间互不依赖，可以并行。` +
     `第二层压缩要等全部第一层任务结束才开始，有工具操作的 ${jobs.filter(j => j.stage === "L2").length} 轮各是一个任务。` +
     `切分在 compress 命令之后运行：${messages} 次发言之间并行，一共切出 ${jobs.filter(j => j.stage === "SEG").length} 段；同一次发言里的段只能一段接一段地切，因为下一段从上一段的结尾开始。` +
-    `抽取在切分之后运行：${unitJobs.length} 个单元严格串行，单元内部的调用也串行。各单元的调用序列：${top}。“压”是提示词放不下时临时调用的本轮压缩。点图里的方块可以跳到对应的调用。`;
+    `抽取在切分之后运行：${unitJobs.length} 个单元严格串行，单元内部的调用也串行。各单元的调用序列：${top}。“压”是提示词放不下时临时调用的本轮压缩。红色的字母是这个单元没有发给模型的步骤：带 ✗ 的是路线上一定要走、但没有发出去的步骤；带 ? 的是要不要走取决于没有拿到的模型回答。点图里的方块可以跳到对应的调用。`;
 })();
 
 function paintDag(f) {
@@ -414,10 +434,11 @@ function paintDag(f) {
     const last = latest[cell.ask ? cell.id + "|" + cell.ask : cell.id];
     let fill = "var(--pending)", stroke = "none", dash = "", width = +el.dataset.thick ? 2 : 1;
     if (last) fill = colorOf(last);
+    const passed = j.stage === "LOOP" ? unitOf(cell.id) <= reachedUnit : STAGES.indexOf(j.stage) < STAGES.indexOf(c?.stage ?? "LOOP");
     if (!callsOf[cell.id]) {
-      const passed = j.stage === "LOOP" ? unitOf(cell.id) <= reachedUnit : STAGES.indexOf(j.stage) < STAGES.indexOf(c?.stage ?? "LOOP");
       fill = "none"; stroke = passed ? "var(--muted)" : "var(--pending)"; dash = "3 2";
     }
+    if (reviewOf(j) && (callsOf[cell.id] ? callsOf[cell.id].at(-1) <= upTo : passed)) { fill = "var(--review)"; dash = ""; }
     if (+el.dataset.thick && stroke === "none") stroke = "var(--ink)";
     if (inFlight.has(cell.id)) { stroke = "var(--active)"; dash = "2 1"; }
     if (cell.id === now && (!cell.ask || cell.ask === c?.ask)) { stroke = "var(--active)"; dash = ""; width = 2.5; }
@@ -450,12 +471,26 @@ function draw() {
   const cur = $("cursor");
   if (cur) { const x = stripX(times[current], strip.clientWidth || 800); cur.setAttribute("x1", x); cur.setAttribute("x2", x); }
   const letter = c?.stage === "LOOP" ? (c.ask === "round" ? "L2" : LETTER[c.ask]) : (c?.stage ?? null);
-  document.querySelectorAll(".rail .stop").forEach(s => s.classList.toggle("on", s.dataset.k === letter));
+  const unsent = job ? unsentOf(job).map(step => step.replace("?", "")) : [];
+  document.querySelectorAll(".rail .stop").forEach(s => {
+    s.classList.toggle("on", s.dataset.k === letter);
+    s.classList.toggle("unsent", unsent.includes(s.dataset.k));
+  });
   paintDag(f);
   drawHead(f, job);
   if (c) drawCall(c, job); else drawSkip(job);
   drawBench(f, job);
   animate(!!c);
+}
+
+function reviewBanner(job) {
+  const reason = reviewOf(job);
+  if (!reason) return "";
+  const over = reason.match(/needs ([\d,]+) tokens more than the budget/);
+  const why = over ? `这个单元的提示词比预算多 ${over[1]} 个 token，放不下的那次调用没有发给模型，代码直接做了标记。\n` : "";
+  const unsent = unsentOf(job).map(unsentMark).join("、");
+  const steps = unsent ? `这个单元没有发给模型的步骤：${unsent}（带 ? 的步骤要不要走，取决于没有拿到的模型回答）。\n` : "";
+  return `<div class="reason review">这个任务最终被标成 needs_review，没有提取出意图。\n${why}${steps}${esc(reason)}</div>`;
 }
 
 function drawHead(f, job) {
@@ -478,6 +513,7 @@ function drawHead(f, job) {
       : a?.placeholder ? "整次发言没有意图，代码写下一个占位记录。"
       : a?.topic ? `它的 topic ${a.topic} 由代码直接确定，没有需要模型判断的内容。` : "它不属于任何 topic，代码直接写下空记录。")}</div>`;
   }
+  $("freason").insertAdjacentHTML("afterbegin", reviewBanner(job));
   $("unit").innerHTML = unitHtml(c, job);
 }
 
@@ -489,7 +525,7 @@ function unitHtml(c, job) {
   }
   if (job.stage === "SEG") {
     const [a, b] = [job.record.start, job.record.end];
-    return `<div class="kv">${esc(job.speaker)}的发言，这一段是字符 ${a}–${b}（黄框）</div><pre>${esc(job.text.slice(0, a))}<mark>${esc(job.text.slice(a, b))}</mark>${esc(job.text.slice(b))}</pre>`;
+    return `<div class="kv">${esc(job.speaker)}的发言，这一段是字符 ${a}–${b}（蓝框）</div><pre>${esc(job.text.slice(0, a))}<mark>${esc(job.text.slice(a, b))}</mark>${esc(job.text.slice(b))}</pre>`;
   }
   return `<div class="kv">${esc(job.stage === "L1" ? "工具 " + job.label + " · " + job.id : (job.speaker ? `这一轮从${job.speaker}的发言开始：` : "") + job.label)}</div>`;
 }
@@ -614,20 +650,23 @@ function drawBench(f, job) {
   const entries = Object.entries(nodes);
   $("gtitle").textContent = `图谱：${topic} ${PAGE.topics[topic] ?? ""}（${entries.length} 个节点${committed ? "，本单元的改动已提交" : "，虚线是本单元还没提交的改动"}）`;
   if (!entries.length) { $("bench").innerHTML = `<p class="note">这个 topic 的图谱目前还是空的。</p>`; return; }
-  const kinds = ["intent", "aggregate", "observation"], colors = {intent: "var(--I)", aggregate: "var(--G)", observation: "var(--O)"};
+  const kinds = ["intent", "aggregate", "observation"], colors = {intent: "var(--I)", aggregate: "var(--G)", observation: "var(--O)", aggregate_observation: "var(--O)"};
+  const columnOf = n => kinds.indexOf(n.type === "aggregate_observation" ? "observation" : n.type);
+  const done = new Set(edges.filter(e => e.relation === "satisfies").map(e => e.to));
   const strokeOf = n => n.type === "intent" && n.actor === "ai" ? "var(--A)" : colors[n.type] ?? "var(--muted)";
-  const nameOf = (id, n) => n.type === "intent" ? `${id} · ${n.actor === "ai" ? "AI" : "用户"}` : id;
+  const statusOf = (id, n) => n.type === "intent" || n.type === "aggregate" ? ` · ${done.has(id) ? "已完成" : "待完成"}` : "";
+  const nameOf = (id, n) => (n.type === "intent" ? `${id} · ${n.actor === "ai" ? "AI" : "用户"}` : n.type === "aggregate_observation" ? `${id} · ${n.aggregate} 的观测` : id) + statusOf(id, n);
   const W = 270, H = 44, GAP = 60, pos = {}, rows = [0, 0, 0];
-  for (const [id, n] of entries) { const kk = Math.max(0, kinds.indexOf(n.type)); pos[id] = {x: 10 + kk * (W + GAP), y: 10 + rows[kk]++ * (H + 12)}; }
+  for (const [id, n] of entries) { const kk = Math.max(0, columnOf(n)); pos[id] = {x: 10 + kk * (W + GAP), y: 10 + rows[kk]++ * (H + 12)}; }
   const height = 20 + Math.max(...rows) * (H + 12);
-  let svg = "";
+  let svg = `<defs><marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"/></marker></defs>`;
   for (const e of edges) {
     const a = pos[e.from], b = pos[e.to]; if (!a || !b) continue;
     const same = a.x === b.x, left = b.x < a.x;
     const x1 = left ? a.x : a.x + W, x2 = left ? b.x + W : b.x, y1 = a.y + H / 2, y2 = b.y + H / 2;
     const d = same ? `M${a.x + W},${y1} C${a.x + W + 40},${y1} ${b.x + W + 40},${y2} ${b.x + W},${y2}` : `M${x1},${y1} C${(x1 + x2) / 2},${y1} ${(x1 + x2) / 2},${y2} ${x2},${y2}`;
     const dash = freshEdges.has(keyOf(e)) && !committed ? ' stroke-dasharray="5 4"' : "";
-    svg += `<path class="edge" d="${d}"${dash}><title>${esc(e.relation + "：" + (e.evidence ?? ""))}</title></path>`;
+    svg += `<path class="edge" d="${d}"${dash} marker-end="url(#arrow)"><title>${esc(e.relation + "：" + (e.evidence ?? ""))}</title></path>`;
     svg += `<text class="elabel" x="${same ? a.x + W + 24 : (x1 + x2) / 2 - 14}" y="${(y1 + y2) / 2 - 3}">${esc(e.relation)}</text>`;
   }
   for (const [id, n] of entries) {

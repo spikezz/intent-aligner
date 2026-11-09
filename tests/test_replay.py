@@ -155,6 +155,18 @@ def test_only_rounds_with_tool_work_are_compression_jobs() -> None:
     assert got == expected, f"{got!r} vs {expected!r}"
 
 
+@needs_sol
+def test_needs_review_units_have_a_route_with_their_unsent_steps() -> None:
+    page = build_page(parse_run(SOL_RUN), None, None)
+    units = [j for j in page.jobs if j.stage == "LOOP"]
+    wrong = [
+        j.id
+        for j in units
+        if bool(j.route) != bool((j.record["assignment"] or {}).get("needs_review"))
+    ]
+    assert wrong == [], wrong
+
+
 def test_prompt_literals_cover_the_tags_of_a_prompt() -> None:
     prompt = "<此前的对话>\nhello\n</此前的对话>"
     got = [prompt[a:b] for a, b in literal_ranges(prompt, literal_texts())]

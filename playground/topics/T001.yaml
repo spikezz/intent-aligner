@@ -26,7 +26,7 @@ meta:
     edges:
       - from: I001
         to: I003
-        relation: prerequisite
+        relation: serves
         span: S002
         evidence: "调查清楚…使用方法，我接下来要你用我已经搭好的部分的基础设施"
       - from: I003
@@ -39,9 +39,9 @@ meta:
         relation: serves
         span: S004
         evidence: "自己运用工具的所有功能（参数探索）…来生成一段音乐的mv"
-      - from: I002
-        to: I005
-        relation: refines
+      - from: I005
+        to: I002
+        relation: serves
         span: S005
         evidence: "来生成一段音乐的mv。音乐是这个/home/spikezz/Music/The Wind Remembers.wav"
 
