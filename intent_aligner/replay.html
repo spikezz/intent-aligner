@@ -61,6 +61,8 @@ header h1 { font-size: 17px; margin: 0 0 4px; }
 #dag .unitText .unsent { fill: var(--bad); font-weight: 700; }
 #dag tspan.cur { fill: var(--signal); font-weight: 700; }
 .legend { font-size: 12px; color: var(--muted); margin: 6px 0; }
+.legend .unsentKey { color: var(--bad); font-weight: 700; }
+.legend .unsentKey:first-child, .legend .sw + .unsentKey { margin-left: 10px; }
 .legend span.sw { display: inline-block; width: 10px; height: 10px; margin: 0 4px 0 10px; vertical-align: -1px; border-radius: 2px; }
 .head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
 .badge { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: 12px; color: #fff; }
@@ -134,10 +136,10 @@ details.more summary { cursor: pointer; color: var(--muted); }
       <span class="sw" style="background:var(--warn)"></span>被驳回或重问
       <span class="sw" style="background:var(--bad)"></span>失败
       <span class="sw" style="background:var(--review)"></span>needs_review（这个任务最终没有完成）
-      <span class="sw" style="background:var(--bad)"></span>红色字母是这个单元没有发给模型的步骤。<b>G✗</b>：这一步在路线上一定要走，但是没有发出去。<b>L?</b>：这一步要不要走还不确定，因为决定它的那次模型回答没有拿到
+      <span class="unsentKey">红色字母</span>是这个单元没有发给模型的步骤。<span class="unsentKey">G✗</span>：这一步在路线上一定要走，但是没有发出去。<span class="unsentKey">L?</span>：这一步要不要走还不确定，因为决定它的那次模型回答没有拿到
       <span class="sw" style="background:none;border:2px solid var(--active)"></span>当前
       <span class="sw" style="background:none;border:1px dashed var(--muted)"></span>没有调用模型
-      · L1 每个工具一对方块：左边压调用，右边压结果；结果分几段压时右块加粗并标段数
+      · L1 每个工具一对：方块压调用，圆点压结果；结果分几段压时圆点加粗并标段数
     </div>
     <div id="dag"></div>
   </details>
@@ -338,11 +340,11 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
   for (const [c, list] of Object.entries(tools)) list.forEach((j, k) => {
     const x = LEFT + c * COL_W + (k % PER_ROW) * PAIR, yy = y + Math.floor(k / PER_ROW) * 16, n = chunksOf(j);
     layout[j.id] = {x, y: yy, w: 2 * SQ + 2, h: SQ};
-    out.push(`<g><title>${esc(j.id + " " + j.label + "\n左：压缩调用；右：压缩结果" + (n > 1 ? `（分 ${n} 段逐段压缩）` : n ? "" : "（没有结果）"))}</title>`);
+    out.push(`<g><title>${esc(j.id + " " + j.label + "\n方块：压缩调用；圆点：压缩结果" + (n > 1 ? `（分 ${n} 段逐段压缩）` : n ? "" : "（没有结果）"))}</title>`);
     out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" data-ask="call" x="${x}" y="${yy}" width="${SQ}" height="${SQ}" rx="1"/>`);
     cells.push({id: j.id, ask: "call"});
     if (n) {
-      out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" data-ask="result" x="${x + SQ + 2}" y="${yy}" width="${SQ}" height="${SQ}" rx="1" data-thick="${n > 1 ? 1 : 0}"/>`);
+      out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" data-ask="result" x="${x + SQ + 2}" y="${yy}" width="${SQ}" height="${SQ}" rx="${SQ / 2}" data-thick="${n > 1 ? 1 : 0}"/>`);
       cells.push({id: j.id, ask: "result"});
       if (n > 1) out.push(`<text x="${x + 2 * SQ + 3}" y="${yy + 8}" style="font-size:8px">${n}</text>`);
     }
@@ -397,7 +399,7 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
   const top = Object.entries(patterns).sort((a, b) => b[1] - a[1]).map(([p, n]) => `${p} ${n} 个`).join("，");
   document.getElementById("dagnote").textContent =
     `第一层压缩：${toolJobs.length} 个工具调用各是一个任务，一共调用模型 ${l1} 次。任务内部是串行的：先压调用，再压结果，因为压结果的提示词要带上调用的意图；` +
-    `其中 ${multi} 个结果太长，被分成几段逐段压缩（加粗的右块，旁边的数字是段数）。任务之间互不依赖，可以并行。` +
+    `其中 ${multi} 个结果太长，被分成几段逐段压缩（加粗的圆点，旁边的数字是段数）。任务之间互不依赖，可以并行。` +
     `压缩结束后进入主循环：${messages} 次发言一段一段切，一共切出 ${jobs.filter(j => j.stage === "SEG").length} 段，每切出一段就处理一段。` +
     `主循环里的 ${unitJobs.length} 个单元严格串行，单元内部的调用也串行。各单元的调用序列：${top}。“压”是提示词放不下时把最旧的工具记录概括成一段。红色的字母是这个单元没有发给模型的步骤：带 ✗ 的是路线上一定要走、但没有发出去的步骤；带 ? 的是要不要走取决于没有拿到的模型回答。点图里的方块可以跳到对应的调用。`;
 })();
@@ -535,7 +537,7 @@ function promptHtml(c) {
 function drawCall(c, job) {
   $("request").innerHTML =
     `<h3>HTTP 请求的设置（来自调用记录的请求行）</h3><pre>${esc(JSON.stringify(c.request, null, 2))}</pre>` +
-    `<h3>提示词</h3><pre>${promptHtml(c)}</pre>` +
+    `<h3>提示词</h3><div class="kv">header 在这里按缩进排版显示；发给模型的是紧凑格式（每个节点、每条边各占一行），内容完全相同。</div><pre>${promptHtml(c)}</pre>` +
     `<details class="more"><summary>system 全文</summary><pre>${esc(PAGE.systems[c.ask])}</pre></details>` +
     `<details class="more"><summary>上下文窗口的规则（源码常量和 docstring）</summary><pre>${esc(PAGE.window.join("\n\n"))}</pre></details>`;
   $("reply").innerHTML =
