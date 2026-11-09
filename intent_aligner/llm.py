@@ -297,6 +297,7 @@ def build_invocation(call: LLMCall, home: Path) -> Invocation:
             "--sandbox", "read-only",
             "--model", call.model,
             "-c", f"model_reasoning_effort={json.dumps(call.effort)}",
+            "-c", 'model_reasoning_summary="detailed"',
             "-c", f"model_instructions_file={json.dumps(str(_codex_file(home, call.system_prompt, 'md')))}",
             "--json",
         ]  # fmt: skip
