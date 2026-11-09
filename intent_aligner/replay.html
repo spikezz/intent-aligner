@@ -65,6 +65,7 @@ header h1 { font-size: 17px; margin: 0 0 4px; }
 .legend .unsentKey:first-child, .legend .sw + .unsentKey { margin-left: 10px; }
 .legend span.sw { display: inline-block; width: 10px; height: 10px; margin: 0 4px 0 10px; vertical-align: -1px; border-radius: 2px; }
 .head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.relayout { margin-left: auto; border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 4px; padding: 2px 9px; cursor: pointer; font: inherit; font-size: 12px; }
 .badge { display: inline-block; padding: 0 6px; border-radius: 3px; font-size: 12px; color: #fff; }
 .verdict-accepted { background: var(--ok); } .verdict-rejected { background: var(--warn); } .verdict-failed { background: var(--bad); } .verdict-skip { background: var(--muted); }
 .ftitle { font-size: 15px; font-weight: 600; }
@@ -102,10 +103,8 @@ pre mark { background: var(--feedback); color: inherit; outline: 1px solid var(-
 .write.bad { color: var(--bad); }
 details.more { margin-top: 8px; font-size: 12px; }
 details.more summary { cursor: pointer; color: var(--muted); }
-#bench { overflow: auto; max-height: 460px; margin-top: 6px; }
-#bench svg text { font-size: 11px; fill: var(--ink); }
-#bench .edge { fill: none; stroke: var(--muted); stroke-width: 1.2; }
-#bench .elabel { font-size: 10px; fill: var(--muted); }
+#bench { height: 75vh; min-height: 420px; margin-top: 6px; border: 1px solid var(--line); border-radius: 4px; resize: vertical; overflow: hidden; }
+#gnote { font-size: 12px; color: var(--muted); margin-top: 6px; overflow-wrap: anywhere; }
 .skip { color: var(--warn); }
 @media (prefers-reduced-motion: reduce) { .pkt { display: none; } .wire.busy .end { animation: none; } * { transition: none !important; } }
 </style>
@@ -156,11 +155,14 @@ details.more summary { cursor: pointer; color: var(--muted); }
     <div class="col" id="c3"><h2>代码校验与写入</h2><div id="checks"></div></div>
   </section>
   <section class="box">
-    <div class="head"><span class="ftitle" id="gtitle"></span></div>
-    <div class="legend"><span>实线框和实线边：已经写入存储</span> · <span>虚线：这个单元刚产生、在单元最后一次调用之后提交</span> · <span>粗框：这次调用 header 里的候选</span> · <span style="color:var(--I)">I 用户的意图</span> · <span style="color:var(--A)">I AI 的意图</span> · <span style="color:var(--G)">G 工具调用的聚合</span> · <span style="color:var(--O)">O 观测</span></div>
+    <div class="head"><span class="ftitle" id="gtitle"></span><button id="relayout" class="relayout">重新自动排版</button></div>
+    <div class="legend"><span>实线框和实线边：已经写入存储</span> · <span>虚线：这个单元刚产生、在单元最后一次调用之后提交</span> · <span>粗框：这次调用 header 里的候选</span> · <span>虚线大框：topic 里有边的节点</span> · <span>左边的虚线框：一条边都没有的节点</span> · <span style="color:var(--I)">I 用户的意图</span> · <span style="color:var(--A)">I AI 的意图</span> · <span style="color:var(--G)">G 工具调用的聚合</span> · <span style="color:var(--O)">O 观测</span> · <span style="color:var(--O)">红色点线 validates：聚合的观测检验这个聚合的意图所带的预期</span></div>
+    <p class="note" id="gempty"></p>
     <div id="bench"></div>
+    <p id="gnote"></p>
   </section>
 </div>
+<script>/*GRAPH_LIBRARIES*/</script>
 <script>
 const PAGE = /*PAGE_DATA*/null;
 const REFRESH_SECONDS = /*REFRESH_SECONDS*/null;
@@ -214,7 +216,9 @@ function frameTime(k) {
 document.getElementById("meta").innerHTML =
   `运行目录 ${esc(PAGE.directory)}<br>对话 ${esc(PAGE.merged)}<br>模型 ${esc(PAGE.backend)} / ${esc(PAGE.model)} · ` +
   (PAGE.logged ? "调用来自 calls.jsonl（精确记录）" :
-    `旧运行：调用是按模型、system prompt 和对话原文从 llm-home 匹配出来的，时间范围从 ${esc(PAGE.since ? new Date(PAGE.since).toLocaleString("zh-CN", {hour12: false}) : "最早")} 开始`);
+    `旧运行：调用是按模型、system prompt 和对话原文从 llm-home 匹配出来的，时间范围从 ${esc(PAGE.since ? new Date(PAGE.since).toLocaleString("zh-CN", {hour12: false}) : "最早")} 开始`) +
+  Object.entries(calls.reduce((m, c) => (c.origin && (m[c.origin] = (m[c.origin] ?? 0) + 1), m), {}))
+    .map(([dir, n]) => `<br>其中 ${n} 次调用由运行目录 ${esc(dir)} 发出，这次运行沿用了它写出的结果`).join("");
 
 (function summary() {
   const rows = {};
@@ -289,7 +293,26 @@ document.getElementById("jumps").onclick = e => { if (e.target.dataset.k) go(+e.
 const strip = document.getElementById("strip");
 const times = frames.map((f, k) => frameTime(k));
 const t0 = Math.min(...times), t1 = Math.max(...times.concat([t0 + 1]));
-function stripX(t, w) { return 8 + (t - t0) / (t1 - t0) * (w - 16); }
+/* A pause longer than GAP_MS (a run resumed later, or level one reused from an earlier run)
+   takes GAP_PX of strip with its length written on it, so the calls keep the width. */
+const GAP_MS = 10 * 60e3, GAP_PX = 110;
+const stamps = [...new Set(times.concat(calls.map(c => new Date(c.started ?? c.ended).getTime())))].sort((a, b) => a - b);
+const gaps = stamps.slice(1).map((b, k) => [stamps[k], b]).filter(([a, b]) => b - a > GAP_MS);
+/* Working time before t, and how many gaps t has passed (a fraction inside one). */
+function position(t) {
+  let busy = t - t0, passed = 0;
+  for (const [a, b] of gaps) {
+    if (t >= b) { busy -= b - a; passed += 1; }
+    else if (t > a) { busy -= t - a; passed += (t - a) / (b - a); }
+  }
+  return [busy, passed];
+}
+const busySpan = Math.max(1, position(t1)[0]);
+function stripX(t, w) {
+  const [busy, passed] = position(t);
+  return 8 + busy / busySpan * Math.max(0, w - 16 - gaps.length * GAP_PX) + passed * GAP_PX;
+}
+const lasting = ms => { const m = Math.round(ms / 60e3); return m >= 60 ? `${Math.floor(m / 60)} 小时 ${m % 60} 分钟` : `${m} 分钟`; };
 function drawStrip() {
   const w = strip.clientWidth || 800;
   let svg = "";
@@ -301,12 +324,17 @@ function drawStrip() {
     if (reviewOf(jobById[c.subject]) && callsOf[c.subject].at(-1) === i)
       svg += `<rect x="${stripX(new Date(c.started ?? c.ended).getTime(), w).toFixed(1)}" y="28" width="2" height="5" fill="var(--review)"/>`;
   });
+  for (const [a, b] of gaps) {
+    const xa = stripX(a, w) + 3, xb = stripX(b, w) - 3;
+    svg += `<rect x="${xa.toFixed(1)}" y="2" width="${Math.max(0, xb - xa).toFixed(1)}" height="30" fill="none" stroke="var(--muted)" stroke-dasharray="3 2"/>` +
+      `<text x="${((xa + xb) / 2).toFixed(1)}" y="21" text-anchor="middle" style="font-size:9px;fill:var(--muted)">停了 ${lasting(b - a)}</text>`;
+  }
   svg += `<line id="cursor" x1="0" x2="0" y1="0" y2="34" stroke="var(--active)" stroke-width="1.5"/>`;
   strip.innerHTML = svg;
 }
 strip.onclick = e => {
-  const w = strip.clientWidth, t = t0 + (e.offsetX - 8) / (w - 16) * (t1 - t0);
-  let best = 0; times.forEach((x, k) => { if (Math.abs(x - t) < Math.abs(times[best] - t)) best = k; });
+  const w = strip.clientWidth, off = k => Math.abs(stripX(times[k], w) - e.offsetX);
+  let best = 0; times.forEach((_, k) => { if (off(k) < off(best)) best = k; });
   go(best);
 };
 window.addEventListener("resize", () => { drawStrip(); draw(); });
@@ -340,7 +368,7 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
   for (const [c, list] of Object.entries(tools)) list.forEach((j, k) => {
     const x = LEFT + c * COL_W + (k % PER_ROW) * PAIR, yy = y + Math.floor(k / PER_ROW) * 16, n = chunksOf(j);
     layout[j.id] = {x, y: yy, w: 2 * SQ + 2, h: SQ};
-    out.push(`<g><title>${esc(j.id + " " + j.label + "\n方块：压缩调用；圆点：压缩结果" + (n > 1 ? `（分 ${n} 段逐段压缩）` : n ? "" : "（没有结果）"))}</title>`);
+    out.push(`<g><title>${esc(j.id + " " + j.label + "\n方块：压缩调用；圆点：压缩结果" + (n > 1 ? `（分 ${n} 段逐段压缩）` : n ? "" : "（没有结果）") + (callsOf[j.id] ? "" : "\n这次运行没有为它调用模型，沿用的是运行开始前就写好的压缩结果"))}</title>`);
     out.push(`<rect class="node" id="n-${cells.length}" data-id="${esc(j.id)}" data-ask="call" x="${x}" y="${yy}" width="${SQ}" height="${SQ}" rx="1"/>`);
     cells.push({id: j.id, ask: "call"});
     if (n) {
@@ -398,7 +426,8 @@ const chunksOf = j => j.record?.result?.summaries?.length ?? 0;
   for (const j of unitJobs) { const p = [...(callsOf[j.id] ?? []).map(i => LETTER[calls[i].ask]), ...unsentOf(j).map(unsentMark)].join("→") || "不调用"; patterns[p] = (patterns[p] ?? 0) + 1; }
   const top = Object.entries(patterns).sort((a, b) => b[1] - a[1]).map(([p, n]) => `${p} ${n} 个`).join("，");
   document.getElementById("dagnote").textContent =
-    `第一层压缩：${toolJobs.length} 个工具调用各是一个任务，一共调用模型 ${l1} 次。任务内部是串行的：先压调用，再压结果，因为压结果的提示词要带上调用的意图；` +
+    (toolJobs.length && !l1 ? `第一层压缩：这次运行没有调用模型。${toolJobs.length} 个工具调用的压缩结果在运行开始前就已经写好，compress 续跑时发现没有缺的，直接结束，所以 L1 一开始就全部标成已完成。` :
+    `第一层压缩：${toolJobs.length} 个工具调用各是一个任务，一共调用模型 ${l1} 次。`) + `任务内部是串行的：先压调用，再压结果，因为压结果的提示词要带上调用的意图；` +
     `其中 ${multi} 个结果太长，被分成几段逐段压缩（加粗的圆点，旁边的数字是段数）。任务之间互不依赖，可以并行。` +
     `压缩结束后进入主循环：${messages} 次发言一段一段切，一共切出 ${jobs.filter(j => j.stage === "SEG").length} 段，每切出一段就处理一段。` +
     `主循环里的 ${unitJobs.length} 个单元严格串行，单元内部的调用也串行。各单元的调用序列：${top}。“压”是提示词放不下时把最旧的工具记录概括成一段。红色的字母是这个单元没有发给模型的步骤：带 ✗ 的是路线上一定要走、但没有发出去的步骤；带 ? 的是要不要走取决于没有拿到的模型回答。点图里的方块可以跳到对应的调用。`;
@@ -421,7 +450,8 @@ function paintDag(f) {
     let fill = "var(--pending)", stroke = "none", dash = "", width = +el.dataset.thick ? 2 : 1;
     if (last) fill = colorOf(last);
     const passed = j.stage === "LOOP" ? unitOf(cell.id) <= reachedUnit : STAGES.indexOf(j.stage) < STAGES.indexOf(c?.stage ?? "LOOP");
-    if (!callsOf[cell.id]) {
+    if (!callsOf[cell.id] && j.stage === "L1" && j.record?.[cell.ask]) fill = STAGE_COLORS.L1;
+    else if (!callsOf[cell.id]) {
       fill = "none"; stroke = passed ? "var(--muted)" : "var(--pending)"; dash = "3 2";
     }
     if (reviewOf(j) && (callsOf[cell.id] ? callsOf[cell.id].at(-1) <= upTo : passed)) { fill = "var(--review)"; dash = ""; }
@@ -466,6 +496,7 @@ function draw() {
   drawHead(f, job);
   if (c) drawCall(c, job); else drawSkip(job);
   drawBench(f, job);
+  applyOpened();
   animate(!!c);
 }
 
@@ -489,7 +520,8 @@ function drawHead(f, job) {
     const mine = callsOf[c.subject];
     $("fmeta").textContent = `第 ${c.attempt} 次（最多 ${limitOf(c)} 次）· ${c.started ? "开始 " + time(c.started) + " · " : ""}结束 ${time(c.ended)} · ` +
       `这个任务的第 ${mine.indexOf(f.i) + 1} 次调用，共 ${mine.length} 次` +
-      (c.window_seen ? ` · 窗口实际放进前 ${c.window_seen.length} 轮（这里最多能放 ${c.window_limit} 轮）` : "");
+      (c.window_seen ? ` · 窗口实际放进前 ${c.window_seen.length} 轮（这里最多能放 ${c.window_limit} 轮）` : "") +
+      (c.origin ? ` · 由运行目录 ${c.origin} 发出` : "");
     $("freason").innerHTML = c.reason && beat >= 3
       ? `<div class="reason">${c.verdict === "rejected" && c.attempt < limitOf(c) ? "管线把下面这段反馈附在提示词后面，又问了一次：\n" : ""}${esc(c.reason)}</div>` : "";
   } else {
@@ -537,14 +569,14 @@ function promptHtml(c) {
 function drawCall(c, job) {
   $("request").innerHTML =
     `<h3>HTTP 请求的设置（来自调用记录的请求行）</h3><pre>${esc(JSON.stringify(c.request, null, 2))}</pre>` +
-    `<h3>提示词</h3><div class="kv">header 在这里按缩进排版显示；发给模型的是紧凑格式（每个节点、每条边各占一行），内容完全相同。</div><pre>${promptHtml(c)}</pre>` +
-    `<details class="more"><summary>system 全文</summary><pre>${esc(PAGE.systems[c.ask])}</pre></details>` +
-    `<details class="more"><summary>上下文窗口的规则（源码常量和 docstring）</summary><pre>${esc(PAGE.window.join("\n\n"))}</pre></details>`;
+    `<h3>提示词</h3>${c.prompt.includes("<header>\n") ? `<div class="kv">header 在这里按缩进排版显示；发给模型的是紧凑格式（每个节点、每条边各占一行），内容完全相同。</div>` : ""}<pre>${promptHtml(c)}</pre>` +
+    `<details class="more" open><summary>system 全文</summary><pre>${esc(PAGE.systems[c.ask])}</pre></details>` +
+    `<details class="more" open><summary>上下文窗口的规则（源码常量和 docstring）</summary><pre>${esc(PAGE.window.join("\n\n"))}</pre></details>`;
   $("reply").innerHTML =
     `<div class="dim ${beat >= 2 ? "lit" : ""}"><pre>${esc(pretty(c.reply ?? "（没有回答）"))}</pre>` +
-    (c.reasoning ? `<details class="more"><summary>推理</summary><pre>${esc(c.reasoning)}</pre></details>` : "") +
-    `<details class="more"><summary>用量和调用记录</summary><pre>${esc(JSON.stringify(c.usage, null, 2))}\nfinish: ${esc(c.finish)}\ntranscript: ${esc(c.transcript)}</pre></details></div>` +
-    `<details class="more"><summary>response_format 的 JSON schema</summary><pre>${esc(JSON.stringify(PAGE.schemas[c.ask], null, 2))}</pre></details>`;
+    (c.reasoning ? `<details class="more" open><summary>推理</summary><pre>${esc(c.reasoning)}</pre></details>` : "") +
+    `<details class="more" open><summary>用量和调用记录</summary><pre>${esc(JSON.stringify(c.usage, null, 2))}\nfinish: ${esc(c.finish)}\ntranscript: ${esc(c.transcript)}</pre></details></div>` +
+    `<details class="more" open><summary>response_format 的 JSON schema</summary><pre>${esc(JSON.stringify(PAGE.schemas[c.ask], null, 2))}</pre></details>`;
   $("checks").innerHTML = checksHtml(c, job);
 }
 
@@ -575,7 +607,7 @@ function writesHtml(c, job) {
     if (a?.needs_review) html += `<div class="write bad">needs_review：${esc(a.review_reason)}</div>`;
     for (const line of job.log) html += `<div class="write">run.log：${esc(line)}</div>`;
   }
-  return html + `<details class="more" ${last ? "open" : ""}><summary>任务最终写下的记录</summary><pre>${esc(JSON.stringify(record, null, 2))}</pre></details>`;
+  return html + `<details class="more" open><summary>任务最终写下的记录</summary><pre>${esc(JSON.stringify(record, null, 2))}</pre></details>`;
 }
 
 function drawSkip(job) {
@@ -615,14 +647,100 @@ const before = [];          /* before[k]: every topic's graph just before unit k
   });
 }
 
+/* Graph drawing: Cytoscape with the dagre layered layout. Positions the viewer drags are kept per run
+   and topic in localStorage, because a watched page reloads itself every few seconds. */
+const DRAGGED_KEY = "intent-aligner-dragged:" + PAGE.directory;
+let cy = null, shownGraph = "", shownTopic = "";
+let dragged = (() => { try { return JSON.parse(localStorage.getItem(DRAGGED_KEY) ?? "{}"); } catch { return {}; } })();
+function saveDragged() { try { localStorage.setItem(DRAGGED_KEY, JSON.stringify(dragged)); } catch { /* the page works without it */ } }
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const measure = document.createElement("canvas").getContext("2d");
+/* Long labels are cut to NODE_LINES lines so the whole graph fits at a readable zoom; a click shows the full text. */
+const NODE_FONT = '11px system-ui, "Noto Sans CJK SC", sans-serif', NODE_TEXT_W = 230, NODE_LINES = 3;
+
+/* Wraps CJK between characters and Latin between words; a word wider than the line (a path) is cut. */
+function wrapLines(text) {
+  measure.font = NODE_FONT;
+  const lines = []; let line = "";
+  for (const token of String(text).match(/[⺀-鿿＀-￯]|[^\s⺀-鿿＀-￯]+|\s+/g) ?? []) {
+    if (measure.measureText(line + token).width <= NODE_TEXT_W) { line += token; continue; }
+    if (line.trim()) lines.push(line.trimEnd());
+    line = token.trimStart();
+    while (measure.measureText(line).width > NODE_TEXT_W) {
+      let cut = line.length; while (cut > 1 && measure.measureText(line.slice(0, cut)).width > NODE_TEXT_W) cut--;
+      lines.push(line.slice(0, cut)); line = line.slice(cut);
+    }
+  }
+  if (line.trim()) lines.push(line.trimEnd());
+  return lines;
+}
+
+function graphStyle() {
+  const ink = cssVar("--ink"), muted = cssVar("--muted"), panel = cssVar("--panel");
+  return [
+    {selector: "node", style: {shape: "round-rectangle", "background-color": panel, "border-width": 1.3, label: "data(label)", "text-wrap": "wrap", "text-max-width": NODE_TEXT_W + 4, "text-valign": "center",
+      "text-halign": "center", "text-justification": "left", "font-size": 11, "font-family": 'system-ui, "Noto Sans CJK SC", sans-serif', color: ink}},
+    {selector: "node[w]", style: {width: "data(w)", height: "data(h)", "border-color": "data(color)"}},
+    {selector: "node.hot", style: {"border-width": 3.5}},
+    {selector: "node.pending", style: {"border-style": "dashed"}},
+    {selector: ":parent", style: {"background-opacity": 0, "border-style": "dashed", "border-width": 1.5, "border-color": muted, "text-valign": "top",
+      "text-halign": "center", "text-margin-y": -6, "text-max-width": 2000, "font-size": 13, "font-weight": "bold", padding: 22}},
+    {selector: "edge", style: {"curve-style": "bezier", width: 1.2, "line-color": muted, "target-arrow-shape": "triangle", "target-arrow-color": muted,
+      "arrow-scale": 0.9, label: "data(label)", "font-size": 10, color: muted, "text-background-color": panel, "text-background-opacity": 1,
+      "text-background-padding": 2}},
+    {selector: "edge.pending", style: {"line-style": "dashed"}},
+    {selector: "edge.owner", style: {"line-style": "dotted", width: 1.6, "line-color": cssVar("--O"), "target-arrow-color": cssVar("--O"), color: cssVar("--O")}},
+    {selector: ":selected", style: {"border-color": ink, "line-color": ink, "target-arrow-color": ink, "border-width": 3}},
+  ];
+}
+
+/* Nodes without any edge sit in their own box left of the connected graph, so dagre does not scatter them between ranks. */
+const ORPHAN_GAP = 90, ORPHAN_COL_GAP = 18, ORPHAN_ROW_GAP = 14;
+function layoutGraph() {
+  const own = dragged[shownTopic] ?? {};
+  const orphans = cy.nodes(`[parent = "orphans:${shownTopic}"]`).sort((p, q) => p.id().localeCompare(q.id()));
+  const connected = cy.nodes(`[parent = "topic:${shownTopic}"]`);
+  if (connected.length) connected.union(cy.edges()).layout({name: "dagre", rankDir: "RL", nodeSep: 18, rankSep: 110, edgeSep: 12, fit: false, animate: false}).run();
+  const box = connected.length ? connected.boundingBox() : {x1: 0, y1: 0, h: 0};
+  const cellW = NODE_TEXT_W + 16, rowH = Math.max(0, ...orphans.map(n => n.data("h"))) + ORPHAN_ROW_GAP;
+  const rows = Math.max(1, Math.floor(box.h / rowH)), cols = Math.ceil(orphans.length / rows);
+  const left = box.x1 - ORPHAN_GAP - cols * (cellW + ORPHAN_COL_GAP) + ORPHAN_COL_GAP;
+  orphans.forEach((n, i) => n.position({x: left + Math.floor(i / rows) * (cellW + ORPHAN_COL_GAP) + cellW / 2, y: box.y1 + (i % rows) * rowH + rowH / 2}));
+  cy.nodes().forEach(n => { if (own[n.id()]) n.position(own[n.id()]); });
+  cy.fit(undefined, 24);
+}
+
+function ensureGraph() {
+  if (cy) return;
+  cy = cytoscape({container: $("bench"), style: graphStyle(), minZoom: 0.15, maxZoom: 3, boxSelectionEnabled: false});
+  cy.on("dragfree", "node", e => {
+    const n = e.target; if (n.isParent()) return;
+    (dragged[shownTopic] ??= {})[n.id()] = {...n.position()}; saveDragged();
+  });
+  cy.on("tap", "node, edge", e => {
+    const d = e.target.data();
+    $("gnote").textContent = e.target.hasClass("owner") ? `${d.source} 检验聚合 ${d.target} 的意图所带的预期，说明到目前为止实际情况和预期相差多少。这条点线不是存储里的边，而是节点的 aggregate 字段。`
+      : e.target.isEdge() ? `${d.source} → ${d.target} · ${d.label}：${d.evidence || "没有证据文字"}` : `${d.id}：${d.full}`;
+  });
+  cy.on("tap", e => { if (e.target === cy) $("gnote").textContent = "点击节点或边查看全文。"; });
+  new ResizeObserver(() => cy.resize()).observe($("bench"));
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => cy.style(graphStyle()));
+  $("relayout").onclick = () => { delete dragged[shownTopic]; saveDragged(); layoutGraph(); };
+}
+
+function showGraph(visible, note) {
+  $("bench").hidden = $("relayout").hidden = $("gnote").hidden = !visible;
+  $("gempty").hidden = visible; $("gempty").textContent = note ?? "";
+}
+
 function drawBench(f, job) {
   const k = job?.stage === "LOOP" ? unitOf(job.id) : -1, g = PAGE.graphs[k];
   if (k < 0 || !g) {
-    $("gtitle").textContent = k < 0 ? "图谱：抽取阶段还没有开始，这一步不读也不写图谱" : "图谱：这个单元没有落盘记录";
-    $("bench").innerHTML = ""; return;
+    $("gtitle").textContent = "图谱";
+    showGraph(false, k < 0 ? "抽取阶段还没有开始，这一步不读也不写图谱。" : "这个单元没有落盘记录。"); return;
   }
   const topic = g.topic ?? job.record?.assignment?.topic;
-  if (!topic) { $("gtitle").textContent = "图谱：这个单元不属于任何 topic，不改动图谱"; $("bench").innerHTML = ""; return; }
+  if (!topic) { $("gtitle").textContent = "图谱"; showGraph(false, "这个单元不属于任何 topic，不改动图谱。"); return; }
   const c = f.call;
   const committed = !c || (beat >= 3 && callsOf[c.subject].at(-1) === f.i);
   const base = before[k];
@@ -634,40 +752,84 @@ function drawBench(f, job) {
   const header = c ? headerOf(c.prompt) : null;
   const candidates = new Set((header?.candidates ?? []).map(x => typeof x === "string" ? x : x.id));
   const entries = Object.entries(nodes);
-  $("gtitle").textContent = `图谱：${topic} ${PAGE.topics[topic] ?? ""}（${entries.length} 个节点${committed ? "，本单元的改动已提交" : "，虚线是本单元还没提交的改动"}）`;
-  if (!entries.length) { $("bench").innerHTML = `<p class="note">这个 topic 的图谱目前还是空的。</p>`; return; }
-  const kinds = ["intent", "aggregate", "observation"], colors = {intent: "var(--I)", aggregate: "var(--G)", observation: "var(--O)", aggregate_observation: "var(--O)"};
-  const columnOf = n => kinds.indexOf(n.type === "aggregate_observation" ? "observation" : n.type);
+  $("gtitle").textContent = `图谱（${entries.length} 个节点，${edges.length} 条边${committed ? "，本单元的改动已提交" : "，虚线是本单元还没提交的改动"}）`;
+  if (!entries.length) { showGraph(false, `${topic} ${PAGE.topics[topic] ?? ""}：这个 topic 的图谱目前还是空的。`); return; }
+  showGraph(true); ensureGraph();
+  /* The container may just have been unhidden; Cytoscape keeps its old (zero) size until told. */
+  cy.resize();
+  const colors = {intent: "--I", aggregate: "--G", observation: "--O", aggregate_observation: "--O"};
   const done = new Set(edges.filter(e => e.relation === "satisfies").map(e => e.to));
-  const strokeOf = n => n.type === "intent" && n.actor === "ai" ? "var(--A)" : colors[n.type] ?? "var(--muted)";
+  const colorOf = n => cssVar(n.type === "intent" && n.actor === "ai" ? "--A" : colors[n.type] ?? "--muted");
   const statusOf = (id, n) => n.type === "intent" || n.type === "aggregate" ? ` · ${done.has(id) ? "已完成" : "待完成"}` : "";
   const nameOf = (id, n) => (n.type === "intent" ? `${id} · ${n.actor === "ai" ? "AI" : "用户"}` : n.type === "aggregate_observation" ? `${id} · ${n.aggregate} 的观测` : id) + statusOf(id, n);
-  const W = 270, H = 44, GAP = 60, pos = {}, rows = [0, 0, 0];
-  for (const [id, n] of entries) { const kk = Math.max(0, columnOf(n)); pos[id] = {x: 10 + kk * (W + GAP), y: 10 + rows[kk]++ * (H + 12)}; }
-  const height = 20 + Math.max(...rows) * (H + 12);
-  let svg = `<defs><marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"/></marker></defs>`;
-  for (const e of edges) {
-    const a = pos[e.from], b = pos[e.to]; if (!a || !b) continue;
-    const same = a.x === b.x, left = b.x < a.x;
-    const x1 = left ? a.x : a.x + W, x2 = left ? b.x + W : b.x, y1 = a.y + H / 2, y2 = b.y + H / 2;
-    const d = same ? `M${a.x + W},${y1} C${a.x + W + 40},${y1} ${b.x + W + 40},${y2} ${b.x + W},${y2}` : `M${x1},${y1} C${(x1 + x2) / 2},${y1} ${(x1 + x2) / 2},${y2} ${x2},${y2}`;
-    const dash = freshEdges.has(keyOf(e)) && !committed ? ' stroke-dasharray="5 4"' : "";
-    svg += `<path class="edge" d="${d}"${dash} marker-end="url(#arrow)"><title>${esc(e.relation + "：" + (e.evidence ?? ""))}</title></path>`;
-    svg += `<text class="elabel" x="${same ? a.x + W + 24 : (x1 + x2) / 2 - 14}" y="${(y1 + y2) / 2 - 3}">${esc(e.relation)}</text>`;
-  }
+  const linked = new Set();
+  for (const e of edges) if (nodes[e.from] && nodes[e.to]) linked.add(e.from).add(e.to);
+  for (const [id, n] of entries) if (n.type === "aggregate_observation" && nodes[n.aggregate]) linked.add(id).add(n.aggregate);
+  const groups = [["topic:" + topic, `${topic} ${PAGE.topics[topic] ?? ""}`, entries.some(([id]) => linked.has(id))],
+                  ["orphans:" + topic, `${topic} 没有边的节点`, entries.some(([id]) => !linked.has(id))]];
+  const elements = groups.filter(([, , used]) => used).map(([id, label]) => ({group: "nodes", data: {id, label, full: PAGE.topics[topic] ?? ""}}));
   for (const [id, n] of entries) {
-    const p = pos[id], pending = fresh.has(id) && !committed, hot = candidates.has(id);
-    svg += `<g><title>${esc(id + " " + (n.label ?? ""))}</title><rect x="${p.x}" y="${p.y}" width="${W}" height="${H}" rx="4" fill="var(--panel)" stroke="${strokeOf(n)}" stroke-width="${hot ? 3.2 : 1.3}"${pending ? ' stroke-dasharray="5 4"' : ""}/>` +
-      `<text x="${p.x + 6}" y="${p.y + 16}" font-weight="700">${esc(nameOf(id, n))}</text><text x="${p.x + 6}" y="${p.y + 34}">${esc(String(n.label ?? "").slice(0, 22))}</text></g>`;
+    const parent = (linked.has(id) ? "topic:" : "orphans:") + topic;
+    const wrapped = wrapLines(n.label ?? ""), shown = wrapped.slice(0, NODE_LINES);
+    if (wrapped.length > NODE_LINES) shown[NODE_LINES - 1] = shown[NODE_LINES - 1].slice(0, -1) + "…";
+    const lines = [nameOf(id, n), ...shown];
+    elements.push({group: "nodes", data: {id, parent, label: lines.join("\n"), full: n.label ?? "", color: colorOf(n), w: NODE_TEXT_W + 16, h: 14 * lines.length + 12},
+      classes: [fresh.has(id) && !committed ? "pending" : "", candidates.has(id) ? "hot" : ""].join(" ")});
   }
-  $("bench").innerHTML = `<svg width="${10 + 3 * (W + GAP)}" height="${height}" role="img" aria-label="topic 图谱">${svg}</svg>`;
+  for (const e of edges) if (nodes[e.from] && nodes[e.to])
+    elements.push({group: "edges", data: {id: keyOf(e), source: e.from, target: e.to, label: e.relation, evidence: e.evidence ?? ""},
+      classes: freshEdges.has(keyOf(e)) && !committed ? "pending" : ""});
+  /* An aggregate's observation names its aggregate in a field, not through an edge; the page draws that tie
+     as the observation validating the expectation the aggregate's intent carries. */
+  for (const [id, n] of entries) if (n.type === "aggregate_observation" && nodes[n.aggregate])
+    elements.push({group: "edges", data: {id: "owner:" + id, source: id, target: n.aggregate, label: "validates", evidence: ""}, classes: "owner"});
+  const shape = JSON.stringify(elements.map(x => x.data.id + "@" + (x.data.parent ?? "")).sort());
+  if (shape === shownGraph) {
+    for (const x of elements) { const el = cy.getElementById(x.data.id); el.data(x.data); el.classes(x.classes ?? ""); }
+    return;
+  }
+  shownGraph = shape; shownTopic = topic;
+  cy.elements().remove(); cy.add(elements); layoutGraph();
+  $("gnote").textContent = "点击节点或边查看全文。拖动节点会记住位置，滚轮缩放，拖动空白处平移。";
+}
+
+/* ---------- what the viewer set by hand survives frame changes and the auto-refresh reload ---------- */
+/* A section the viewer opened or closed stays that way, keyed by its summary text, because every frame rebuilds the panes. */
+const VIEW_KEY = "intent-aligner-view:" + PAGE.directory, SCROLLED = "#dag, .unit pre, .col, .col pre";
+let opened = {};
+function applyOpened() {
+  for (const d of document.querySelectorAll("details")) {
+    const name = d.querySelector("summary")?.textContent;
+    if (name in opened) d.open = opened[name];
+  }
+}
+/* A click on a summary toggles its details only after the click handlers run. */
+document.addEventListener("click", e => {
+  const summary = e.target.closest("summary");
+  if (summary) setTimeout(() => { opened[summary.textContent] = summary.parentElement.open; });
+});
+function saveView() {
+  const view = {opened, page: scrollY, scrolled: [...document.querySelectorAll(SCROLLED)].map(x => [x.scrollTop, x.scrollLeft]),
+    bench: $("bench").style.height, topic: shownTopic, graph: cy ? {zoom: cy.zoom(), pan: cy.pan()} : null};
+  try { sessionStorage.setItem(VIEW_KEY, JSON.stringify(view)); } catch { /* the reload then starts from the defaults */ }
+}
+function restoreView() {
+  let view = null;
+  try { view = JSON.parse(sessionStorage.getItem(VIEW_KEY) ?? "null"); } catch { /* defaults */ }
+  if (!view) return;
+  opened = view.opened; applyOpened();
+  if (view.bench) $("bench").style.height = view.bench;
+  if (cy && view.graph && view.topic === shownTopic) { cy.resize(); cy.viewport({zoom: view.graph.zoom, pan: view.graph.pan}); }
+  document.querySelectorAll(SCROLLED).forEach((x, i) => { if (view.scrolled[i]) [x.scrollTop, x.scrollLeft] = view.scrolled[i]; });
+  scrollTo(0, view.page);
 }
 
 drawStrip();
 const startAt = new URLSearchParams(location.hash.slice(1)).get("frame");
 go(+(startAt ?? 1) - 1);
+restoreView();
 // A reload would cut off a running playback, so it waits until playback stops.
-if (REFRESH_SECONDS !== null) setInterval(() => { if (timer === null) location.reload(); }, REFRESH_SECONDS * 1000);
+if (REFRESH_SECONDS !== null) setInterval(() => { if (timer === null) { saveView(); location.reload(); } }, REFRESH_SECONDS * 1000);
 </script>
 </body>
 </html>

@@ -60,6 +60,11 @@ from intent_aligner.units import (
 from intent_aligner.window import Digests, load_digests, round_entry
 
 TEMPLATE = Path(__file__).with_name("replay.html")
+# Inlined in this order so the page works offline; cytoscape-dagre needs both libraries before it.
+GRAPH_LIBRARIES = [
+    Path(__file__).with_name("vendor") / name
+    for name in ("cytoscape.min.js", "dagre.min.js", "cytoscape-dagre.js")
+]
 
 # The extract command's inline "round" asks share compress's system prompt; which
 # command made one is known from calls.jsonl, or else from when it ran (see _allocate).
@@ -285,6 +290,8 @@ class Call:
 
     `subject` is the job it served: "tool:<id>", "round:<uuid>",
     "message:<uuid>:<start>" or "unit:<position>". `started` is known only from calls.jsonl.
+    `origin` is the run directory that made the call when it is another run's: results
+    copied from there come with their calls.jsonl lines.
     """
 
     stage: str
@@ -293,6 +300,7 @@ class Call:
     started: datetime | None
     exchange: Exchange
     error: str | None
+    origin: str | None = None
 
     @property
     def at(self) -> datetime:
@@ -314,6 +322,7 @@ def logged_calls(run: Run) -> list[Call] | None:
     logs = [run.digests.parent / CALLS_FILE, run.extract / CALLS_FILE]
     if not any(path.exists() for path in logs):
         return None
+    origins = _origins(run)
     calls = []
     for path in logs:
         if not path.exists():
@@ -334,9 +343,29 @@ def logged_calls(run: Run) -> list[Call] | None:
                     started=record.started,
                     exchange=exchange,
                     error=record.error,
+                    origin=origins.get(record.transcript or ""),
                 )
             )
     return calls
+
+
+def _origins(run: Run) -> dict[str, str]:
+    """Transcript -> the other run directory whose calls.jsonl logged it first."""
+    logs = [
+        path
+        for directory in run.directory.parent.iterdir()
+        if directory.is_dir() and directory != run.directory
+        for path in (directory / CALLS_FILE, directory / "extract" / CALLS_FILE)
+        if path.exists()
+    ]
+    origins: dict[str, str] = {}
+    for path in sorted(logs, key=lambda p: p.stat().st_mtime, reverse=True):
+        directory = str(path.parent.parent if path.parent.name == "extract" else path.parent)
+        for line in path.read_text(encoding="utf-8").splitlines():
+            transcript = CallRecord.model_validate_json(line).transcript
+            if transcript is not None:
+                origins[transcript] = directory
+    return origins
 
 
 def _split(prompt: str) -> tuple[str, str]:
@@ -553,6 +582,7 @@ class Attempt(BaseModel):
     `window_seen` are the opening uuids of the earlier rounds the prompt's window really
     holds, oldest first, or None for a prompt without a window; `window_limit` is how
     many it could have held, the run's window size or the rounds that exist if fewer.
+    `origin` is the other run directory that made the call (see Call).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -576,6 +606,7 @@ class Attempt(BaseModel):
     reasoning: str | None
     usage: dict[str, Any]
     finish: str
+    origin: str | None
 
 
 def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
@@ -634,6 +665,7 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
                     reasoning=exchange.reasoning,
                     usage=exchange.usage,
                     finish=exchange.finish,
+                    origin=call.origin,
                 )
             )
     return sorted(judged, key=lambda a: (a.started or a.ended, a.ended))
@@ -1228,8 +1260,11 @@ def render(page: Page, refresh_seconds: int | None) -> str:
     """The template with the page data inlined; a page with `refresh_seconds` reloads itself."""
     data = page.model_dump_json().replace("</", "<\\/")
     refresh = "null" if refresh_seconds is None else str(refresh_seconds)
-    template = TEMPLATE.read_text(encoding="utf-8")
-    return template.replace("/*PAGE_DATA*/null", data).replace("/*REFRESH_SECONDS*/null", refresh)
+    libraries = "\n".join(path.read_text(encoding="utf-8") for path in GRAPH_LIBRARIES)
+    template = TEMPLATE.read_text(encoding="utf-8").replace("/*GRAPH_LIBRARIES*/", libraries, 1)
+    return template.replace("/*PAGE_DATA*/null", data, 1).replace(
+        "/*REFRESH_SECONDS*/null", refresh, 1
+    )
 
 
 def _publish(args: argparse.Namespace) -> None:

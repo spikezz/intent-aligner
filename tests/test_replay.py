@@ -28,7 +28,7 @@ from intent_aligner.replay import (
 from intent_aligner.store import Stores
 from intent_aligner.window import Digests
 
-SOL_RUN = TOOL_ROOT / "corpus" / "results" / "claude-5a1f0c1a-sol-l1"
+SOL_RUN = TOOL_ROOT / "corpus" / "results" / "claude-5a1f0c1a-sol-rewrite"
 T0 = datetime(2026, 11, 8, 19, 0, tzinfo=UTC)
 
 
@@ -85,7 +85,7 @@ def test_errored_call_fails() -> None:
 
 needs_sol = pytest.mark.skipif(
     not (SOL_RUN / "run.sh").exists() or not (LLM_HOME / "codex").exists(),
-    reason="needs the claude-5a1f0c1a-sol-l1 run and its codex transcripts",
+    reason="needs the claude-5a1f0c1a-sol-rewrite run and its codex transcripts",
 )
 
 
@@ -106,18 +106,15 @@ def test_run_sh_names_the_runs_files() -> None:
 @needs_sol
 def test_old_run_matches_every_call_its_records_account_for() -> None:
     run = parse_run(SOL_RUN)
-    conversation = Conversation.load(run)
     page = build_page(run, None, None)
-    asks = Counter((c.stage, c.ask) for c in page.calls)
-    digests = conversation.digests
-    expected = {
-        ("L1", "call"): len(digests.calls),
-        ("L1", "result"): sum(len(r.summaries) for r in digests.results.values()),
-        ("SEG", "segment"): sum(len(s) for s in conversation.segments.values()),
-        ("LOOP", "topic"): sum(a.attempts for a in conversation.assignments),
-        ("LOOP", "round"): len((run.extract / "tool_compressions.jsonl").read_text().splitlines()),
-    }
-    got = {key: asks[key] for key in expected}
+    # digests.jsonl and assignments.jsonl miss L1 retries and a call cut off by a restart
+    # before its unit was written, so the calls.jsonl files are what accounts for every call.
+    expected = Counter(
+        json.loads(line)["ask"]
+        for path in (run.digests.with_name("calls.jsonl"), run.extract / "calls.jsonl")
+        for line in path.read_text().splitlines()
+    )
+    got = Counter(c.ask for c in page.calls)
     assert got == expected, f"{got!r} vs {expected!r}"
     assert page.unplaced == [], page.unplaced
 
@@ -204,8 +201,9 @@ def test_graph_changes_add_up_to_the_final_graphs() -> None:
         topic: store.meta.graph.model_dump(mode="json", by_alias=True, exclude_none=True)
         for topic, store in stores.stores.items()
     }
-    got = {topic: (nodes[topic], edges[topic]) for topic in nodes}
-    expected = {topic: (g["nodes"], g["edges"]) for topic, g in graphs.items()}
+    # Replay appends a replaced edge where the store keeps its place; order is not drawn.
+    got = {topic: (nodes[topic], sorted(map(_flat, edges[topic]))) for topic in nodes}
+    expected = {topic: (g["nodes"], sorted(map(_flat, g["edges"]))) for topic, g in graphs.items()}
     assert got == expected, f"{got!r} vs {expected!r}"
 
 
