@@ -180,8 +180,10 @@ def complete(call: LLMCall, home: Path = LLM_HOME) -> LLMReply:
         check=False,
     )
     if proc.returncode != 0:
+        # claude -p reports API and auth failures in the stdout result JSON, not on stderr.
         raise LLMError(
-            f"{call.backend} exited with {proc.returncode}. stderr tail:\n{proc.stderr[-2000:]}"
+            f"{call.backend} exited with {proc.returncode}. stderr tail:\n{proc.stderr[-2000:]}\n"
+            f"stdout tail:\n{proc.stdout[-2000:]}"
         )
     if call.backend == "claude":
         return _claude_reply(proc.stdout, home)
