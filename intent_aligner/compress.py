@@ -10,7 +10,7 @@ summarize_trajectory is what the main loop calls when a prompt would not fit: it
 the oldest tool records of the window into one passage (intent_aligner.window).
 
 Usage: python -m intent_aligner.compress MERGED.jsonl --backend hive
-           --model deployment/pc-qwen38-np8 --out DIGESTS.jsonl
+           --model deployment/pc-qwen38-np6 --out DIGESTS.jsonl
            [--workers 8] [--until UUID]
 The output is appended to as digests are made, so a stopped run resumes where it was.
 """
@@ -75,12 +75,12 @@ CALL_SYSTEM_PROMPT = """\
 你在提炼 AI 助手一次工具调用的意图，让后面读对话的人不看原文也知道这次调用是做什么的。<调用> 是这次调用的完整原文。
 
 回答两项：
-- intents：这次调用想达成什么。只写目的，不写具体怎么做。一次调用通常只有一个目的；同时做了几件目的不同的事时（比如一条命令既建目录又读文档），每个目的各写一项。每项回答四项：
-  - text：目的，一句话。
-  - evidence：这个目的在 <调用> 原文里的依据，原样摘录。可以用 … 省略中间的部分，但被 … 分开的每个片段都必须原样出现在 <调用> 里，并且按原文的先后顺序排列。
-  - explicit：调用里写明了这个目的就是 true，比如 Bash 调用的 description 字段、代码里说明用途的注释；目的是从命令、路径和参数推断出来的，就是 false。
-  - note：explicit 为 false 时写推断依据：从调用里的什么推断出这个目的。explicit 为 true 时写空字符串。
-- targets：这次调用针对的具体对象：路径、文件名、命令、关键参数和数值。
+- intents：这次调用想达成什么。只写意图，不写具体怎么做。一次调用通常只有一个意图；同时做了几件意图不同的事时，每个意图各写一项。每项回答四项：
+  - text：意图，一句话。
+  - evidence：这个意图在 <调用> 原文里的依据，原样摘录。可以用 … 省略中间的部分，但被 … 分开的每个片段都必须原样出现在 <调用> 里，并且按原文的先后顺序排列。
+  - explicit：调用里写明了这个意图就是 true，比如 Bash 调用的 description 字段、代码里说明用途的注释；意图是从命令、路径和参数推断出来的，就是 false。
+  - note：explicit 为 false 时写推断依据：从调用里的什么推断出这个意图。explicit 为 true 时写空字符串。
+- targets：这次调用针对的具体对象：路径、文件名、关键参数和数值。
 """
 
 RESULT_SYSTEM_PROMPT = """\
@@ -354,7 +354,7 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--effort", choices=["low", "medium", "high", "xhigh"], default="xhigh")
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--workers", type=int, default=8, help="np8 serves 8 slots")
+    parser.add_argument("--workers", type=int, default=6, help="np6 serves 6 slots")
     parser.add_argument("--until", help="stop before this user message uuid")
     parser.add_argument(
         "--stream",

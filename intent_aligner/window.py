@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from tokenizers import Tokenizer
 
 from intent_aligner.intent import Intent
+from intent_aligner.llm import HIVE_THINKING_BUDGET
 from intent_aligner.units import (
     AIText,
     Item,
@@ -29,12 +30,15 @@ from intent_aligner.units import (
     UserSignal,
 )
 
-# hive-frame qwen38-np8 gives each slot 18,944 tokens; the rest of the slot is left
-# for the 9,216-token thinking budget (llm._HIVE_THINKING_BUDGET) and the answer; the
-# largest prompt plus completion on np8 so far is 15,947 tokens (2026-11-06).
-PROMPT_BUDGET = 9_000
+# hive-frame qwen38-np6 gives each slot 27,136 tokens. The thinking budget is set
+# apart and the prompt and the answer share what is left, so the prompt may take all
+# of it; an answer left without room ends with finish_reason "length" (llm.TruncatedReply).
+SLOT_TOKENS = 27_136
+PROMPT_BUDGET = SLOT_TOKENS - HIVE_THINKING_BUDGET
 # Qwen3-0.6B shares the Qwen tokenizer family; on six corpus texts its counts were
-# within 7% of the qwen38 server's /tokenize, which PROMPT_BUDGET's slack absorbs.
+# within 7% of the qwen38 server's /tokenize. On the largest prompts of
+# claude-87eeb4bd-qwen it counted the user prompt alone as high as the server counted
+# system and user prompt together, so it errs on the side of fitting.
 TOKENIZER = "Qwen/Qwen3-0.6B"
 DEFAULT_WINDOW_ROUNDS = 2
 # Call G alone sees what follows its unit; these bound that text.

@@ -12,7 +12,7 @@ from intent_aligner import compress
 from intent_aligner.compress import compress_conversation, summarize_trajectory
 from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, LLMError, TruncatedReply
 from intent_aligner.units import Item
-from intent_aligner.window import CallDigest, Digest, Digests, ResultDigest
+from intent_aligner.window import PROMPT_BUDGET, CallDigest, Digest, Digests, ResultDigest
 from tests.test_segment import _Script
 from tests.test_window import TIMELINE, _call, _call_digest, _result, _user
 
@@ -108,7 +108,8 @@ def test_a_result_is_read_against_its_calls_intent_and_full_text() -> None:
 
 
 def test_a_call_that_leaves_no_room_for_its_result_fails_with_its_id() -> None:
-    call = _call("c1").model_copy(update={"text": "z" * 7_000})
+    # Fits its own prompt, but quoted in the result prompt it leaves under MIN_RESULT_ROOM.
+    call = _call("c1").model_copy(update={"text": "z" * (PROMPT_BUDGET - 2_000)})
 
     with pytest.raises(LLMError, match="1 of 1 jobs failed"):
         _run([call, _result("c1")], Digests(), _call_answer, _result_answer)
@@ -116,7 +117,9 @@ def test_a_call_that_leaves_no_room_for_its_result_fails_with_its_id() -> None:
 
 def test_a_long_trajectory_is_summarized_again() -> None:
     rounds = _Script(_round_answer(""), _round_answer(""), _round_answer(""))
-    summary = summarize_trajectory(_user("u1", "做"), ["意" * 5_000] * 2, rounds, len, "r")
+    summary = summarize_trajectory(
+        _user("u1", "做"), ["意" * (PROMPT_BUDGET // 2)] * 2, rounds, len, "r"
+    )
 
     assert summary == "看了目录", summary
     assert "（第 2/2 段）" in rounds.prompts[1], rounds.prompts[1][:60]
@@ -144,8 +147,9 @@ def test_a_long_queued_message_is_cut_and_marked() -> None:
 
 
 def test_a_long_result_is_summarized_chunk_by_chunk() -> None:
-    # Two 5,000-char lines under len() as the count: together they exceed the 9,000 budget.
-    long_result = _result("c1").model_copy(update={"text": ("y" * 4_999 + "\n") * 2})
+    # Two lines of half the budget under len() as the count: each fits, both together do not.
+    line = "y" * (PROMPT_BUDGET // 2 - 1) + "\n"
+    long_result = _result("c1").model_copy(update={"text": line * 2})
     results = _Script(*[_result_answer("")] * 2)
     made = _run([_call("c1"), long_result], Digests(), _call_answer, results)
 

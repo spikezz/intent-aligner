@@ -261,24 +261,40 @@ B_SCHEMA = {
     "additionalProperties": False,
 }
 
-C_SYSTEM_PROMPT = """\
+_C_TASK = """\
 你在判断对话里一个单元的意图和这个 topic 的其他节点之间有什么关系。
 
 <header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个单元所属的 topic；unit 是这个单元的类型、发出者和时间；graph 是这个 topic 的意图图谱，nodes 是已有节点（intent 是用户或 AI 的意图，actor 说明是谁，aggregate 是工具操作的意图聚合，observation 是环境推送的观测，aggregate_observation 是一个聚合到目前为止的观测），edges 是已有的边；unit_intents 是这个单元的意图或聚合，编号和文本；candidates 是可以连接的节点：字符串是图谱里的编号，带 id 和 text 的对象是还没有建节点的观测；relations 是可以使用的关系，from 和 to 说明两端的节点种类，intent 既指用户或 AI 的意图，也指聚合。
 
-<此前的对话> 是这个单元之前的对话。<当前单元> 是这个单元。
+<此前的对话> 是这个单元之前的对话。<当前单元> 是这个单元：发言段落给出整次发言，用 <当前段落> 和 </当前段落> 标出这一段；工具调用给出它的意图和操作对象的概括。
 
-回答 edges：每条关系一项，没有关系时是空列表。每条边的两端必须有一端在 unit_intents 里，另一端在 candidates 或 unit_intents 里。每项回答四项：
+回答 edges：每条关系一项，没有关系时是空列表。每条边的两端必须有一端在 unit_intents 里，另一端在 candidates 里。每项回答四项：
 - from、to：起点和终点的编号。
 - relation：关系类型，含义见 relations。
 - evidence：这条关系的依据，从 <当前单元> 或 <此前的对话> 原样摘录。可以用 … 省略中间的部分，但被 … 分开的每个片段都必须原样出现，并且按原文的先后顺序排列。
-
-某个观测引出这个单元的意图时，记这个观测到这个意图的 triggers 边。triggers 的 to 是用户意图，或者产生这个观测的聚合之外的聚合；同一个聚合内部，结果引出下一步操作属于这个聚合本身的推进。只记录这个单元实际表现出来的关系。
 """
 
+C_SYSTEM_PROMPT = (
+    _C_TASK
+    + """
+某个观测引出这个单元的意图时，记这个观测到这个意图的 triggers 边。triggers 的 to 是产生这个观测的聚合之外的意图或聚合；同一个聚合内部，结果引出下一步操作属于这个聚合本身的推进。记下这个单元实际表现出来的全部关系。
+"""
+)
+
+# A tool call filed under an aggregate that already has a node: the aggregate's edges
+# were recorded when it was set up, and asked for "all relations of this unit" the model
+# kept weighing whether to copy them (unit 30 of claude-87eeb4bd-qwen thought to the cap).
+C_STEP_SYSTEM_PROMPT = (
+    _C_TASK
+    + """
+这个单元是一个已有聚合里的又一步工具调用：unit_intents 就是这个聚合，图谱里有这个聚合已有的边。记下这一步新表现出来的关系：产生于这个聚合之外的观测引出了这一步时，记这个观测到这个聚合的 triggers 边；这一步表明这个聚合同时在为另一个意图服务时，记这个聚合到那个意图的 serves 边。
+"""
+)
+
 _C_RELATIONS: dict[str, tuple[str, str, str]] = {
-    "serves": ("intent", "intent", "from 是实现 to 的手段"),
+    "serves": ("intent", "intent", "from 直接服务于 to"),
     "triggers": ("observation", "intent", "from 这个观测引出了 to 这个意图"),
+    "responds": ("intent", "intent", "from 回应对方说的话 to：一端是用户，另一端是 AI"),
 }
 
 C_SCHEMA = {
@@ -529,7 +545,7 @@ class _CEdge(BaseModel):
 
     from_: str = Field(alias="from")
     to: str
-    relation: Literal["serves", "triggers"]
+    relation: Literal["serves", "triggers", "responds"]
     evidence: str = Field(min_length=1)
 
 
@@ -566,6 +582,7 @@ class Asks:
     aggregate: Ask
     tool_intent: Ask
     relation: Ask
+    step_relation: Ask
     outcome: Ask
     outcome_summary: Ask
     outcome_update: Ask
@@ -704,7 +721,7 @@ def extract_units(
             else:
                 record = _with_intents(step, record, context, window, asks, stores)
                 if record.intents and not record.needs_review:
-                    record = _relate(step, record, context, window, asks.relation, stores)
+                    record = _relate(step, record, context, window, asks, stores)
             into_stores(stores, step, record)
             yield from window.fresh
             yield record
@@ -803,9 +820,11 @@ def _make_segment(
 ) -> Segment:
     CALL_SUBJECT.set(f"message:{speech.source.uuid}")
 
+    header = _graphs_block(context.stores)
+
     def fitted(rounds: int) -> str:
         return message_window(
-            context.items, index, context.digests, window.in_force, context.count, rounds
+            header, context.items, index, context.digests, window.in_force, context.count, rounds
         )
 
     try:
@@ -813,7 +832,7 @@ def _make_segment(
     except WindowError as error:
         print(f"needs_review: {error}", file=sys.stderr, flush=True)
         return review_segment(speech, start, 0)
-    return next_segment(_graphs_block(context.stores), text, speech, start, ask)
+    return next_segment(header, text, speech, start, ask)
 
 
 @attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
@@ -910,8 +929,6 @@ def _fitted_prompt(
     head: str,
     window: _Round,
     tail: str = "",
-    *,
-    uncharged: int = 0,
 ) -> str:
     """The prompt of one call, compressing tool records first when it would not fit otherwise.
 
@@ -920,7 +937,7 @@ def _fitted_prompt(
     """
 
     def fitted(rounds: int) -> str:
-        return _prompt(step, context, system, head, window.in_force, tail, uncharged, rounds)
+        return _prompt(step, context, system, head, window.in_force, tail, rounds)
 
     return _within_budget(_round_low(step), step.index, context, window, fitted)
 
@@ -937,9 +954,8 @@ def _assign(
     if isinstance(unit, Observation) and unit.tool_use_id is not None:
         return Assignment(unit=ref, topic=call_topics[unit.tool_use_id], attempts=0)
     head = _header(unit, context.topics, {"graphs": _graphs(context.stores)})
-    uncharged = context.count(head) - context.count(_header(unit, context.topics, {}))
     try:
-        prompt = _fitted_prompt(step, context, T_SYSTEM_PROMPT, head, window, uncharged=uncharged)
+        prompt = _fitted_prompt(step, context, T_SYSTEM_PROMPT, head, window)
     except WindowError as error:
         return Assignment(
             unit=ref, topic=None, needs_review=True, review_reason=str(error), attempts=0
@@ -1300,38 +1316,57 @@ def _relate(
     record: Assignment,
     context: _Context,
     window: _Round,
-    ask: Ask,
+    asks: Asks,
     stores: Stores,
 ) -> Assignment:
     """Call C: the edges of this unit's intents, and a node for each observation they name.
 
-    A unit's intents may relate to each other: "A before B" often opens both at once.
+    A unit's intents may relate to each other: "A before B" often opens both at once. A
+    tool call filed under an aggregate that already has a node is asked only for what
+    this step adds (C_STEP_SYSTEM_PROMPT).
     """
     topic = record.topic
     assert topic is not None
     unit_nodes = _unit_nodes(record, topic, stores)
     known = stores.topic_nodes(topic)
+    if isinstance(step.unit, ToolCall) and set(unit_nodes) <= set(known):
+        system, ask = C_STEP_SYSTEM_PROMPT, asks.step_relation
+    else:
+        system, ask = C_SYSTEM_PROMPT, asks.relation
     relations = [
         {"relation": name, "from": start, "to": end, "meaning": meaning}
         for name, (start, end, meaning) in _C_RELATIONS.items()
     ]
 
+    same_speech = set(unit_nodes)
+    if isinstance(step.unit, SpeechSegment):
+        uuid = step.unit.speech.source.uuid
+        same_speech |= {
+            i.id
+            for span in stores.stores[topic].spans
+            if span.source.uuid == uuid
+            for i in span.intents
+        }
+    linkable = [i for i in known if i not in same_speech]
     pending = _visible_pending(step, topic, context, stores)
     offered = [{"id": handle, "text": p.text} for handle, p in pending.items()]
     more: dict[str, object] = {
         "relations": relations,
         "unit_intents": list(unit_nodes.values()),
     }
-    head = _graph_header(step, context, topic, stores, [*known, *offered], more)
+    head = _graph_header(step, context, topic, stores, [*linkable, *offered], more)
     try:
-        prompt = _fitted_prompt(step, context, C_SYSTEM_PROMPT, head, window)
+        prompt = _fitted_prompt(step, context, system, head, window)
     except WindowError as error:
         return _review(record, str(error))
     own_aggregate = {
         i: node.aggregate for i, node in known.items() if isinstance(node, AggregateObservationNode)
     }
     observations = {i for i, n in known.items() if isinstance(n, _OBSERVATION_NODES)} | set(pending)
-    allowed = {*known, *unit_nodes, *pending}
+    allowed = {*linkable, *pending}
+    speakers = {i: n.actor for i, n in known.items() if isinstance(n, IntentNode)}
+    if isinstance(step.unit, SpeechSegment):
+        speakers |= {i: step.unit.speech.speaker for i in unit_nodes if i not in speakers}
     source = _unit_source(step.unit)
     shown_input = prompt[prompt.index("<此前的对话>") :]
 
@@ -1339,11 +1374,12 @@ def _relate(
         got = _CAnswer.model_validate_json(reply).edges
         for edge in got:
             ends = (edge.from_, edge.to)
-            wrong = [end for end in ends if end not in allowed]
-            if wrong:
-                raise ValueError(f"{wrong!r} 不在 candidates 或 unit_intents 里。")
-            if edge.from_ == edge.to or not set(ends) & set(unit_nodes):
-                raise ValueError(f"{ends!r} 的两端必须不同，并且有一端在 unit_intents 里。")
+            if len(set(ends) & same_speech) == 2:
+                raise ValueError(
+                    f"{ends!r} 出自同一次发言。同一次发言里的几个意图之间没有关系，去掉这条边。"
+                )
+            if not set(ends) & set(unit_nodes) or not set(ends) & allowed:
+                raise ValueError(f"{ends!r} 必须一端在 unit_intents 里，另一端在 candidates 里。")
             start, end, _ = _C_RELATIONS[edge.relation]
             kinds = tuple("observation" if e in observations else "intent" for e in ends)
             if kinds != (start, end):
@@ -1351,6 +1387,10 @@ def _relate(
             if edge.relation == "triggers" and edge.to == own_aggregate.get(edge.from_):
                 raise ValueError(
                     f"{edge.from_} 是 {edge.to} 自己的工具调用产生的结果。同一个聚合内部，结果引出下一步操作属于这个聚合本身的推进，去掉这条 triggers 边。"
+                )
+            if edge.relation == "responds" and {speakers.get(e) for e in ends} != {"user", "ai"}:
+                raise ValueError(
+                    f"responds 只连用户和 AI 之间相互回应的话：{ends!r} 必须一端是用户的意图，另一端是 AI 的意图。"
                 )
             if not is_excerpt(edge.evidence, source) and not is_excerpt(edge.evidence, shown_input):
                 raise ValueError(f"evidence {edge.evidence!r} 不是当前单元或此前对话的原文摘录。")
@@ -1624,20 +1664,19 @@ def _prompt(
     head: str,
     in_force: Sequence[ToolCompression],
     tail: str,
-    uncharged: int,
     rounds: int,
 ) -> str:
     """The prompt of one call for `step`; raises WindowError when the window does not fit.
 
     The window ends right before this unit, so the unit sees what led to it but not how
     its round ended. `tail` follows the current unit; `system` only counts against the
-    budget, and `uncharged` tokens of the head (the graphs) do not.
+    budget.
     """
     items, digests, count = context.items, context.digests, context.count
     current = f"<当前单元>\n{render_unit(step.unit, digests)}\n</当前单元>"
     if tail:
         current = f"{current}\n\n{tail}"
-    room = PROMPT_BUDGET - count(system) - count(head) + uncharged - count(current) - FEEDBACK_ROOM
+    room = PROMPT_BUDGET - count(system) - count(head) - count(current) - FEEDBACK_ROOM
     window = window_text(
         items, _round_low(step), step.index, digests, in_force, room, count, rounds
     )
@@ -1776,6 +1815,7 @@ def main() -> None:
         aggregate=ask("aggregate", G_SYSTEM_PROMPT, G_SCHEMA),
         tool_intent=ask("tool_intent", L_SYSTEM_PROMPT, L_SCHEMA),
         relation=ask("relation", C_SYSTEM_PROMPT, C_SCHEMA),
+        step_relation=ask("step_relation", C_STEP_SYSTEM_PROMPT, C_SCHEMA),
         outcome=ask("outcome", D_SYSTEM_PROMPT, D_SCHEMA),
         outcome_summary=ask("outcome_summary", D_SUMMARY_SYSTEM_PROMPT, D_SUMMARY_SCHEMA),
         outcome_update=ask("outcome_update", D_UPDATE_SYSTEM_PROMPT, D_SUMMARY_SCHEMA),

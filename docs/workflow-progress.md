@@ -47,7 +47,7 @@ flowchart TD
     A --> VA{"校验 A<br/>每项字段齐全？<br/>evidence 是单元原文的摘录？<br/>explicit 为 false 时 note 非空？"}
     VA -- 不通过 --> A
     VA -- "通过，空列表" --> SPAN
-    VA -- "通过，非空" --> RET["代码：列出候选<br/>调用 B：当前 topic 里同一方（用户或 AI）的意图节点<br/>调用 C：当前 topic 的全部节点 + 窗口内能单独看到的未建节点观测<br/>（用户拒绝时被拒绝调用所属的聚合已在全部节点里）"]
+    VA -- "通过，非空" --> RET["代码：列出候选<br/>调用 B：当前 topic 里同一方（用户或 AI）的意图节点<br/>调用 C：当前 topic 里出自其他发言的节点 + 窗口内能单独看到的未建节点观测<br/>（用户拒绝时被拒绝调用所属的聚合已在全部节点里）"]
 
     RET --> HAS{当前 topic 已有同一方的意图节点？}
     HAS -- "没有：全部算作 NEW" --> ASSIGN
@@ -69,7 +69,7 @@ flowchart TD
     GASSIGN["代码：给 NEW 分配 G 编号<br/>同一个底层意图沿用原 L 编号，其余分配新 L 编号<br/>登记进 meta.tool_intents，段落引用 L 编号"]
     GASSIGN --> C
     C["调用 C：这个单元的每个意图<br/>和候选之间有关系吗？<br/>输出 [起点编号, 终点编号, relation 枚举, evidence]"]
-    C --> VC{"校验 C<br/>两端一个是本单元的意图<br/>另一个在候选列表或本单元的意图里？<br/>relation 在枚举里且方向和节点类型匹配？<br/>evidence 是单元原文或 input 的摘录？"}
+    C --> VC{"校验 C<br/>两端一个是本单元的意图<br/>另一个在候选列表里（候选列表不含同一次发言的意图）？<br/>relation 在枚举里且方向和节点类型匹配？<br/>responds 的两端一个是用户的意图、一个是 AI 的意图？<br/>evidence 是单元原文或 input 的摘录？"}
     VC -- 不通过 --> C
     VC -- 通过 --> TRIG["代码：重复的边去重<br/>triggers 指向尚未建节点的观测时<br/>用这个观测的概括文本为它建节点"]
     TRIG --> SPAN

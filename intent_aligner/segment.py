@@ -225,6 +225,7 @@ def review_segment(message: Speech, start: int, attempts: int) -> Segment:
 
 
 def message_window(
+    header: str,
     items: Sequence[Item],
     index: int,
     digests: Digests,
@@ -235,6 +236,6 @@ def message_window(
     """The window for segmenting items[index], sized so the longest prompt still fits."""
     message = items[index]
     assert isinstance(message, Speech)
-    rest = count(SYSTEM_PROMPT) + count(build_prompt("", "", message, 0, ""))
+    rest = count(SYSTEM_PROMPT) + count(build_prompt(header, "", message, 0, ""))
     room = PROMPT_BUDGET - rest - FEEDBACK_ROOM
     return window_text(items, index, index, digests, compressions, room, count, rounds)

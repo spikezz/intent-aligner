@@ -20,6 +20,18 @@
 
 对话 `corpus/merged/claude-87eeb4bd.jsonl`，模型是 Hive 网关上的 `deployment/pc-qwen38-np8`（Qwen 3.8 27B），思考强度 xhigh，窗口 `--window-rounds 2`，规则和 `claude-5a1f0c1a-sol-rewrite/` 相同。这次运行用来观察思考 token 随 header 里图谱变大怎样增长。目录里的文件和上面相同。
 
+## `claude-87eeb4bd-qwen-final/`
+
+同一个对话，模型是 `deployment/pc-qwen38-np6`，思考强度 xhigh，窗口 `--window-rounds 2`，按现行提示词从空图谱重跑。第一级压缩、发言切分和主循环都在这一轮里做，所有调用都用同一个思考上限 `llm.HIVE_THINKING_BUDGET`。这次运行用来验证 `backups/intent-aligner-capped-thinking-rerun-2026-11-09/problem-table.md` 里的改动：调用 C 还会不会把思考顶满，serves 和 responds 怎样使用。`extract-before-direct/` 是 serves 改成“from 直接服务于 to”之前那次中途停下的主循环输出。
+
+## `claude-87eeb4bd-sol/`
+
+和 `claude-87eeb4bd-qwen-final/` 用同一套提示词跑同一个对话，模型换成 Codex 的 gpt-6.1-sol，思考强度 xhigh，作为对照。`run.sh` 会先续跑第一级压缩，压缩结果已经齐全，所以直接进入主循环。`extract-before-direct/` 的含义同上。
+
+## `claude-87eeb4bd-opus/`
+
+同一个对话，模型是 Opus 5.5（`--backend claude --model claude-opus-5-5`），思考强度 xhigh，窗口 `--window-rounds 2`，按现行提示词从空图谱重跑。第一级压缩、发言切分和主循环都由 Opus 在这一轮里做，所以单元编号可能和 `claude-87eeb4bd-qwen-final/` 不同，两轮对照时按发言的 uuid 对应单元。这次运行比 Qwen 快，用来先在 Opus 上验证问题表里的改动，特别是第 5 项：用户的同意记成 responds 之后，单元 27 和 59 还会不会把 serves 同时连到两层意图上。
+
 ## 回放
 
 用法见项目根目录 `README.md` 的“回放一次运行”：

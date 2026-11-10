@@ -21,7 +21,7 @@ from intent_aligner.units import Item, Speech, ToolCall, UserSignal
 STORE_HEADER = "# 结构和填写规则见 docs/trajectory-extractor.md（路径相对于工具根目录）\n"
 UNASSIGNED_FILE = "unassigned.yaml"
 
-Relation = Literal["serves", "satisfies", "blocks", "triggers"]
+Relation = Literal["serves", "satisfies", "blocks", "triggers", "responds"]
 
 
 class IntentNode(BaseModel):

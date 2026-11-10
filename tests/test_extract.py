@@ -147,6 +147,7 @@ def _assignments(
     tool_intent: Ask = _no_repeats,
     stores: Stores | None = None,
     relation: Ask = _no_edges,
+    step_relation: Ask = _no_edges,
     outcome: Ask = _no_outcomes,
     outcome_update: Ask = _no_outcomes_summary,
     round_ask: Ask = _no_round,
@@ -159,6 +160,7 @@ def _assignments(
         aggregate=aggregate,
         tool_intent=tool_intent,
         relation=relation,
+        step_relation=step_relation,
         outcome=outcome,
         outcome_summary=_no_outcomes_summary,
         outcome_update=outcome_update,
@@ -809,8 +811,8 @@ LONG_SEGMENTS: dict[str, list[Segment]] = {"u1": [_segment(0, 4)], "a1": []}
 
 
 def _heavy_results(text: str) -> int:
-    """Each level-1 result costs 1,000 tokens, so the round outgrows the budget after a few."""
-    return len(text) + 1000 * text.count("【工具结果】")
+    """Each level-1 result costs a ninth of the budget, so the round outgrows it after a few."""
+    return len(text) + PROMPT_BUDGET // 9 * text.count("【工具结果】")
 
 
 def _long_run(
@@ -827,6 +829,7 @@ def _long_run(
         aggregate=_one_aggregate,
         tool_intent=_no_repeats,
         relation=_no_edges,
+        step_relation=_no_edges,
         outcome=_no_outcomes,
         outcome_summary=_no_outcomes_summary,
         outcome_update=_no_outcomes_summary,
@@ -972,6 +975,7 @@ def test_an_earlier_round_is_compressed_before_the_current_one(no_following: Non
         aggregate=_one_aggregate,
         tool_intent=_no_repeats,
         relation=_no_edges,
+        step_relation=_no_edges,
         outcome=_no_outcomes,
         outcome_summary=_no_outcomes_summary,
         outcome_update=_no_outcomes_summary,
@@ -1010,6 +1014,7 @@ def _one_round(
         aggregate=aggregate,
         stores=stores,
         relation=relation,
+        step_relation=relation,
         outcome=outcome,
         outcome_update=outcome_update,
     )
@@ -1094,6 +1099,30 @@ def test_call_c_gives_a_picked_pushed_observation_its_node() -> None:
     assert list(stores.pending) == [], "a picked observation stops being pending"
 
 
+def test_a_call_that_joins_an_existing_aggregate_is_asked_only_for_its_step() -> None:
+    asked: list[tuple[str, str]] = []
+
+    def ask_for(name: str) -> Ask:
+        def answer(prompt: str) -> str:
+            asked.append((name, re.findall(r'"unit_intents":\s*\[\{"id":\s*"(\w+)"', prompt)[0]))
+            return '{"edges": []}'
+
+        return answer
+
+    stores = Stores(merged_file="merged.jsonl", items=ONE_ROUND)
+    _assignments(
+        ONE_ROUND,
+        ONE_SEGMENT,
+        FULL,
+        _new_then_first([]),
+        stores=stores,
+        relation=ask_for("relation"),
+        step_relation=ask_for("step_relation"),
+    )
+
+    assert asked == [("relation", "G001"), ("step_relation", "G001")], asked
+
+
 def test_call_c_retries_a_trigger_into_the_aggregate_that_produced_the_observation() -> None:
     prompts: list[str] = []
 
@@ -1126,6 +1155,68 @@ def test_call_c_retries_an_edge_against_the_direction_of_its_relation() -> None:
     assert "方向必须是" in prompts[2], prompts[2]
     assert not any(a.needs_review for a in got), got
     assert _edges(stores) == [], "the rejected edge must not be stored"
+
+
+def test_call_c_keeps_responds_between_user_and_ai_and_retries_it_between_two_users() -> None:
+    timeline: list[Item] = [
+        _user("u1", "第一条"),
+        AIText(source=_source("a1"), text="第二条"),
+        _user("u2", "第三条"),
+    ]
+    said = Intent(text="说话", evidence="第", explicit=True, note="")
+    segments = {
+        u: [Segment(start=0, end=3, text="", intents=[said], attempts=1)]
+        for u in ("u1", "a1", "u2")
+    }
+    stores = Stores(merged_file="merged.jsonl", items=timeline)
+    prompts: list[str] = []
+
+    def relation(prompt: str) -> str:
+        prompts.append(prompt)
+        unit = re.findall(r'"unit_intents":\s*\[\{"id":\s*"(\w+)"', prompt)[0]
+        if unit == "I001" or len(prompts) > 3:
+            return '{"edges": []}'
+        edge = {"from": unit, "to": "I001", "relation": "responds", "evidence": "第"}
+        return json.dumps({"edges": [edge]})
+
+    _assignments(timeline, segments, FULL, _new_then_first([]), stores=stores, relation=relation)
+
+    assert "responds 只连用户和 AI" in prompts[3], prompts[3]
+    assert [e[:3] for e in _edges(stores)] == [("I002", "I001", "responds")], _edges(stores)
+
+
+def test_call_c_does_not_offer_or_keep_an_edge_between_intents_of_one_speech() -> None:
+    timeline: list[Item] = [_user("u1", "第一条第二条")]
+    said = Intent(text="做事", evidence="第", explicit=True, note="")
+    segments = {
+        "u1": [Segment(start=a, end=a + 3, text="", intents=[said], attempts=1) for a in (0, 3)]
+    }
+    stores = Stores(merged_file="merged.jsonl", items=timeline)
+    prompts: list[str] = []
+
+    def relation(prompt: str) -> str:
+        prompts.append(prompt)
+        if len(prompts) != 2:
+            return '{"edges": []}'
+        edge = {"from": "I002", "to": "I001", "relation": "serves", "evidence": "第"}
+        return json.dumps({"edges": [edge]})
+
+    def registry(prompt: str) -> str:
+        return json.dumps({"answers": [{"match": "NEW", "complete": True}]})
+
+    _assignments(
+        timeline,
+        segments,
+        FULL,
+        _new_then_first([]),
+        registry=registry,
+        stores=stores,
+        relation=relation,
+    )
+
+    assert _header(prompts[1])["candidates"] == [], _header(prompts[1])["candidates"]
+    assert "出自同一次发言" in prompts[2], prompts[2]
+    assert _edges(stores) == [], _edges(stores)
 
 
 def test_an_incomplete_intent_serves_the_one_it_adds_to_without_asking_call_c() -> None:

@@ -50,15 +50,9 @@ _CLAUDE_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
 
 HIVE_FRAME_URL = os.environ.get("HIVE_FRAME_URL", "http://127.0.0.1:8790").rstrip("/")
 
-# pi's default thinking budgets for token-budget models, so a Hive model thinks as much
-# here as it does under pi, except at the top: a np8 slot holds 18,944 tokens for prompt,
-# thinking and answer together, so high and xhigh are capped to leave window.PROMPT_BUDGET.
-_HIVE_THINKING_BUDGET: dict[Effort, int] = {
-    "low": 2048,
-    "medium": 9216,
-    "high": 9216,
-    "xhigh": 9216,
-}
+# The one thinking cap for every Hive call at every effort, so calls of one run are
+# comparable; window.PROMPT_BUDGET is the np6 slot minus this cap.
+HIVE_THINKING_BUDGET = 10_240
 # The gateway answered 409 to a burst right after a stopped run and accepted the same
 # requests about 40 s later (2026-11-06), so a 409 is waited out before it counts as failure.
 _HIVE_CAPACITY_WAIT = 1800
@@ -424,8 +418,8 @@ def hive_request_body(call: LLMCall, client: dict[str, Any]) -> dict[str, Any]:
         if client.get("thinking_format") == "qwen-chat-template":
             body["chat_template_kwargs"] = {"enable_thinking": True}
             field = client.get("thinking_token_budget_field")
-            if field and call.effort in _HIVE_THINKING_BUDGET:
-                body[field] = _HIVE_THINKING_BUDGET[call.effort]
+            if field:
+                body[field] = HIVE_THINKING_BUDGET
         elif client.get("reasoning_effort"):
             body["reasoning_effort"] = call.effort
     if call.json_schema is not None:

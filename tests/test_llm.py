@@ -14,7 +14,7 @@ import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from pydantic import ValidationError
@@ -168,14 +168,12 @@ def test_hive_streams_by_default() -> None:
     assert body["stream_options"] == {"include_usage": True}, body
 
 
-def test_hive_qwen_thinking_budget_leaves_room_for_the_prompt() -> None:
-    low = hive_request_body(_hive_call("low"), QWEN_CLIENT)
-    xhigh = hive_request_body(_hive_call("xhigh"), QWEN_CLIENT)
+def test_hive_qwen_thinking_budget_is_the_same_at_every_effort() -> None:
+    for effort in get_args(llm.Effort):
+        body = hive_request_body(_hive_call(effort), QWEN_CLIENT)
 
-    assert low["chat_template_kwargs"] == {"enable_thinking": True}, low
-    assert low["reasoning_budget_tokens"] == 2048, low
-    assert xhigh["chat_template_kwargs"] == {"enable_thinking": True}, xhigh
-    assert xhigh["reasoning_budget_tokens"] == 9216, xhigh
+        assert body["chat_template_kwargs"] == {"enable_thinking": True}, body
+        assert body["reasoning_budget_tokens"] == llm.HIVE_THINKING_BUDGET, body
 
 
 def test_hive_openai_thinking_sends_reasoning_effort() -> None:
@@ -379,7 +377,7 @@ LIVE_MODELS: dict[llm.Backend, str] = {
     "claude": "sonnet",
     "codex": "gpt-6-astra",
     "pi": "fireworks/accounts/fireworks/models/glm-5p3-flash",
-    "hive": "deployment/pc-qwen38-np8",
+    "hive": "deployment/pc-qwen38-np6",
 }
 
 # Where each CLI keeps transcripts in daily use; an isolated call must leave no trace there.

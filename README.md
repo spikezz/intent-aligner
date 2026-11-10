@@ -30,14 +30,14 @@ $PY -m intent_aligner.units corpus/merged/claude-5a1f0c1a.jsonl --out corpus/uni
 OUT=corpus/results/claude-5a1f0c1a-qwen38
 mkdir -p $OUT/extract
 $PY -m intent_aligner.compress corpus/merged/claude-5a1f0c1a.jsonl \
-    --backend hive --model deployment/pc-qwen38-np8 --workers 8 --out $OUT/digests.jsonl
+    --backend hive --model deployment/pc-qwen38-np6 --workers 6 --out $OUT/digests.jsonl
 
 # 5. 指针按时间顺序逐个走过单元，每一步都带着此时全部 topic 的意图图谱：发言一段一段切分，判断单元属于哪个 topic，
 #    对照已有意图，把工具调用的底层意图归入聚合并在聚合内去重，建立意图之间的关系，判断观测的影响。
 #    全程串行，输出边跑边追加，中断后重跑会从断点继续。
 $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
     --digests $OUT/digests.jsonl --segments $OUT/segments.jsonl \
-    --backend hive --model deployment/pc-qwen38-np8 --out $OUT/extract
+    --backend hive --model deployment/pc-qwen38-np6 --out $OUT/extract
 ```
 
 第 3 步输出的单元有 `user_message`（用户消息全文，附带图片路径）、`ai_text`（AI 对用户说的一段话）、`user_signal`、`tool_call` 和 `observation`。用户消息和 AI 说的话都算发言，用同样的方式处理。
@@ -72,14 +72,15 @@ $PY -m intent_aligner.replay corpus/results/claude-5a1f0c1a-sol-l1 --out replay.
 
 每一帧显示下面这些内容：
 
-- 流程条标出当前阶段，主循环标到具体的调用（T、A、B、G、L、C、D）。
-- 当前 topic 的图谱，放在当前任务的原文和三栏的上面：按 `assignments.jsonl` 逐单元重建。每一帧都显示图谱：单元还没写完时显示它开始前的图谱；调用 T 还不知道 topic、或者这一帧在切分和压缩时，显示最近一个单元所在 topic 到这一帧为止的图谱。图谱有改动时重新排版，没有改动时保持原来的排版。有边的节点放在虚线大框里，一条边都没有的节点放在左边单独的“没有边的节点”框里。本单元新增的节点和边在单元最后一次调用之前画成虚线，这次调用 header 里的候选加粗；用户的意图和 AI 的意图用不同的边框颜色，节点上也写明是谁的。聚合的观测和它所属的聚合之间画一条红色点线 `validates`，它不是存储里的边，而是观测节点的 `aggregate` 字段。点击节点或边显示全文；节点可以拖动，页面会记住拖动后的位置，滚轮缩放，拖动空白处平移。
+- 流程条标出当前阶段，主循环标到具体的调用（T、A、B、G、L、C、D）；点一个阶段或字母跳到下一次这一步的调用。
+- 当前 topic 的图谱，放在当前任务的原文和三栏的上面：按 `assignments.jsonl` 逐单元重建。每一帧都显示图谱：单元还没写完时显示它开始前的图谱；调用 T 还不知道 topic、或者这一帧在切分和压缩时，显示最近一个单元所在 topic 到这一帧为止的图谱。图谱有改动时重新排版，没有改动时保持原来的排版。有边的节点放在虚线大框里，一条边都没有的节点放在左边单独的“没有边的节点”框里。本单元新增的节点和边在单元最后一次调用之前画成虚线，这次调用 header 里的候选加粗；用户的意图和 AI 的意图用不同的边框颜色，节点上也写明是谁的。已完成的意图和聚合整块涂满边框颜色、文字变成白色，右上角有绿底白字的“已完成”标记；待完成的在节点第一行写着“待完成”。聚合的观测和它所属的聚合之间画一条红色点线 `validates`，它不是存储里的边，而是观测节点的 `aggregate` 字段。点击节点或边显示全文，并列出改动过它的单元，点单元跳到它提交记录的那一帧；模型回答和写入记录里加引号的节点编号也可以点，点了在图谱里选中那个节点；节点可以拖动，页面会记住拖动后的位置，滚轮缩放，拖动空白处平移。
 - 当前任务的原文：抽取单元的全文和它所属的 topic，或者发言里正在切分的那一段。
-- 发给端点的请求：请求行里的设置、system、提示词和上下文窗口的规则。提示词里源码写死的文字和随任务变化的文字用不同底色区分，重问时附上的反馈另外标出来。
+- 发给端点的请求：请求行里的设置、system 和提示词。提示词里源码写死的文字和随任务变化的文字用不同底色区分，重问时附上的反馈另外标出来。帧标题下面写明窗口实际放进了哪几轮，点一轮跳到主循环处理那一轮的第一个单元；旁边可以展开上下文窗口的规则，这段说明由页面从源码常量和 docstring 生成，不发给模型。
 - 模型的回答、推理、用量和 schema。
-- 代码对这个调用的校验规则和重问时追加的反馈，这些都是生成页面时从源码里读出来的；还有这次调用是第几次尝试、被接受还是被驳回，以及写入的文件、needs_review 和 run.log 的行。
+- 代码对这个调用的校验规则和重问时追加的反馈，这些都是生成页面时从源码里读出来的；还有这次调用是第几次尝试（可以跳到同一个问题的上一次尝试和重问的下一次尝试）、被接受还是被驳回，以及写入的文件、needs_review 和 run.log 的行。
+- token 统计，分两个标签页：思考 token 和完整上下文 token（提示词 + 思考 + 回答）。每页一张图按 header 里图谱的节点数加边数排开，一张图从小到大排列（完整上下文的柱子分三段），思考 token 页的红色虚线是请求里设的思考上限，运行中途换过上限时只画最高的那个；可以按调用种类筛选，点一个点或一根柱子跳到那次调用。
 
-依赖图按轮次画出全部任务。被标成 needs_review 的抽取单元里，没有发给模型的步骤用红色字母显示：`G✗` 表示这一步在路线上但没有发出去，`L?` 表示这一步要不要走取决于没有拿到的模型回答。第一层压缩的每个工具画成一对方块（压调用、压结果），结果分段压缩时标出段数；第一层压缩和主循环之间画一条屏障，写明 compress 命令结束后才运行 extract；同一轮发言切出的段落连成一条链；抽取单元画成一条链，每个单元标出它的调用序列，并高亮当前调用。页面顶部的表按阶段统计真实的调用次数、重试、驳回和失败，以及 `needs_review` 的任务数。`needs_review` 的任务在依赖图和时间条上用单独的颜色标出，这个任务的每一帧顶部都写明原因。
+依赖图按轮次画出全部任务。被标成 needs_review 的抽取单元里，没有发给模型的步骤用红色字母显示：`G✗` 表示这一步在路线上但没有发出去，`L?` 表示这一步要不要走取决于没有拿到的模型回答。第一层压缩的每个工具画成一对方块（压调用、压结果），结果分段压缩时标出段数；第一层压缩和主循环之间画一条屏障，写明 compress 命令结束后才运行 extract；同一轮发言切出的段落连成一条链；抽取单元画成一条链，每个单元标出它的调用序列，并高亮当前调用。页面顶部的表按阶段统计真实的调用次数、重试、驳回和失败，以及 `needs_review` 的任务数；点表里的数字跳到下一个符合条件的帧。`needs_review` 的任务在依赖图和时间条上用单独的颜色标出，这个任务的每一帧顶部都写明原因。
 
 有 `calls.jsonl` 的运行直接按它找到每次调用。更早的运行没有这个文件，回放会在 `llm-home/` 里按模型、system prompt 和提示词里引用的对话原文把调用对应到任务上，并且只取这次运行最后一次写结果之前、中间没有超过 30 分钟停顿的那一段时间，因为同一个对话更早的运行也会留下一模一样的提示词。这段时间里同一个模型的调用如果对不上任何任务（发出它们的代码后来改过），页面会把这些记录列出来，不会猜着填进回放。另一个结果目录跑过同一个对话和同一个模型时，必须用 `--since` 和 `--until` 给出这次运行的时间范围。
 
@@ -94,7 +95,7 @@ echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.ll
 ```
 
 - `--backend` 可以是 `claude`、`codex`、`pi` 或 `hive`。`--model` 按对应命令行的写法给出，pi 的写法是 `provider/model-id`，hive 的写法是网关 `/v1/models` 列出的 `deployment/<部署名>`。
-- `hive` 不经过任何 agent 命令行，发给网关的请求里只有系统提示和用户 prompt。网关地址默认是 `http://127.0.0.1:8790`，可以用环境变量 `HIVE_FRAME_URL` 改。思考参数按网关为这个部署声明的模型协议设置：Qwen 模板的模型打开思考，`low` 给 2048 个思考 token 的预算，`medium`、`high`、`xhigh` 都给 9216 个，这样单槽 18,944 token 里还放得下 prompt 和答案。
+- `hive` 不经过任何 agent 命令行，发给网关的请求里只有系统提示和用户 prompt。网关地址默认是 `http://127.0.0.1:8790`，可以用环境变量 `HIVE_FRAME_URL` 改。思考参数按网关为这个部署声明的模型协议设置：Qwen 模板的模型打开思考，所有 effort 档位都用同一个思考预算 `llm.HIVE_THINKING_BUDGET`；单槽 `window.SLOT_TOKENS` 扣掉这个预算以后，剩下的由 prompt 和答案共用（`window.PROMPT_BUDGET`）。
 - `--effort` 可以是 `low`、`medium`、`high` 或 `xhigh`，默认是 `xhigh`。
 - `--stream` 和 `--no-stream` 决定 `hive` 用流式还是整块接收回复，默认是流式，对其他后端没有影响。`--no-stream` 的请求如果超过网关 1200 秒的读取超时，这个槽位就会一直被占着，直到部署重启。`extract` 也有这两个选项。
 - `--schema` 是可选的 JSON schema，给出时回复就是满足它的 JSON。pi 不支持这个参数。
@@ -116,7 +117,7 @@ PY=$PY scripts/llm-chat.sh --home /some/dir pi   # 对话记录写进 /some/dir
 
 ```bash
 $PY -m pytest -q                            # 离线测试
-INTENT_ALIGNER_LIVE=1 $PY -m pytest -q -k live   # 真实调用四个后端，会消耗 token；hive 需要网关上正在运行 deployment/pc-qwen38-np8
+INTENT_ALIGNER_LIVE=1 $PY -m pytest -q -k live   # 真实调用四个后端，会消耗 token；hive 需要网关上正在运行 deployment/pc-qwen38-np6
 ```
 
 没有构建语料时，语料相关的测试会跳过；没有设置 `INTENT_ALIGNER_LIVE=1` 时，真实调用的测试会跳过。CI 只运行离线测试。
