@@ -51,6 +51,7 @@ from intent_aligner.llm import (
     LLM_HOME,
     TRUNCATED_FEEDBACK,
     CallRecord,
+    qwen_tokens,
 )
 from intent_aligner.segment import Segment
 from intent_aligner.store import IntentNode, Stores
@@ -838,7 +839,7 @@ def _tokens(exchange: Exchange) -> TokenUse | None:
             prompt=int(usage["input_tokens"]), thinking=thinking, answer=output - thinking
         )
     if "completion_tokens" in usage:
-        answer = window.qwen_tokens(exchange.reply or "")
+        answer = qwen_tokens(exchange.reply or "")
         return TokenUse(
             prompt=int(usage["prompt_tokens"]),
             thinking=int(usage["completion_tokens"]) - answer,

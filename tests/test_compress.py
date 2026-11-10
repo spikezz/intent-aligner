@@ -5,12 +5,13 @@ from __future__ import annotations
 import doctest
 import json
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 
 from intent_aligner import compress
 from intent_aligner.compress import compress_conversation, summarize_trajectory
-from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, LLMError, TruncatedReply
+from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, LLMError, ThinkingCapped, TruncatedReply
 from intent_aligner.units import Item
 from intent_aligner.window import PROMPT_BUDGET, CallDigest, Digest, Digests, ResultDigest
 from tests.test_segment import _Script
@@ -190,3 +191,39 @@ def test_bad_json_is_retried_then_fails() -> None:
 
     with pytest.raises(LLMError, match="No valid digest for c1"):
         _run(TIMELINE[:3], Digests(), calls, _result_answer)
+
+
+def _capped(answer: str) -> ThinkingCapped:
+    return ThinkingCapped("capped", answer, Path("capped.jsonl"))
+
+
+def test_a_capped_call_is_asked_again_with_the_same_prompt() -> None:
+    calls = _Script(_capped(_call_answer("<调用>\nBash:")), _call_answer("<调用>\nBash:"))
+    made = _run([_call("c1")], Digests(), calls, _result_answer)
+
+    assert calls.prompts[0] == calls.prompts[1], calls.prompts
+    assert [(d.kind, d.review_reason) for d in made] == [("call", None)], made
+
+
+def test_a_call_capped_on_every_attempt_keeps_its_last_answer_for_review() -> None:
+    calls = _Script(*[_capped(_call_answer("<调用>\nBash:"))] * compress.MAX_ATTEMPTS)
+    made = _run([_call("c1")], Digests(), calls, _result_answer)
+
+    call = next(d for d in made if isinstance(d, CallDigest))
+    assert call.purpose == "看目录" and "cap" in (call.review_reason or ""), call
+
+
+def test_a_result_capped_on_every_attempt_is_marked_for_review() -> None:
+    results = _Script(*[_capped(_result_answer(""))] * compress.MAX_ATTEMPTS)
+    made = _run([_call("c1"), _result("c1")], Digests(), _call_answer, results)
+
+    result = next(d for d in made if isinstance(d, ResultDigest))
+    assert result.summaries == ["列出了文件"], result
+    assert "chunk 1/1" in (result.review_reason or ""), result
+
+
+def test_capped_answers_that_never_validate_fail_the_job() -> None:
+    calls = _Script(*[_capped("not json")] * compress.MAX_ATTEMPTS)
+
+    with pytest.raises(LLMError, match="No valid digest for c1"):
+        _run([_call("c1")], Digests(), calls, _result_answer)

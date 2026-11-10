@@ -10,13 +10,11 @@ from __future__ import annotations
 
 from argparse import ArgumentTypeError
 from collections.abc import Callable, Sequence
-from functools import cache
 from pathlib import Path
 from typing import Annotated, Literal
 
 import attrs
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
-from tokenizers import Tokenizer
 
 from intent_aligner.intent import Intent
 from intent_aligner.llm import HIVE_THINKING_BUDGET
@@ -35,11 +33,6 @@ from intent_aligner.units import (
 # of it; an answer left without room ends with finish_reason "length" (llm.TruncatedReply).
 SLOT_TOKENS = 27_136
 PROMPT_BUDGET = SLOT_TOKENS - HIVE_THINKING_BUDGET
-# Qwen3-0.6B shares the Qwen tokenizer family; on six corpus texts its counts were
-# within 7% of the qwen38 server's /tokenize. On the largest prompts of
-# claude-87eeb4bd-qwen it counted the user prompt alone as high as the server counted
-# system and user prompt together, so it errs on the side of fitting.
-TOKENIZER = "Qwen/Qwen3-0.6B"
 DEFAULT_WINDOW_ROUNDS = 2
 # Call G alone sees what follows its unit; these bound that text.
 FOLLOWING_ITEMS = 8
@@ -55,7 +48,9 @@ class CallDigest(BaseModel):
     """A tool call compressed to what it is for and the concrete things it acts on.
 
     `intents` are the call's intents for the main loop as well, so each carries its
-    evidence in the rendered call text.
+    evidence in the rendered call text. `review_reason` is set when every attempt hit the
+    thinking cap: the digest is the last capped answer and the main loop marks the call
+    needs_review.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -64,6 +59,7 @@ class CallDigest(BaseModel):
     tool_use_id: str
     intents: list[Intent] = Field(min_length=1)
     targets: str
+    review_reason: str | None = None
 
     @property
     def purpose(self) -> str:
@@ -72,13 +68,17 @@ class CallDigest(BaseModel):
 
 
 class ResultDigest(BaseModel):
-    """A tool result compressed to one sentence per chunk it was cut into."""
+    """A tool result compressed to one sentence per chunk it was cut into.
+
+    `review_reason` is set as on CallDigest, when some chunk hit the thinking cap on every attempt.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     kind: Literal["result"] = "result"
     tool_use_id: str
     summaries: list[str]
+    review_reason: str | None = None
 
 
 Digest = Annotated[CallDigest | ResultDigest, Field(discriminator="kind")]
@@ -118,16 +118,6 @@ def load_digests(path: Path) -> Digests:
 
 class WindowError(ValueError):
     """Even the one-round window does not fit; the unit needs review."""
-
-
-@cache
-def _tokenizer() -> Tokenizer:
-    return Tokenizer.from_pretrained(TOKENIZER)
-
-
-def qwen_tokens(text: str) -> int:
-    """Token count of `text` under the Qwen tokenizer (downloaded once into the HF cache)."""
-    return len(_tokenizer().encode(text).ids)
 
 
 class ToolCompression(BaseModel):

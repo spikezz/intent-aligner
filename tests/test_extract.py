@@ -1281,3 +1281,25 @@ def test_a_message_without_intents_is_logged_as_a_placeholder() -> None:
 
     assert got[0].placeholder, got
     assert any("placeholder" in line for line in log_lines(got[0])), got
+
+
+def test_a_call_whose_compression_needs_review_is_marked_without_call_l() -> None:
+    capped = FULL.calls["c1"].model_copy(update={"review_reason": "capped"})
+    digests = Digests(calls={**FULL.calls, "c1": capped}, results=FULL.results)
+
+    got = _assignments(TIMELINE, SEGMENTS, digests, _new_then_first([]), tool_intent=_not_asked)
+    call = next(a for a in got if a.unit.uuid == "c1")
+
+    assert (call.needs_review, call.intents) == (True, []), call
+    assert call.review_reason == "level-1 compression: capped", call
+
+
+def test_a_result_whose_compression_needs_review_leaves_a_needs_review_node() -> None:
+    capped = FULL.results["c1"].model_copy(update={"review_reason": "capped"})
+    digests = Digests(calls=FULL.calls, results={**FULL.results, "c1": capped})
+
+    got = _assignments(TIMELINE, SEGMENTS, digests, _new_then_first([]))
+    result = next(a for a in got if a.unit.uuid == "r-c1")
+
+    assert result.needs_review and [o.needs_review for o in result.observations] == [True], result
+    assert result.review_reason == "level-1 compression: capped", result

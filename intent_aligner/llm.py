@@ -33,11 +33,13 @@ import uuid
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
 from typing import Any, Literal, cast
 
 import attrs
 from pydantic import BaseModel, ConfigDict, Field
+from tokenizers import Tokenizer
 
 from intent_aligner.corpus import TOOL_ROOT
 
@@ -54,10 +56,31 @@ HIVE_FRAME_URL = os.environ.get("HIVE_FRAME_URL", "http://127.0.0.1:8790").rstri
 # comparable; window.PROMPT_BUDGET is the np6 slot minus this cap.
 HIVE_THINKING_BUDGET = 10_240
 HIVE_SCHEMA_INTRO = "回答是符合下面这个 JSON schema 的 JSON："
+# A capped reply's thinking, counted as completion minus the answer under TOKENIZER, came
+# to 10,231-10,278 on 64 capped Qwen3.8 calls (2026-11-10) and to at most 10,124 on the
+# others, so this margin absorbs the local count of the answer.
+HIVE_CAPPED_MARGIN = 64
 # The gateway answered 409 to a burst right after a stopped run and accepted the same
 # requests about 40 s later (2026-11-06), so a 409 is waited out before it counts as failure.
 _HIVE_CAPACITY_WAIT = 1800
 _HIVE_CAPACITY_POLL = 10
+
+
+# Qwen3-0.6B shares the Qwen tokenizer family; on six corpus texts its counts were
+# within 7% of the qwen38 server's /tokenize. On the largest prompts of
+# claude-87eeb4bd-qwen it counted the user prompt alone as high as the server counted
+# system and user prompt together, so it errs on the side of fitting.
+TOKENIZER = "Qwen/Qwen3-0.6B"
+
+
+@cache
+def _tokenizer() -> Tokenizer:
+    return Tokenizer.from_pretrained(TOKENIZER)
+
+
+def qwen_tokens(text: str) -> int:
+    """Token count of `text` under the Qwen tokenizer (downloaded once into the HF cache)."""
+    return len(_tokenizer().encode(text).ids)
 
 
 class LLMCall(BaseModel):
@@ -90,7 +113,8 @@ class LLMCall(BaseModel):
 class LLMReply(BaseModel):
     """The final assistant text and the transcript file the call left in LLM_HOME.
 
-    With a json_schema, `text` is the JSON document that satisfies it.
+    With a json_schema, `text` is the JSON document that satisfies it. `thinking_capped` is
+    whether the thinking reached HIVE_THINKING_BUDGET, which only a hive reply can tell.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -98,6 +122,7 @@ class LLMReply(BaseModel):
     text: str
     session_id: str
     transcript: Path
+    thinking_capped: bool = False
 
 
 @attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
@@ -122,6 +147,14 @@ class LLMError(RuntimeError):
 
 class TruncatedReply(LLMError):
     """The model ran out of room before finishing; callers count it as one failed attempt."""
+
+
+class ThinkingCapped(LLMError):
+    """The thinking reached HIVE_THINKING_BUDGET; `text` is the answer written after the cut."""
+
+    def __init__(self, message: str, text: str, transcript: Path) -> None:
+        super().__init__(message, transcript)
+        self.text = text
 
 
 TRUNCATED_FEEDBACK = (
@@ -209,10 +242,13 @@ def asker(
     stream: bool,
     log: CallLog,
     name: str,
+    *,
+    refuse_capped: bool = False,
 ) -> Ask:
     """An Ask: one isolated call per prompt under a fixed system prompt and reply schema.
 
-    Every call, failed or not, is logged under `name` and the caller's CALL_SUBJECT.
+    Every call, failed or not, is logged under `name` and the caller's CALL_SUBJECT. With
+    `refuse_capped`, a reply whose thinking reached the cap raises ThinkingCapped.
     """
 
     def ask(prompt: str) -> str:
@@ -229,6 +265,13 @@ def asker(
         started = datetime.now(UTC)
         try:
             reply = complete(call)
+            if refuse_capped and reply.thinking_capped:
+                raise ThinkingCapped(
+                    f"The thinking reached the {HIVE_THINKING_BUDGET:,}-token cap; "
+                    f"see {reply.transcript}.",
+                    reply.text,
+                    reply.transcript,
+                )
         except LLMError as error:
             transcript = None if error.transcript is None else str(error.transcript)
             log.write(
@@ -479,8 +522,13 @@ def _hive_complete(call: LLMCall, home: Path) -> LLMReply:
             f"incomplete; see {transcript}.",
             transcript,
         )
+    text = str(choice["message"]["content"])
+    thinking = response.get("usage", {}).get("completion_tokens", 0) - qwen_tokens(text)
     return LLMReply(
-        text=str(choice["message"]["content"]), session_id=call_id, transcript=transcript
+        text=text,
+        session_id=call_id,
+        transcript=transcript,
+        thinking_capped=thinking >= HIVE_THINKING_BUDGET - HIVE_CAPPED_MARGIN,
     )
 
 

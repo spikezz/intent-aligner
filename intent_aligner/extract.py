@@ -69,6 +69,7 @@ from intent_aligner.llm import (
     CallLog,
     TruncatedReply,
     asker,
+    qwen_tokens,
 )
 from intent_aligner.segment import (
     SCHEMA as SEGMENT_SCHEMA,
@@ -117,7 +118,6 @@ from intent_aligner.window import (
     covering,
     is_tool_record,
     load_digests,
-    qwen_tokens,
     render_following,
     round_entry,
     window_rounds,
@@ -1031,7 +1031,10 @@ def _with_intents(
     if isinstance(unit, SpeechSegment):
         intents = unit.segment.intents
     elif isinstance(unit, ToolCall):
-        filed = context.digests.calls[unit.tool_use_id].intents
+        digest = context.digests.calls[unit.tool_use_id]
+        if digest.review_reason is not None:
+            return _review(record, f"level-1 compression: {digest.review_reason}")
+        filed = digest.intents
         return _file_under_aggregates(
             step, record, topic, filed, context, window, asks.aggregate, asks.tool_intent, stores
         )
@@ -1489,6 +1492,10 @@ def _observe(
         )
         return _review(record, reason).model_copy(update={"observations": [built]})
 
+    if unit.tool_use_id is not None:
+        review = context.digests.results[unit.tool_use_id].review_reason
+        if review is not None:
+            return failed(f"level-1 compression: {review}")
     topic = record.topic
     if topic is None:
         return failed(record.review_reason or "The tool call that produced this has no topic.")

@@ -1,7 +1,9 @@
 """Compress each tool call and its result, before the main loop runs (level 1).
 
 The call becomes its intents and what it acts on, the result one sentence per chunk,
-read against the call's intents and full text. The call's intents, each with evidence
+read against the call's intents and full text. A reply whose thinking reached the cap is
+asked again; when all MAX_ATTEMPTS hit it, the last capped answer is kept and the digest
+is marked for review. The call's intents, each with evidence
 in the call text, are also the intents the main loop records for the call, so it does
 not ask for them again. A call and its result are one job; jobs read nothing of the
 conversation around them and run in parallel.
@@ -21,6 +23,7 @@ import argparse
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from functools import partial
 from pathlib import Path
 
@@ -30,12 +33,15 @@ from intent_aligner.intent import INTENT_SCHEMA, Intent, stray_evidence
 from intent_aligner.llm import (
     CALL_SUBJECT,
     CALLS_FILE,
+    HIVE_THINKING_BUDGET,
     TRUNCATED_FEEDBACK,
     Ask,
     CallLog,
     LLMError,
+    ThinkingCapped,
     TruncatedReply,
     asker,
+    qwen_tokens,
 )
 from intent_aligner.units import (
     SPEAKER_NAMES,
@@ -56,7 +62,6 @@ from intent_aligner.window import (
     ResultDigest,
     WindowError,
     load_digests,
-    qwen_tokens,
 )
 
 MAX_ATTEMPTS = 3
@@ -219,8 +224,13 @@ def _compress_call(item: ToolCall, ask: Ask, count: Count) -> CallDigest:
             f"Tool call {item.tool_use_id} needs {count(prompt):,} tokens but the prompt budget "
             f"leaves {room:,}; the largest call in the corpus was 6,116, so check its input."
         )
-    answer = _ask_until_valid(ask, prompt, _CallAnswer, item.tool_use_id, context=item.text)
-    return CallDigest(tool_use_id=item.tool_use_id, intents=answer.intents, targets=answer.targets)
+    answer, review = _ask_until_valid(ask, prompt, _CallAnswer, item.tool_use_id, item.text)
+    return CallDigest(
+        tool_use_id=item.tool_use_id,
+        intents=answer.intents,
+        targets=answer.targets,
+        review_reason=review,
+    )
 
 
 def _compress_result(
@@ -235,11 +245,19 @@ def _compress_result(
         )
     parts = chunks(item.text, room, count)
     summaries = []
+    reviews = []
     for number, part in enumerate(parts, 1):
         label = f"（第 {number}/{len(parts)} 段）" if len(parts) > 1 else ""
         prompt = f"{head}<结果>{label}\n{part}\n</结果>"
-        summaries.append(_ask_until_valid(ask, prompt, _SummaryAnswer, call.tool_use_id).summary)
-    return ResultDigest(tool_use_id=call.tool_use_id, summaries=summaries)
+        answer, review = _ask_until_valid(ask, prompt, _SummaryAnswer, call.tool_use_id)
+        summaries.append(answer.summary)
+        if review is not None:
+            reviews.append(f"chunk {number}/{len(parts)}: {review}")
+    return ResultDigest(
+        tool_use_id=call.tool_use_id,
+        summaries=summaries,
+        review_reason="; ".join(reviews) or None,
+    )
 
 
 def summarize_trajectory(
@@ -264,7 +282,7 @@ def summarize_trajectory(
         for number, part in enumerate(parts, 1):
             label = f"（第 {number}/{len(parts)} 段）" if len(parts) > 1 else ""
             prompt = f"{head}<轨迹>{label}\n{part}\n</轨迹>"
-            summaries.append(_ask_until_valid(ask, prompt, _SummaryAnswer, where).summary)
+            summaries.append(_ask_until_valid(ask, prompt, _SummaryAnswer, where)[0].summary)
         if len(summaries) == 1:
             return summaries[0]
         lines = [" ".join(summary.split()) for summary in summaries]
@@ -321,15 +339,29 @@ def _longest_prefix(line: str, room: int, count: Count) -> int:
 
 def _ask_until_valid[Answer: BaseModel](
     ask: Ask, prompt: str, schema: type[Answer], tool_use_id: str, context: str | None = None
-) -> Answer:
+) -> tuple[Answer, str | None]:
+    """The first valid answer, and a review reason when only capped answers were valid.
+
+    A capped reply is asked again with the same prompt and no feedback: the model cannot see
+    its earlier thinking, so a fresh sample is the retry.
+    """
     feedback = ""
+    capped: Answer | None = None
     for _ in range(MAX_ATTEMPTS):
         try:
-            return schema.model_validate_json(ask(prompt + feedback), context=context)
+            return schema.model_validate_json(ask(prompt + feedback), context=context), None
+        except ThinkingCapped as error:
+            with suppress(ValidationError):
+                capped = schema.model_validate_json(error.text, context=context)
         except TruncatedReply:
             feedback = f"\n\n{TRUNCATED_FEEDBACK}"
         except ValidationError as error:
             feedback = f"\n\n你上一次的回答不符合要求，请重新回答：{error}"
+    if capped is not None:
+        return capped, (
+            f"the thinking reached the {HIVE_THINKING_BUDGET:,}-token cap in {MAX_ATTEMPTS} "
+            "attempts; the last capped answer is kept"
+        )
     raise LLMError(f"No valid digest for {tool_use_id} in {MAX_ATTEMPTS} attempts: {feedback}")
 
 
@@ -368,12 +400,22 @@ def main() -> None:
     done = load_digests(args.out) if args.out.exists() else Digests()
     llm_args = (args.backend, args.model, args.effort)
     log = CallLog(path=args.out.parent / CALLS_FILE)
-    ask_call = asker(*llm_args, CALL_SYSTEM_PROMPT, CALL_SCHEMA, args.stream, log, "call")
-    ask_result = asker(*llm_args, RESULT_SYSTEM_PROMPT, SUMMARY_SCHEMA, args.stream, log, "result")
+    ask_call = asker(
+        *llm_args, CALL_SYSTEM_PROMPT, CALL_SCHEMA, args.stream, log, "call", refuse_capped=True
+    )
+    ask_result = asker(
+        *llm_args,
+        RESULT_SYSTEM_PROMPT,
+        SUMMARY_SCHEMA,
+        args.stream,
+        log,
+        "result",
+        refuse_capped=True,
+    )
     digests = compress_conversation(items, done, ask_call, ask_result, qwen_tokens, args.workers)
     with args.out.open("a", encoding="utf-8") as out:
         for digest in digests:
-            line = DIGEST_ADAPTER.dump_json(digest).decode()
+            line = DIGEST_ADAPTER.dump_json(digest, exclude_none=True).decode()
             out.write(line + "\n")
             out.flush()
             print(line, flush=True)

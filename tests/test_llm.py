@@ -21,12 +21,20 @@ from pydantic import ValidationError
 
 from intent_aligner import llm
 from intent_aligner.llm import (
+    CALL_SUBJECT,
+    HIVE_CAPPED_MARGIN,
+    HIVE_THINKING_BUDGET,
+    CallLog,
     LLMCall,
     LLMError,
+    LLMReply,
+    ThinkingCapped,
+    asker,
     build_invocation,
     complete,
     hive_client,
     hive_request_body,
+    qwen_tokens,
 )
 
 SCHEMA = {
@@ -444,3 +452,40 @@ def test_asker_logs_every_call_with_its_subject(
         ("topic", "unit:3", str(tmp_path / "s1.jsonl"), None),
         ("topic", "unit:3", str(tmp_path / "s2.jsonl"), "truncated"),
     ], got
+
+
+@pytest.mark.parametrize(
+    ("thinking", "capped"),
+    [(HIVE_THINKING_BUDGET - HIVE_CAPPED_MARGIN, True), (HIVE_THINKING_BUDGET - 100, False)],
+)
+def test_hive_reply_tells_whether_the_thinking_reached_the_cap(
+    tmp_path: Path, gateway: _Gateway, thinking: int, capped: bool
+) -> None:
+    answer = '{"answer": 4}'
+    usage = {"completion_tokens": thinking + qwen_tokens(answer)}
+    gateway.reply = (
+        200,
+        {"choices": [{"finish_reason": "stop", "message": {"content": answer}}], "usage": usage},
+    )
+    call = _hive_call(schema=True).model_copy(update={"stream": False})
+
+    assert complete(call, tmp_path).thinking_capped is capped
+
+
+def test_an_asker_that_refuses_capped_replies_logs_and_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reply = LLMReply(text="{}", session_id="s", transcript=tmp_path / "t", thinking_capped=True)
+    monkeypatch.setattr(llm, "complete", lambda call: reply)
+    log = CallLog(path=tmp_path / "calls.jsonl")
+    CALL_SUBJECT.set("tool:t1")
+
+    plain = asker("hive", "m", "xhigh", "s", SCHEMA, True, log, "call")
+    refusing = asker("hive", "m", "xhigh", "s", SCHEMA, True, log, "call", refuse_capped=True)
+
+    assert plain("p") == "{}"
+    with pytest.raises(ThinkingCapped) as raised:
+        refusing("p")
+    assert raised.value.text == "{}", raised.value.text
+    errors = [json.loads(line)["error"] for line in log.path.read_text().splitlines()]
+    assert errors[0] is None and "cap" in errors[1], errors
