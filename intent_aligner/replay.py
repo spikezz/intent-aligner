@@ -46,7 +46,12 @@ from intent_aligner.extract import (
     render_unit,
     walk_so_far,
 )
-from intent_aligner.llm import CALLS_FILE, LLM_HOME, TRUNCATED_FEEDBACK, CallRecord
+from intent_aligner.llm import (
+    CALLS_FILE,
+    LLM_HOME,
+    TRUNCATED_FEEDBACK,
+    CallRecord,
+)
 from intent_aligner.segment import Segment
 from intent_aligner.store import IntentNode, Stores
 from intent_aligner.units import (
@@ -79,6 +84,7 @@ STEPS: dict[str, tuple[str, str]] = {
     extract.G_SYSTEM_PROMPT: ("LOOP", "aggregate"),
     extract.L_SYSTEM_PROMPT: ("LOOP", "tool_intent"),
     extract.C_SYSTEM_PROMPT: ("LOOP", "relation"),
+    extract.C_STEP_SYSTEM_PROMPT: ("LOOP", "step_relation"),
     extract.D_SYSTEM_PROMPT: ("LOOP", "outcome"),
     extract.D_SUMMARY_SYSTEM_PROMPT: ("LOOP", "outcome_summary"),
     extract.D_UPDATE_SYSTEM_PROMPT: ("LOOP", "outcome_update"),
@@ -91,6 +97,7 @@ LETTERS = {
     "aggregate": "G",
     "tool_intent": "L",
     "relation": "C",
+    "step_relation": "C",
     "outcome": "D",
     "outcome_summary": "D",
     "outcome_update": "D",
@@ -682,7 +689,9 @@ class Attempt(BaseModel):
     `window_seen` are the opening uuids of the earlier rounds the prompt's window really
     holds, oldest first, or None for a prompt without a window; `window_limit` is how
     many it could have held, the run's window size or the rounds that exist if fewer.
-    `origin` is the other run directory that made the call (see Call).
+    `origin` is the other run directory that made the call (see Call). `tokens` is
+    None when the reply carries no usage; `thinking_budget` is the cap its request set,
+    None for a backend without one.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -707,6 +716,8 @@ class Attempt(BaseModel):
     usage: dict[str, Any]
     finish: str
     origin: str | None
+    tokens: TokenUse | None
+    thinking_budget: int | None
 
 
 def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
@@ -766,6 +777,8 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
                     usage=exchange.usage,
                     finish=exchange.finish,
                     origin=call.origin,
+                    tokens=_tokens(exchange),
+                    thinking_budget=_thinking_budget(exchange.request),
                 )
             )
     return sorted(judged, key=lambda a: (a.started or a.ended, a.ended))
@@ -812,6 +825,15 @@ def _tokens(exchange: Exchange) -> TokenUse | None:
             answer=answer,
         )
     return None
+
+
+def _thinking_budget(request: dict[str, Any]) -> int | None:
+    """The budget the request body carried, so a run keeps the budget it was sent with.
+
+    `reasoning_budget_tokens` is the field hive-frame's config names for every Qwen client.
+    """
+    body = request.get("body")
+    return body.get("reasoning_budget_tokens") if isinstance(body, dict) else None
 
 
 HEADER = re.compile(r"<header>\n(.*?)\n</header>", re.S)
@@ -961,6 +983,7 @@ RULE_SOURCES: dict[str, tuple[str, ...]] = {
     "aggregate": ("extract._file_under_aggregates.parse", "extract._ask_until_valid"),
     "tool_intent": ("extract._match_tool_intents.parse", "extract._ask_until_valid"),
     "relation": ("extract._relate.parse", "extract._ask_until_valid"),
+    "step_relation": ("extract._relate.parse", "extract._ask_until_valid"),
     "outcome": ("extract._parse_outcomes", "extract._ask_until_valid"),
     "outcome_summary": ("extract._parse_outcomes", "extract._ask_until_valid"),
     "outcome_update": ("extract._parse_outcomes", "extract._ask_until_valid"),
@@ -1079,8 +1102,8 @@ def _shown(source: str, expression: ast.expr) -> str | None:
 def window_rules(window_rounds: int) -> list[str]:
     """The constants and docstrings that decide what a prompt's windows hold."""
     constants = [
-        f"window.PROMPT_BUDGET = {window.PROMPT_BUDGET:,} token（调用 T 和切分"
-        "的 header 里全部 topic 的图谱 graphs 不计入；其他调用 header 里当前 topic 的图谱 graph 计入）",
+        f"window.PROMPT_BUDGET = {window.PROMPT_BUDGET:,} token（单槽 {window.SLOT_TOKENS:,} 扣掉思考预算"
+        "后，提示词和回答共用剩下的部分；header 里的图谱全部计入）",
         f"--window-rounds = {window_rounds}（这次运行的值。放不下时先压缩最旧的工具记录，"
         "全部压缩过仍然放不下才逐轮减少，1 轮也放不下时这个单元标记 needs_review）",
         f"window.COMPRESSION_BATCH = {window.COMPRESSION_BATCH:,}（一次压缩至少累积这么多 token 的工具记录）",

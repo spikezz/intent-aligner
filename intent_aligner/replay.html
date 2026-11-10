@@ -11,12 +11,14 @@
   --ok: #2f9e6a; --bad: #d1453b; --review: #b5179e; --warn: #d08a1e; --pending: #c9c9c3; --active: #111111;
   --feedback: #cfe2ff; --var: #fbe3c0; --var-ink: #8a5300; --code: #f1f1ee; --signal: #0b6e8a;
   --I: #4656b8; --A: #0f7d6b; --G: #a86a00; --O: #b3322a;
+  --tk-prompt: #b9b8b2; --tk-think: #7a5cc7; --tk-answer: #c03f8f;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #a09f98; --line: #3a3a36;
     --pending: #4a4a45; --active: #ffffff; --feedback: #1d3f70; --var: #4a3512; --var-ink: #f0c070;
     --code: #262624; --signal: #4dbcd8; --I: #99a6f2; --A: #5fd0b5; --G: #e6ac4b; --O: #ef7f75;
+    --tk-prompt: #5f5e59; --tk-think: #a58bea; --tk-answer: #e07bb8;
   }
 }
 :root[data-theme="dark"] {
@@ -44,6 +46,9 @@ header h1 { font-size: 17px; margin: 0 0 4px; }
 .rail .stop.on { background: var(--signal); border-color: var(--signal); color: var(--panel); }
 .rail .stop.unsent { border-color: var(--bad); color: var(--bad); }
 .rail .arrow { color: var(--muted); }
+.rail .stop { cursor: pointer; }
+.rail .stop.none { cursor: default; opacity: .45; }
+a.jump, a.nid, .summary td.pick { color: var(--signal); cursor: pointer; text-decoration: underline; }
 #strip { display: block; width: 100%; height: 34px; background: var(--panel); border-bottom: 1px solid var(--line); cursor: pointer; }
 .wrap { padding: 10px 16px; display: grid; gap: 10px; }
 .box { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; min-width: 0; }
@@ -106,6 +111,18 @@ details.more summary { cursor: pointer; color: var(--muted); }
 #bench { height: 75vh; min-height: 200px; margin-top: 6px; border: 1px solid var(--line); border-radius: 4px; resize: vertical; overflow: hidden; }
 #gnote { font-size: 12px; color: var(--muted); margin-top: 6px; overflow-wrap: anywhere; }
 .skip { color: var(--warn); }
+#tokens svg { display: block; width: 100%; height: auto; margin-top: 6px; }
+#tokens svg text { fill: var(--muted); font-size: 11px; }
+#tokens .mark { cursor: pointer; }
+#tokens .tabs { display: flex; gap: 4px; margin: 8px 0 4px; }
+#tokens .tabs button { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 4px; padding: 3px 12px; cursor: pointer; font: inherit; font-size: 13px; }
+#tokens .tabs button.on { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+#tokens .mark.on { stroke: var(--active); stroke-width: 2; }
+#tokens select { font: inherit; font-size: 12px; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 4px; }
+#tokens table { border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+#tokens td, #tokens th { border: 1px solid var(--line); padding: 2px 8px; text-align: right; }
+#toktip { position: fixed; pointer-events: none; display: none; z-index: 5; max-width: 340px; padding: 6px 8px; font-size: 12px;
+  background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 2px 8px rgb(0 0 0 / .15); }
 @media (prefers-reduced-motion: reduce) { .pkt { display: none; } .wire.busy .end { animation: none; } * { transition: none !important; } }
 </style>
 </head>
@@ -160,7 +177,20 @@ details.more summary { cursor: pointer; color: var(--muted); }
     <div class="col" id="c2"><h2>模型的回答</h2><div id="reply"></div></div>
     <div class="col" id="c3"><h2>代码校验与写入</h2><div id="checks"></div></div>
   </section>
+  <details class="box" id="tokens" open>
+    <summary>token 统计：每次调用用了多少 token，和 header 里图谱的大小</summary>
+    <div class="tabs" id="tokTabs" role="tablist"><button role="tab" data-tab="thinking">思考 token</button><button role="tab" data-tab="context">完整上下文 token</button></div>
+    <p class="note" id="tokNote"></p>
+    <div class="legend"><label>调用：<select id="tokAsk"></select></label> <span id="tokCount"></span>
+      <span class="sw" style="background:var(--l1)"></span>第一层压缩<span class="sw" style="background:var(--seg)"></span>切分<span class="sw" style="background:var(--loop)"></span>逐单元抽取
+      · 点一个点或一根柱子跳到那次调用，黑框是当前帧的调用</div>
+    <svg id="tokScatter" viewBox="0 0 1060 400" role="img" aria-label="token 和图谱大小的散点图"></svg>
+    <p class="note legend" id="tokBarsNote"></p>
+    <svg id="tokBars" viewBox="0 0 1060 360" role="img" aria-label="所有调用的 token 从小到大排列"></svg>
+    <table id="tokTable"></table>
+  </details>
 </div>
+<div id="toktip"></div>
 <script>/*GRAPH_LIBRARIES*/</script>
 <script>
 const PAGE = /*PAGE_DATA*/null;
@@ -169,9 +199,9 @@ const STAGES = ["L1", "SEG", "LOOP"];
 const STAGE_NAMES = {L1: "第一层压缩（工具调用和结果）", SEG: "切分发言", LOOP: "逐单元抽取"};
 const STAGE_COLORS = {L1: "var(--l1)", SEG: "var(--seg)", LOOP: "var(--loop)"};
 const ASK_NAMES = {call: "压缩工具调用", result: "压缩工具结果", round: "概括最旧的工具记录", segment: "切分", topic: "T 归入 topic",
-  signal: "A 信号意图", registry: "B 登记意图", aggregate: "G 归入聚合", tool_intent: "L 底层意图", relation: "C 连边",
+  signal: "A 信号意图", registry: "B 登记意图", aggregate: "G 归入聚合", tool_intent: "L 底层意图", relation: "C 连边", step_relation: "C 连边（聚合的又一步）",
   outcome: "D 观察结果", outcome_summary: "D 观察结果（摘要）", outcome_update: "D 更新聚合的观测"};
-const LETTER = {topic: "T", signal: "A", registry: "B", aggregate: "G", tool_intent: "L", relation: "C", outcome: "D", outcome_summary: "D", outcome_update: "D", round: "压"};
+const LETTER = {topic: "T", signal: "A", registry: "B", aggregate: "G", tool_intent: "L", relation: "C", step_relation: "C", outcome: "D", outcome_summary: "D", outcome_update: "D", round: "压"};
 const STOPS = [["L1", "第一层压缩"], ["SEG", "切分"], ["T", "T 归 topic"], ["A", "A 信号意图"], ["B", "B 登记意图"],
   ["G", "G 归聚合"], ["L", "L 底层意图"], ["C", "C 连边"], ["D", "D 观察结果"]];
 const VERDICT_NAMES = {accepted: "已接受", rejected: "被驳回", failed: "失败"};
@@ -198,7 +228,9 @@ function headerOf(prompt) {
 
 /* ---------- frames: every call, plus one frame for each extract unit that called nothing ---------- */
 const called = new Set(calls.map(c => c.subject));
-const silentUnits = unitJobs.filter(j => !called.has(j.id));
+/* A unit without an assignment has not run yet, so it is waiting, not silent. */
+const silentJobs = jobs.filter(j => !called.has(j.id) && (j.stage !== "LOOP" || j.record.assignment !== null));
+const silentUnits = silentJobs.filter(j => j.stage === "LOOP");
 const frames = [];
 {
   let next = 0;
@@ -206,6 +238,23 @@ const frames = [];
   calls.forEach((c, i) => { if (c.stage === "LOOP") flushBefore(unitOf(c.subject)); frames.push({call: c, i}); });
   flushBefore(Infinity);
 }
+/* ---------- jumping from what a frame shows to the frames behind it ---------- */
+const frameOfCall = [], firstFrameOf = {}, lastFrameOf = {};
+frames.forEach((f, k) => {
+  if (f.call) frameOfCall[f.i] = k;
+  const id = f.call?.subject ?? f.skip.id;
+  firstFrameOf[id] ??= k; lastFrameOf[id] = k;
+});
+const jobOfFrame = f => f.call ? jobById[f.call.subject] : f.skip;
+const letterOf = f => f.call ? (f.call.stage === "LOOP" ? LETTER[f.call.ask] : f.call.stage) : null;
+/* The next frame after the current one that passes `test`, wrapping around, so repeated clicks step through all of them. */
+function nextFrame(test) {
+  for (let step = 1; step <= frames.length; step++) { const k = (current + step) % frames.length; if (test(frames[k], k)) return k; }
+  return -1;
+}
+const frameLink = (k, text) => `<a class="jump" data-frame="${k}">${esc(text)}</a>`;
+document.addEventListener("click", e => { const a = e.target.closest("a[data-frame]"); if (a) go(+a.dataset.frame); });
+
 function frameTime(k) {
   for (let n = k; n >= 0; n--) { const c = frames[n].call; if (c) return new Date(c.started ?? c.ended).getTime(); }
   return new Date(calls[0]?.ended ?? 0).getTime();
@@ -220,6 +269,12 @@ document.getElementById("meta").innerHTML =
     .map(([dir, n]) => `<br>其中 ${n} 次调用由运行目录 ${esc(dir)} 发出，这次运行沿用了它写出的结果`).join("");
 
 (function summary() {
+  const picks = [];
+  const cell = (n, test, span) => {
+    const usable = n > 0 && frames.some(test);
+    if (usable) picks.push(test);
+    return `<td${span ? ` colspan="${span}"` : ""}${usable ? ` class="pick" data-pick="${picks.length - 1}" title="点击跳到下一个"` : ""}>${n}${span ? " 个" : ""}</td>`;
+  };
   const rows = {};
   for (const c of calls) {
     const r = rows[c.stage + "|" + c.ask] ??= {stage: c.stage, ask: c.ask, n: 0, retry: 0, rejected: 0, failed: 0};
@@ -227,18 +282,22 @@ document.getElementById("meta").innerHTML =
   }
   const silent = {}, review = {};
   for (const j of jobs) if (reviewOf(j)) review[j.stage] = (review[j.stage] ?? 0) + 1;
-  for (const j of jobs) if (!called.has(j.id)) silent[j.stage] = (silent[j.stage] ?? 0) + 1;
+  for (const j of silentJobs) silent[j.stage] = (silent[j.stage] ?? 0) + 1;
   let html = "<tr><th>阶段</th><th>调用</th><th>次数</th><th>其中重试</th><th>被驳回</th><th>失败</th></tr>", total = 0;
   for (const s of STAGES) {
     for (const r of Object.values(rows).filter(r => r.stage === s)) {
       total += r.n;
-      html += `<tr><td>${STAGE_NAMES[s]}</td><td>${ASK_NAMES[r.ask]}</td><td>${r.n}</td><td>${r.retry}</td><td>${r.rejected}</td><td>${r.failed}</td></tr>`;
+      const of = f => f.call?.stage === s && f.call.ask === r.ask;
+      html += `<tr><td>${STAGE_NAMES[s]}</td><td>${ASK_NAMES[r.ask]}</td>${cell(r.n, of)}${cell(r.retry, f => of(f) && f.call.attempt > 1)}` +
+        `${cell(r.rejected, f => of(f) && f.call.verdict === "rejected")}${cell(r.failed, f => of(f) && f.call.verdict === "failed")}</tr>`;
     }
-    if (silent[s]) html += `<tr><td>${STAGE_NAMES[s]}</td><td>没有调用模型的任务</td><td colspan="4">${silent[s]} 个</td></tr>`;
-    if (review[s]) html += `<tr style="color:var(--review);font-weight:600"><td>${STAGE_NAMES[s]}</td><td>needs_review 的任务</td><td colspan="4">${review[s]} 个，共 ${jobs.filter(j => j.stage === s).length} 个任务</td></tr>`;
+    if (silent[s]) html += `<tr><td>${STAGE_NAMES[s]}</td><td>没有调用模型的任务</td>${cell(silent[s], f => f.skip?.stage === s, 4)}</tr>`;
+    if (review[s]) html += `<tr style="color:var(--review);font-weight:600"><td>${STAGE_NAMES[s]}</td><td>needs_review 的任务</td>` +
+      `${cell(review[s], (f, k) => { const j = jobOfFrame(f); return j?.stage === s && !!reviewOf(j) && firstFrameOf[j.id] === k; }, 4).replace("</td>", `，共 ${jobs.filter(j => j.stage === s).length} 个任务</td>`)}</tr>`;
   }
   html += `<tr><th>合计</th><th></th><th>${total}</th><th colspan="3"></th></tr>`;
   document.getElementById("summary").innerHTML = html;
+  document.getElementById("summary").onclick = e => { const td = e.target.closest("td.pick"); if (!td) return; const k = nextFrame(picks[+td.dataset.pick]); if (k >= 0) go(k); };
 })();
 
 if (PAGE.unplaced.length) {
@@ -246,7 +305,10 @@ if (PAGE.unplaced.length) {
     `<div class="unplaced"><b>${PAGE.unplaced.length} 份同模型的记录落在这次运行的时间范围里，但对不上任何任务</b>（发出它们的代码后来改过，或者它们属于另一次运行）。这些记录没有被猜着填进回放：<ul>` +
     PAGE.unplaced.map(p => `<li>${esc(p)}</li>`).join("") + "</ul></div>";
 }
-document.getElementById("rail").innerHTML = STOPS.map(([k, v], n) => (n ? '<span class="arrow">→</span>' : "") + `<span class="stop" data-k="${k}">${v}</span>`).join("");
+document.getElementById("rail").innerHTML = STOPS.map(([k, v], n) => (n ? '<span class="arrow">→</span>' : "") + `<span class="stop" data-k="${k}" title="点击跳到下一个">${v}</span>`).join("");
+for (const stop of document.querySelectorAll(".rail .stop"))
+  if (!frames.some(f => letterOf(f) === stop.dataset.k)) { stop.classList.add("none"); stop.title = "这次运行没有这一步的调用"; }
+document.getElementById("rail").onclick = e => { const key = e.target.dataset?.k; if (!key) return; const k = nextFrame(f => letterOf(f) === key); if (k >= 0) go(k); };
 document.getElementById("endpoint").textContent = `${PAGE.backend}\n${PAGE.model}`;
 
 /* ---------- controls ---------- */
@@ -482,6 +544,7 @@ function draw() {
   const f = frames[current], c = f.call, job = c ? jobById[c.subject] : f.skip;
   slider.value = current;
   $("counter").textContent = `第 ${current + 1} / ${frames.length} 帧`;
+  markTokens();
   history.replaceState(null, "", `#frame=${current + 1}`);
   const cur = $("cursor");
   if (cur) { const x = stripX(times[current], strip.clientWidth || 800); cur.setAttribute("x1", x); cur.setAttribute("x2", x); }
@@ -495,8 +558,32 @@ function draw() {
   drawHead(f, job);
   if (c) drawCall(c, job); else drawSkip(job);
   drawBench(f, job);
+  linkNodeIds();
   applyOpened();
   animate(!!c);
+}
+
+/* A retry repeats its question's first prompt and appends feedback, so the attempts of one question share that prefix. */
+function triesOf(i) {
+  const c = calls[i], same = x => x.ask === c.ask && x.subject === c.subject;
+  let previous = -1, next = -1;
+  if (c.feedback_at !== null) {
+    const base = c.prompt.slice(0, c.feedback_at);
+    for (let n = i - 1; n >= 0; n--) if (same(calls[n]) && calls[n].attempt === c.attempt - 1 && calls[n].prompt.startsWith(base)) { previous = n; break; }
+  }
+  if (c.verdict === "rejected")
+    next = calls.findIndex((x, n) => n > i && same(x) && x.attempt === c.attempt + 1 && c.prompt.startsWith(x.prompt.slice(0, x.feedback_at)));
+  return {previous, next};
+}
+/* A window round is named by its opening speech; it jumps to the first unit the main loop took from that round. */
+const roundColumn = {};
+for (const j of jobs) if (j.id.startsWith("message:")) roundColumn[j.id.split(":")[1]] ??= j.column;
+function roundLink(uuid) {
+  const column = roundColumn[uuid];
+  if (column === undefined) return esc(uuid.slice(0, 8));
+  let k = frames.findIndex(f => jobOfFrame(f)?.stage === "LOOP" && jobOfFrame(f).column === column);
+  if (k < 0) k = frames.findIndex(f => jobOfFrame(f)?.column === column);
+  return k < 0 ? esc(`第 ${column} 轮`) : frameLink(k, `第 ${column} 轮`);
 }
 
 function reviewBanner(job) {
@@ -516,11 +603,15 @@ function drawHead(f, job) {
   $("ftitle").textContent = c ? `${ASK_NAMES[c.ask]} · ${c.subject}` : `${job.id} · 代码直接处理`;
   $("verdict").innerHTML = c ? (beat >= 3 ? `<span class="badge verdict-${c.verdict}">${VERDICT_NAMES[c.verdict]}</span>` : "") : `<span class="badge verdict-skip">没有调用模型</span>`;
   if (c) {
-    const mine = callsOf[c.subject];
-    $("fmeta").textContent = `第 ${c.attempt} 次（最多 ${limitOf(c)} 次）· ${c.started ? "开始 " + time(c.started) + " · " : ""}结束 ${time(c.ended)} · ` +
-      `这个任务的第 ${mine.indexOf(f.i) + 1} 次调用，共 ${mine.length} 次` +
-      (c.window_seen ? ` · 窗口实际放进前 ${c.window_seen.length} 轮（这里最多能放 ${c.window_limit} 轮）` : "") +
-      (c.origin ? ` · 由运行目录 ${c.origin} 发出` : "");
+    const mine = callsOf[c.subject], tries = triesOf(f.i);
+    $("fmeta").innerHTML = esc(`第 ${c.attempt} 次（最多 ${limitOf(c)} 次）`) +
+      (tries.previous >= 0 ? " " + frameLink(frameOfCall[tries.previous], "← 上一次尝试") : "") +
+      (tries.next >= 0 ? " " + frameLink(frameOfCall[tries.next], "重问的下一次尝试 →") : "") +
+      esc(` · ${c.started ? "开始 " + time(c.started) + " · " : ""}结束 ${time(c.ended)} · 这个任务的第 ${mine.indexOf(f.i) + 1} 次调用，共 ${mine.length} 次`) +
+      (c.window_seen ? esc(` · 窗口实际放进前 ${c.window_seen.length} 轮（这里最多能放 ${c.window_limit} 轮）`) +
+        (c.window_seen.length ? "：" + c.window_seen.map(roundLink).join(" ") : "") : "") +
+      (c.origin ? esc(` · 由运行目录 ${c.origin} 发出`) : "") +
+      (c.window_seen ? `<details class="more"><summary>上下文窗口的规则（页面从源码常量和 docstring 生成的说明，不发给模型）</summary><pre>${esc(PAGE.window.join("\n\n"))}</pre></details>` : "");
     $("freason").innerHTML = c.reason && beat >= 3
       ? `<div class="reason">${c.verdict === "rejected" && c.attempt < limitOf(c) ? "管线把下面这段反馈附在提示词后面，又问了一次：\n" : ""}${esc(c.reason)}</div>` : "";
   } else {
@@ -569,8 +660,7 @@ function drawCall(c, job) {
   $("request").innerHTML =
     `<h3>HTTP 请求的设置（来自调用记录的请求行）</h3><pre>${esc(JSON.stringify(c.request, null, 2))}</pre>` +
     `<h3>提示词</h3>${c.prompt.includes("<header>\n") ? `<div class="kv">header 在这里按缩进排版显示；发给模型的是紧凑格式（每个节点、每条边各占一行），内容完全相同。</div>` : ""}<pre>${promptHtml(c)}</pre>` +
-    `<details class="more" open><summary>system 全文</summary><pre>${esc(PAGE.systems[c.ask])}</pre></details>` +
-    `<details class="more" open><summary>上下文窗口的规则（源码常量和 docstring）</summary><pre>${esc(PAGE.window.join("\n\n"))}</pre></details>`;
+    `<details class="more" open><summary>system 全文</summary><pre>${esc(PAGE.systems[c.ask])}</pre></details>`;
   $("reply").innerHTML =
     `<div class="dim ${beat >= 2 ? "lit" : ""}"><pre>${esc(pretty(c.reply ?? "（没有回答）"))}</pre>` +
     (c.reasoning ? `<details class="more" open><summary>推理</summary><pre>${esc(c.reasoning)}</pre></details>` : "") +
@@ -687,6 +777,11 @@ function wrapLines(text) {
   return lines;
 }
 
+/* A cytoscape label is one plain string, so the green box around 已完成 is an image drawn in the node's top-right corner. */
+const DONE_BADGE = "data:image/svg+xml;utf8," + encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" width="52" height="18"><rect x="4" y="4" width="44" height="14" rx="3" fill="#16a34a" stroke="#4ade80"/>` +
+  `<text x="26" y="14.5" text-anchor="middle" font-size="10" font-weight="700" fill="#fff" font-family="system-ui, Noto Sans CJK SC, sans-serif">已完成</text></svg>`);
+
 function graphStyle() {
   const ink = cssVar("--ink"), muted = cssVar("--muted"), panel = cssVar("--panel");
   return [
@@ -695,6 +790,8 @@ function graphStyle() {
     {selector: "node[w]", style: {width: "data(w)", height: "data(h)", "border-color": "data(color)"}},
     {selector: "node.hot", style: {"border-width": 3.5}},
     {selector: "node.pending", style: {"border-style": "dashed"}},
+    {selector: "node.done", style: {"background-color": "data(color)", color: "#fff", "background-image": DONE_BADGE, "background-fit": "none",
+      "background-width": 52, "background-height": 18, "background-position-x": "100%", "background-position-y": 0, "background-clip": "none"}},
     {selector: ":parent", style: {"background-opacity": 0, "border-style": "dashed", "border-width": 1.5, "border-color": muted, "text-valign": "top",
       "text-halign": "center", "text-margin-y": -6, "text-max-width": 2000, "font-size": 13, "font-weight": "bold", padding: 22}},
     {selector: "edge", style: {"curve-style": "bezier", width: 1.2, "line-color": muted, "target-arrow-shape": "triangle", "target-arrow-color": muted,
@@ -734,16 +831,52 @@ function ensureGraph() {
     const n = e.target; if (n.isParent()) return;
     (dragged[shownTopic] ??= {})[n.id()] = {...n.position()}; saveDragged();
   });
-  cy.on("tap", "node, edge", e => {
-    const d = e.target.data();
-    $("gnote").textContent = e.target.hasClass("owner") ? `${d.source} 检验聚合 ${d.target} 的意图所带的预期，说明到目前为止实际情况和预期相差多少。这条点线不是存储里的边，而是节点的 aggregate 字段。`
-      : e.target.isEdge() ? `${d.source} → ${d.target} · ${d.label}：${d.evidence || "没有证据文字"}` : `${d.id}：${d.full}`;
-  });
-  cy.on("tap", e => { if (e.target === cy) $("gnote").textContent = "点击节点或边查看全文。"; });
+  cy.on("tap", "node, edge", e => noteOf(e.target));
+  cy.on("tap", e => { if (e.target === cy) $("gnote").textContent = "点击节点或边查看全文和改动过它的单元。"; });
   new ResizeObserver(() => cy.resize()).observe($("bench"));
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => cy.style(graphStyle()));
   $("relayout").onclick = () => { delete dragged[shownTopic]; saveDragged(); layoutGraph(); };
 }
+
+function noteOf(el) {
+  const d = el.data();
+  const text = el.hasClass("owner") ? `${d.source} 检验聚合 ${d.target} 的意图所带的预期，说明到目前为止实际情况和预期相差多少。这条点线不是存储里的边，而是节点的 aggregate 字段。`
+    : el.isEdge() ? `${d.source} → ${d.target} · ${d.label}：${d.evidence || "没有证据文字"}` : `${d.id}：${d.full}`;
+  const history = el.isParent() ? [] : el.isEdge() && !el.hasClass("owner") ? edgeHistory(d.id) : nodeHistory(el.hasClass("owner") ? d.source : d.id);
+  $("gnote").innerHTML = esc(text) + (history.length ? `<br>改动过它的单元（点击跳到这个单元提交记录的那一帧）：${history.join(" ")}` : "");
+}
+function unitLink(u, what) { const k = lastFrameOf["unit:" + u]; return k === undefined ? esc(`unit:${u} ${what}`) : frameLink(k, `unit:${u} ${what}`); }
+function nodeHistory(id) {
+  const out = []; let exists = false;
+  PAGE.graphs.forEach((g, u) => {
+    if (g?.topic !== shownTopic) return;
+    if (g.removed.includes(id)) { out.push(unitLink(u, "删除")); exists = false; }
+    if (id in g.nodes) { out.push(unitLink(u, exists ? "修改" : "新建")); exists = true; }
+  });
+  return out;
+}
+function edgeHistory(key) {
+  const out = [];
+  PAGE.graphs.forEach((g, u) => {
+    if (g?.topic !== shownTopic) return;
+    if (g.removed_edges.some(e => keyOf(e) === key)) out.push(unitLink(u, "删除"));
+    if (g.edges.some(e => keyOf(e) === key)) out.push(unitLink(u, "新建"));
+  });
+  return out;
+}
+/* Node ids quoted in the reply and the written record become links that select the node in the graph above. */
+function linkNodeIds() {
+  const ids = cy.nodes().filter(n => !n.isParent()).map(n => n.id());
+  if (!ids.length) return;
+  const quoted = new RegExp(`"(${ids.map(x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})"`, "g");
+  for (const pre of document.querySelectorAll("#reply > div > pre, #checks pre")) pre.innerHTML = pre.innerHTML.replace(quoted, `"<a class="nid" data-node="$1">$1</a>"`);
+}
+document.addEventListener("click", e => {
+  const a = e.target.closest("a.nid"); if (!a) return;
+  const n = cy.getElementById(a.dataset.node); if (!n.length) return;
+  cy.elements().unselect(); n.select(); cy.animate({center: {eles: n}}, {duration: 300}); noteOf(n);
+  $("gbox").scrollIntoView({block: "nearest", behavior: "smooth"});
+});
 
 function drawBench(f, job) {
   ensureGraph();
@@ -773,7 +906,7 @@ function drawBench(f, job) {
   const colors = {intent: "--I", aggregate: "--G", observation: "--O", aggregate_observation: "--O"};
   const done = new Set(edges.filter(e => e.relation === "satisfies").map(e => e.to));
   const colorOf = n => cssVar(n.type === "intent" && n.actor === "ai" ? "--A" : colors[n.type] ?? "--muted");
-  const statusOf = (id, n) => n.type === "intent" || n.type === "aggregate" ? ` · ${done.has(id) ? "已完成" : "待完成"}` : "";
+  const statusOf = (id, n) => (n.type === "intent" || n.type === "aggregate") && !done.has(id) ? " · 待完成" : "";
   const nameOf = (id, n) => (n.type === "intent" ? `${id} · ${n.actor === "ai" ? "AI" : "用户"}` : n.type === "aggregate_observation" ? `${id} · ${n.aggregate} 的观测` : id) + statusOf(id, n);
   const linked = new Set();
   for (const e of edges) if (nodes[e.from] && nodes[e.to]) linked.add(e.from).add(e.to);
@@ -787,7 +920,7 @@ function drawBench(f, job) {
     if (wrapped.length > NODE_LINES) shown[NODE_LINES - 1] = shown[NODE_LINES - 1].slice(0, -1) + "…";
     const lines = [nameOf(id, n), ...shown];
     elements.push({group: "nodes", data: {id, parent, label: lines.join("\n"), full: n.label ?? "", color: colorOf(n), w: NODE_TEXT_W + 16, h: 14 * lines.length + 12},
-      classes: [fresh.has(id) && !committed ? "pending" : "", candidates.has(id) ? "hot" : ""].join(" ")});
+      classes: [fresh.has(id) && !committed ? "pending" : "", candidates.has(id) ? "hot" : "", done.has(id) ? "done" : ""].join(" ")});
   }
   for (const e of edges) if (nodes[e.from] && nodes[e.to])
     elements.push({group: "edges", data: {id: keyOf(e), source: e.from, target: e.to, label: e.relation, evidence: e.evidence ?? ""},
@@ -803,7 +936,7 @@ function drawBench(f, job) {
   }
   shownGraph = shape; shownTopic = topic;
   cy.elements().remove(); cy.add(elements); layoutGraph();
-  $("gnote").textContent = "点击节点或边查看全文。拖动节点会记住位置，滚轮缩放，拖动空白处平移。";
+  $("gnote").textContent = "点击节点或边查看全文和改动过它的单元。拖动节点会记住位置，滚轮缩放，拖动空白处平移。";
 }
 
 /* ---------- what the viewer set by hand survives frame changes and the auto-refresh reload ---------- */
@@ -823,7 +956,7 @@ document.addEventListener("click", e => {
 });
 function saveView() {
   const view = {opened, graphTop: $("gbox").getBoundingClientRect().top, scrolled: [...document.querySelectorAll(SCROLLED)].map(x => [x.scrollTop, x.scrollLeft]),
-    bench: $("bench").style.height, topic: shownTopic, graph: cy ? {zoom: cy.zoom(), pan: cy.pan()} : null};
+    bench: $("bench").style.height, topic: shownTopic, tokAsk: $("tokAsk").value, tokTab, graph: cy ? {zoom: cy.zoom(), pan: cy.pan()} : null};
   try { sessionStorage.setItem(VIEW_KEY, JSON.stringify(view)); } catch { /* the reload then starts from the defaults */ }
 }
 function restoreView() {
@@ -832,11 +965,145 @@ function restoreView() {
   if (!view) return;
   opened = view.opened; applyOpened();
   if (view.bench) $("bench").style.height = view.bench;
+  if (view.tokAsk && [...$("tokAsk").options].some(o => o.value === view.tokAsk)) $("tokAsk").value = view.tokAsk;
+  if (view.tokTab in TOKEN_TABS) tokTab = view.tokTab;
+  drawTokens();
   if (cy && view.graph && view.topic === shownTopic) { cy.resize(); cy.viewport({zoom: view.graph.zoom, pan: view.graph.pan}); }
   document.querySelectorAll(SCROLLED).forEach((x, i) => { if (view.scrolled[i]) [x.scrollTop, x.scrollLeft] = view.scrolled[i]; });
   /* The page keeps the graph where the viewer had it: the dependency graph above it grows while a run is watched. */
   scrollTo(0, $("gbox").getBoundingClientRect().top + scrollY - view.graphTop);
 }
+
+/* ---------- token use against the graph in each prompt's header ---------- */
+const SVG_NS = "http://www.w3.org/2000/svg";
+function graphSize(v) {
+  if (Array.isArray(v)) return v.reduce((n, x) => n + graphSize(x), 0);
+  if (!v || typeof v !== "object") return 0;
+  if (v.nodes && Array.isArray(v.edges)) return Object.keys(v.nodes).length + v.edges.length;
+  return Object.values(v).reduce((n, x) => n + graphSize(x), 0);
+}
+const tokRows = calls.flatMap((c, i) => {
+  if (c.tokens === null) return [];
+  const h = headerOf(c.prompt), graph = h !== null && ("graph" in h || "graphs" in h), t = c.tokens;
+  return [{c, i, graph, size: graph ? graphSize([h.graph, h.graphs]) : 0, ...t, context: t.prompt + t.thinking + t.answer}];
+});
+/* A run that switched deployments sent different budgets; the page draws only the highest. */
+const sentBudgets = tokRows.map(r => r.c.thinking_budget).filter(b => b !== null);
+const budgets = sentBudgets.length ? [Math.max(...sentBudgets)] : [];
+const fmtN = n => Math.round(n).toLocaleString("en-US");
+const SOURCES = "思考 token：codex 直接报告 reasoning_output_tokens；claude 报告 output_tokens_details.thinking_tokens，回答是 output_tokens 减去思考，包括全部非思考输出（含工具调用的 JSON），不只是最后的结构化答案；hive 只报告 completion_tokens，页面用 Qwen 分词器数出回答的 token，剩下的算思考，误差只来自较短的回答。";
+const AXIS_NOTE = "横轴是 header 里 graph 和 graphs 的节点数加边数，没有 header 的调用（第一层压缩）算 0。";
+const PARTS = [["prompt", "提示词", "var(--tk-prompt)"], ["thinking", "思考", "var(--tk-think)"], ["answer", "回答", "var(--tk-answer)"]];
+const TOKEN_TABS = {
+  thinking: {value: r => r.thinking, budgets, parts: null,
+    note: () => `${tokRows.length} 次调用带用量记录。${SOURCES}${AXIS_NOTE}` +
+      (budgets.length ? `红色虚线是请求里设的思考上限 ${budgets.map(fmtN).join("、")}。` : "这个后端的请求没有设思考上限。"),
+    bars: "每根柱子是一次调用，按思考 token 从小到大排列，颜色是调用所属的阶段。橙色实线是平均数，黑色点线是中位数。"},
+  context: {value: r => r.context, budgets: [], parts: PARTS,
+    note: () => `${tokRows.length} 次调用带用量记录。完整上下文是一次调用在端点上占用的全部 token：提示词 + 思考 + 回答。` +
+      `提示词取服务端报告的 prompt_tokens（hive）或 input_tokens（codex）；claude 的提示词是 input_tokens 加上缓存写入和缓存读取的 token。${SOURCES}${AXIS_NOTE}`,
+    bars: "每根柱子是一次调用，按完整上下文 token 从小到大排列，柱子从下往上分成三段：" +
+      PARTS.map(([, name, color]) => `<span class="sw" style="background:${color}"></span>${name}`).join(" ") + "。橙色实线是平均数，黑色点线是中位数。"},
+};
+let tokTab = "thinking";
+$("tokTabs").onclick = e => { const tab = e.target.dataset?.tab; if (tab) { tokTab = tab; drawTokens(); } };
+const tokAsks = [...new Set(tokRows.map(r => r.c.ask))];
+$("tokAsk").innerHTML = `<option value="*all">所有调用</option><option value="*graph">带图谱的调用</option>` +
+  tokAsks.map(a => `<option value="${a}">${esc(ASK_NAMES[a] ?? a)}</option>`).join("");
+$("tokAsk").onchange = drawTokens;
+const tokTip = $("toktip");
+function svgEl(parent, name, attrs, text) {
+  const n = document.createElementNS(SVG_NS, name);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (text != null) n.textContent = text;
+  parent.appendChild(n); return n;
+}
+function niceStep(span, count) { const raw = span / count, p = 10 ** Math.floor(Math.log10(raw)); return [1, 2, 5, 10].map(m => m * p).find(x => x >= raw); }
+function bindMark(node, r, extra) {
+  node.classList.add("mark"); node.dataset.call = r.i;
+  node.onmousemove = e => {
+    tokTip.innerHTML = `${extra}<b>${esc(ASK_NAMES[r.c.ask] ?? r.c.ask)}</b> · ${esc(r.c.subject)}<br>图谱 ${r.size} · 提示词 ${fmtN(r.prompt)} · 思考 ${fmtN(r.thinking)}` +
+      (r.c.thinking_budget !== null ? ` / ${fmtN(r.c.thinking_budget)}` : "") + ` · 回答 ${fmtN(r.answer)} · 合计 ${fmtN(r.context)}` +
+      `<br>${time(r.c.started ?? r.c.ended)} · ${esc(VERDICT_NAMES[r.c.verdict])}` + (r.c.finish !== "stop" ? ` · ${esc(r.c.finish)}` : "");
+    tokTip.style.display = "block";
+    tokTip.style.left = Math.min(e.clientX + 12, innerWidth - tokTip.offsetWidth - 8) + "px";
+    tokTip.style.top = Math.min(e.clientY + 12, innerHeight - tokTip.offsetHeight - 8) + "px";
+  };
+  node.onmouseleave = () => { tokTip.style.display = "none"; };
+  node.onclick = () => go(frameOfCall[r.i]);
+}
+function tokAxes(svg, box, xMax, yMax, xLabel, yLabel) {
+  const [x0, x1, y0, y1] = box, sx = v => x0 + v / xMax * (x1 - x0), sy = v => y1 - v / yMax * (y1 - y0);
+  const step = niceStep(yMax, 6);
+  for (let v = 0; v <= yMax + 1e-9; v += step) {
+    svgEl(svg, "line", {x1: x0, x2: x1, y1: sy(v), y2: sy(v), stroke: "var(--line)"});
+    svgEl(svg, "text", {x: x0 - 6, y: sy(v) + 4, "text-anchor": "end"}, fmtN(v));
+  }
+  svgEl(svg, "line", {x1: x0, x2: x1, y1, y2: y1, stroke: "var(--muted)"});
+  svgEl(svg, "text", {x: (x0 + x1) / 2, y: y1 + 34, "text-anchor": "middle"}, xLabel);
+  svgEl(svg, "text", {x: 14, y: (y0 + y1) / 2, "text-anchor": "middle", transform: `rotate(-90 14 ${(y0 + y1) / 2})`}, yLabel);
+  return {sx, sy};
+}
+function refLine(svg, box, sy, v, label, color, dash, atEnd) {
+  const [x0, x1] = box;
+  svgEl(svg, "line", {x1: x0, x2: x1, y1: sy(v), y2: sy(v), stroke: color, "stroke-width": 1.5, "stroke-dasharray": dash});
+  svgEl(svg, "text", {x: atEnd ? x1 : x0 + 6, y: sy(v) - 4, "text-anchor": atEnd ? "end" : "start", style: `fill: ${color}`}, label);
+}
+function drawTokens() {
+  const tab = TOKEN_TABS[tokTab], value = tab.value, yLabel = tokTab === "thinking" ? "思考 token" : "完整上下文 token";
+  document.querySelectorAll("#tokTabs button").forEach(b => { b.classList.toggle("on", b.dataset.tab === tokTab); b.setAttribute("aria-selected", b.dataset.tab === tokTab); });
+  $("tokNote").textContent = tab.note(); $("tokBarsNote").innerHTML = tab.bars;
+  const pick = $("tokAsk").value;
+  const rows = tokRows.filter(r => pick === "*all" || (pick === "*graph" ? r.graph : r.c.ask === pick));
+  $("tokCount").textContent = `${rows.length} 次调用`;
+  const yMax = Math.max(1000, ...tab.budgets, ...rows.map(value)) * 1.06;
+
+  const scatter = $("tokScatter"), sBox = [64, 1040, 12, 352]; scatter.innerHTML = "";
+  const xMax = Math.max(10, ...rows.map(r => r.size)) * 1.03;
+  const s = tokAxes(scatter, sBox, xMax, yMax, "header 里图谱的节点数 + 边数", yLabel);
+  const xStep = niceStep(xMax, 10);
+  for (let v = 0; v <= xMax; v += xStep) svgEl(scatter, "text", {x: s.sx(v), y: sBox[3] + 16, "text-anchor": "middle"}, fmtN(v));
+  for (const b of tab.budgets) refLine(scatter, sBox, s.sy, b, `思考上限 ${fmtN(b)}`, "var(--bad)", "5 4", true);
+  for (const r of rows) bindMark(svgEl(scatter, "circle", {cx: s.sx(r.size), cy: s.sy(value(r)), r: 4.5,
+    fill: STAGE_COLORS[r.c.stage], "fill-opacity": 0.7, stroke: "var(--panel)", "stroke-width": 1}), r, "");
+
+  const bars = $("tokBars"), bBox = [64, 1040, 12, 320]; bars.innerHTML = "";
+  const b = tokAxes(bars, bBox, 1, yMax, `每一次调用，按${yLabel}从小到大排列`, yLabel);
+  const sorted = [...rows].sort((p, q) => value(p) - value(q)), values = sorted.map(value);
+  const slot = (bBox[1] - bBox[0]) / Math.max(values.length, 1), width = Math.max(slot - (slot > 4 ? 1 : 0), 0.6);
+  sorted.forEach((r, n) => {
+    const x = bBox[0] + n * slot, extra = `第 ${n + 1} / ${values.length} 次 · `;
+    if (!tab.parts) {
+      const y = b.sy(value(r));
+      bindMark(svgEl(bars, "rect", {x, y, width, height: Math.max(bBox[3] - y, 0.5), fill: STAGE_COLORS[r.c.stage]}), r, extra);
+      return;
+    }
+    let below = 0;
+    for (const [key, , color] of tab.parts) {
+      const top = b.sy(below + r[key]), bottom = b.sy(below);
+      if (r[key] > 0) bindMark(svgEl(bars, "rect", {x, y: top, width, height: Math.max(bottom - top, 0.5), fill: color}), r, extra);
+      below += r[key];
+    }
+  });
+  for (const v of tab.budgets) refLine(bars, bBox, b.sy, v, `思考上限 ${fmtN(v)}`, "var(--bad)", "5 4", true);
+  if (values.length) {
+    const mean = values.reduce((p, q) => p + q, 0) / values.length;
+    const at = p => values[Math.min(values.length - 1, Math.floor(p * values.length))];
+    const median = values.length % 2 ? values[values.length >> 1] : (values[values.length / 2 - 1] + values[values.length / 2]) / 2;
+    refLine(bars, bBox, b.sy, mean, `平均数 ${fmtN(mean)}`, "var(--warn)", "", false);
+    refLine(bars, bBox, b.sy, median, `中位数 ${fmtN(median)}`, "var(--ink)", "2 3", true);
+    $("tokTable").innerHTML = `<tr><th></th><th>调用次数</th><th>平均数</th><th>中位数</th><th>p90</th><th>p99</th><th>最大</th>` +
+      tab.budgets.map(() => "<th>达到自己请求的上限</th>").join("") + "</tr>" +
+      `<tr><th>${yLabel}</th><td>${values.length}</td><td>${fmtN(mean)}</td><td>${fmtN(median)}</td><td>${fmtN(at(.9))}</td><td>${fmtN(at(.99))}</td><td>${fmtN(values[values.length - 1])}</td>` +
+      tab.budgets.map(() => `<td>${sorted.filter(r => r.c.thinking_budget !== null && r.thinking >= r.c.thinking_budget).length}</td>`).join("") + "</tr>";
+  } else $("tokTable").innerHTML = "";
+  markTokens();
+}
+function markTokens() {
+  const own = frames[current]?.call ? String(frames[current].i) : null;
+  document.querySelectorAll("#tokens .mark").forEach(m => m.classList.toggle("on", m.dataset.call === own));
+}
+drawTokens();
 
 drawStrip();
 const startAt = new URLSearchParams(location.hash.slice(1)).get("frame");
