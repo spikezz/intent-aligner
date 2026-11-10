@@ -280,8 +280,9 @@ def _claude_exchange(path: Path, lines: list[dict[str, Any]]) -> Exchange | None
         for key, value in counts.items():
             if isinstance(value, int):
                 usage[key] = usage.get(key, 0) + value
+    # Claude transcripts write "output_tokens_details": null when the API sent no split.
     if messages and all(
-        "thinking_tokens" in m.get("output_tokens_details", {}) for m in messages.values()
+        "thinking_tokens" in (m.get("output_tokens_details") or {}) for m in messages.values()
     ):
         usage["output_tokens_details"] = {
             "thinking_tokens": sum(
@@ -659,6 +660,16 @@ def _extends(prompt: str, base: str) -> bool:
     return len(prompt) > len(base) and prompt.startswith(base + "\n\n")
 
 
+class TokenUse(BaseModel):
+    """Token usage; Claude answer includes all non-thinking output, including tool JSON."""
+
+    model_config = ConfigDict(frozen=True)
+
+    prompt: int
+    thinking: int
+    answer: int
+
+
 class Attempt(BaseModel):
     """One call as the page shows it, judged among the calls of its question.
 
@@ -758,6 +769,49 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
                 )
             )
     return sorted(judged, key=lambda a: (a.started or a.ended, a.ended))
+
+
+def _tokens(exchange: Exchange) -> TokenUse | None:
+    """Codex and Claude report reasoning counts; Hive reports only completion_tokens.
+
+    Claude input includes cache reads and writes. Its answer count includes all
+    non-thinking output, not just the final StructuredOutput payload.
+
+    For Hive the answer is counted under the Qwen tokenizer and the rest of the
+    completion is thinking, so only the short answer carries the local tokenizer's
+    error (within ~7% of the server's).
+    """
+    usage = exchange.usage
+    if exchange.request.get("backend") == "claude":
+        details = usage.get("output_tokens_details", {})
+        if "thinking_tokens" not in details:
+            return None
+        thinking = int(details["thinking_tokens"])
+        return TokenUse(
+            prompt=sum(
+                int(usage.get(key, 0))
+                for key in (
+                    "input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                )
+            ),
+            thinking=thinking,
+            answer=int(usage["output_tokens"]) - thinking,
+        )
+    if "reasoning_output_tokens" in usage:
+        output, thinking = int(usage["output_tokens"]), int(usage["reasoning_output_tokens"])
+        return TokenUse(
+            prompt=int(usage["input_tokens"]), thinking=thinking, answer=output - thinking
+        )
+    if "completion_tokens" in usage:
+        answer = window.qwen_tokens(exchange.reply or "")
+        return TokenUse(
+            prompt=int(usage["prompt_tokens"]),
+            thinking=int(usage["completion_tokens"]) - answer,
+            answer=answer,
+        )
+    return None
 
 
 HEADER = re.compile(r"<header>\n(.*?)\n</header>", re.S)

@@ -213,3 +213,44 @@ def test_legacy_discovery_reads_claude_projects(
     calls, unplaced, _ = matched_calls(run, conversation, datetime(2020, 1, 1, tzinfo=UTC), None)
     assert len(calls) == 1 and calls[0].exchange.path == path
     assert unplaced == []
+
+
+@pytest.mark.parametrize("thinking", [0, 10])
+def test_claude_token_split_includes_cached_prompt(
+    events: list[dict[str, Any]], tmp_path: Path, thinking: int
+) -> None:
+    events[2]["message"]["usage"]["cache_creation_input_tokens"] = 7
+    events[2]["message"]["usage"]["output_tokens_details"]["thinking_tokens"] = thinking
+    exchange = read_exchange(_write(tmp_path / "session.jsonl", events))
+    assert exchange is not None
+    tokens = replay._tokens(exchange)
+    assert tokens is not None
+    assert tokens.model_dump() == {"prompt": 57, "thinking": thinking, "answer": 12 - thinking}
+
+
+def test_claude_unknown_thinking_count_remains_unknown(
+    events: list[dict[str, Any]], tmp_path: Path
+) -> None:
+    del events[2]["message"]["usage"]["output_tokens_details"]
+    exchange = read_exchange(_write(tmp_path / "session.jsonl", events))
+    assert exchange is not None
+    assert replay._tokens(exchange) is None
+    assert exchange.usage["output_tokens"] == 12
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_claude_null_token_details_are_unknown(
+    events: list[dict[str, Any]], tmp_path: Path, mixed: bool
+) -> None:
+    if mixed:
+        events[3]["message"]["id"] = "msg_2"
+        events[3]["message"]["usage"] = {
+            **events[3]["message"]["usage"],
+            "output_tokens_details": {"thinking_tokens": 3},
+        }
+    events[2]["message"]["usage"]["output_tokens_details"] = None
+    exchange = read_exchange(_write(tmp_path / "session.jsonl", events))
+    assert exchange is not None and exchange.reply == "4"
+    assert "output_tokens_details" not in exchange.usage
+    assert replay._tokens(exchange) is None
+    assert exchange.usage["output_tokens"] == (24 if mixed else 12)
