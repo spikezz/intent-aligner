@@ -22,7 +22,7 @@
 
 ## `claude-87eeb4bd-qwen-final/`
 
-同一个对话，模型是 `deployment/pc-qwen38-np6`，思考强度 xhigh，窗口 `--window-rounds 2`，按现行提示词从空图谱重跑。第一级压缩、发言切分和主循环都在这一轮里做，所有调用都用同一个思考上限 `llm.HIVE_THINKING_BUDGET`。这次运行用来验证 `backups/intent-aligner-capped-thinking-rerun-2026-11-09/problem-table.md` 里的改动：调用 C 还会不会把思考顶满，serves 和 responds 怎样使用。`extract-before-direct/` 是 serves 改成“from 直接服务于 to”之前那次中途停下的主循环输出。
+同一个对话，模型是 Hive 角色 `qwen38-pool`（`pc-qwen38-np6` 的 6 个槽位加 `art-qwen38-np2` 的 2 个槽位，第一级压缩用 8 个并发），思考强度 xhigh，窗口 `--window-rounds 2`，按现行提示词从空图谱重跑。第一级压缩、发言切分和主循环都在这一轮里做，所有调用都用同一个思考上限 `llm.HIVE_THINKING_BUDGET`。这次运行用来验证 `backups/intent-aligner-capped-thinking-rerun-2026-11-09/problem-table.md` 里的改动：调用 C 还会不会把思考顶满，serves 和 responds 怎样使用。`extract-before-direct/` 是 serves 改成“from 直接服务于 to”之前那次中途停下的主循环输出。
 
 ## `claude-87eeb4bd-sol/`
 

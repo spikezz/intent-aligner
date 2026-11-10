@@ -21,6 +21,7 @@ from intent_aligner.replay import (
     judge,
     literal_ranges,
     literal_texts,
+    logged_calls,
     parse_run,
     read_exchange,
     readable,
@@ -238,3 +239,41 @@ def test_the_page_shows_the_header_the_model_got_indented() -> None:
         assert page.startswith(before) and page.endswith(after), call["transcript"]
         shown += 1
     assert shown, "no extract prompt with a header in the run"
+
+
+QWEN_RUN = TOOL_ROOT / "corpus" / "results" / "claude-87eeb4bd-qwen"
+
+
+def _run_sh(directory: Path, digests: Path, segments: Path) -> Path:
+    directory.mkdir()
+    (directory / "run.sh").write_text(
+        f"$PY -m intent_aligner.extract {TOOL_ROOT}/corpus/merged/claude-87eeb4bd.jsonl "
+        f"--digests {digests} --segments {segments} "
+        f"--backend hive --model deployment/pc-qwen38-np6 --out {directory}/extract\n",
+        encoding="utf-8",
+    )
+    return directory
+
+
+def test_a_run_before_its_first_call_has_no_calls(tmp_path: Path) -> None:
+    run_dir = tmp_path / "new"
+    run = parse_run(_run_sh(run_dir, run_dir / "digests.jsonl", run_dir / "segments.jsonl"))
+    (run_dir / "digests.jsonl").write_text("", encoding="utf-8")
+
+    assert logged_calls(run) == [], logged_calls(run)
+
+
+@pytest.mark.skipif(
+    not (QWEN_RUN / "extract" / "calls.jsonl").exists() or not (LLM_HOME / "hive").exists(),
+    reason="needs the claude-87eeb4bd-qwen run and its hive transcripts",
+)
+def test_reused_digests_and_segments_bring_their_calls(tmp_path: Path) -> None:
+    run = parse_run(
+        _run_sh(tmp_path / "reuse", QWEN_RUN / "digests.jsonl", QWEN_RUN / "segments.jsonl")
+    )
+    calls = logged_calls(run)
+
+    assert calls is not None
+    stages = Counter(c.stage for c in calls)
+    assert set(stages) == {"L1", "SEG"}, stages
+    assert all(c.origin == str(QWEN_RUN) for c in calls), {c.origin for c in calls}

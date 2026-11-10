@@ -1,6 +1,6 @@
 """Replay a pipeline run as one self-contained HTML page, from its records and its calls' transcripts.
 
-Usage: python -m intent_aligner.replay RUN_DIR --out PAGE.html [--since T] [--until T]
+Usage: python -m intent_aligner.replay RUN_DIR [--out PAGE.html] [--since T] [--until T] [--watch S]
 
 RUN_DIR holds a run.sh that runs intent_aligner.extract (and usually .compress and
 .segment before it); run.sh names the conversation, the model and every file the run
@@ -414,17 +414,28 @@ def _stage(ask: str) -> str:
 
 
 def logged_calls(run: Run) -> list[Call] | None:
-    """The calls named by the run's calls.jsonl files, or None for a run older than them."""
+    """The calls named by the run's calls.jsonl files, or None for a run older than them.
+
+    A run that reads another run's segments.jsonl gets that run's segment calls with it,
+    from the extract/calls.jsonl next to the file; digests come with their own directory's
+    calls.jsonl the same way.
+    """
     logs = [run.digests.parent / CALLS_FILE, run.extract / CALLS_FILE]
+    segments_log = run.segments.parent / "extract" / CALLS_FILE
+    reused_segments = segments_log not in logs and segments_log.exists()
     if not any(path.exists() for path in logs):
-        return None
+        return None if _has_output(run) else []
     origins = _origins(run)
     calls = []
-    for path in logs:
+    for path in [*logs, segments_log] if reused_segments else logs:
         if not path.exists():
             continue
+        owner = path.parent.parent if path.parent.name == "extract" else path.parent
+        foreign = None if owner == run.directory else str(owner)
         for line in path.read_text(encoding="utf-8").splitlines():
             record = CallRecord.model_validate_json(line)
+            if path == segments_log and reused_segments and record.ask != "segment":
+                continue
             exchange = None if record.transcript is None else read_exchange(Path(record.transcript))
             if exchange is None:
                 continue
@@ -439,10 +450,16 @@ def logged_calls(run: Run) -> list[Call] | None:
                     started=record.started,
                     exchange=exchange,
                     error=record.error,
-                    origin=origins.get(record.transcript or ""),
+                    origin=foreign or origins.get(record.transcript or ""),
                 )
             )
     return calls
+
+
+def _has_output(run: Run) -> bool:
+    """A run that wrote nothing yet has made no call, whatever its age."""
+    files = [run.digests, run.segments, run.extract / "assignments.jsonl"]
+    return any(f.exists() and f.stat().st_size > 0 for f in files)
 
 
 def _origins(run: Run) -> dict[str, str]:
@@ -1472,13 +1489,14 @@ def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(description="Replay a pipeline run as a local HTML page.")
     parser.add_argument("run", type=Path, help="run directory with its run.sh")
-    parser.add_argument("--out", type=Path, required=True, help="HTML page to write")
+    parser.add_argument("--out", type=Path, help="HTML page to write; default RUN/replay.html")
     parser.add_argument("--since", type=_time, help="ignore transcripts before this time")
     parser.add_argument("--until", type=_time, help="ignore transcripts after this time")
     parser.add_argument(
         "--watch", type=int, metavar="SECONDS", help="rebuild and reload the page every SECONDS"
     )
     args = parser.parse_args()
+    args.out = args.out or args.run / "replay.html"
     if args.watch is None:
         _publish(args)
     else:
