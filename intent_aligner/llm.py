@@ -271,6 +271,7 @@ def build_invocation(call: LLMCall, home: Path) -> Invocation:
             "claude", "-p",
             "--model", call.model,
             "--effort", call.effort,
+            "--thinking-display", "summarized",
             "--system-prompt", call.system_prompt,
             "--tools", "",
             "--strict-mcp-config",

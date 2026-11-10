@@ -65,6 +65,7 @@ def test_claude_uses_isolated_config_and_borrowed_token(tmp_path: Path, credenti
     assert inv.cwd == tmp_path / "work", inv.cwd
     assert json.loads(inv.argv[inv.argv.index("--json-schema") + 1]) == SCHEMA, inv.argv
     assert inv.argv[inv.argv.index("--effort") + 1] == "low", inv.argv
+    assert inv.argv[inv.argv.index("--thinking-display") + 1] == "summarized", inv.argv
     assert not (tmp_path / "claude" / ".credentials.json").exists()
 
 

@@ -98,6 +98,7 @@ echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.ll
 - `--effort` 可以是 `low`、`medium`、`high` 或 `xhigh`，默认是 `xhigh`。
 - `--stream` 和 `--no-stream` 决定 `hive` 用流式还是整块接收回复，默认是流式，对其他后端没有影响。`--no-stream` 的请求如果超过网关 1200 秒的读取超时，这个槽位就会一直被占着，直到部署重启。`extract` 也有这两个选项。
 - `--schema` 是可选的 JSON schema，给出时回复就是满足它的 JSON。pi 不支持这个参数。
+- Claude 调用显式启用 `--thinking-display summarized`，将可读思考摘要保存在原生 JSONL 中。回放读取其中的 `thinking`、普通回答或 `StructuredOutput`，以及 prompt snapshot 中的系统提示和 schema；空白或被省略的旧 thinking 无法补回。这里保存的是 Claude 返回的摘要，不是完整的原始推理。
 - 调用产生的对话记录只写进 `--home` 指定的目录，默认是工具根目录下的 `llm-home/`。对话记录不会出现在日常使用的 `~/.claude/projects`、`~/.codex/sessions` 或 `~/.pi/agent/sessions` 里。
 
 ### 手动测试端点

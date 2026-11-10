@@ -181,12 +181,12 @@ class Exchange:
 
 
 def read_exchange(path: Path) -> Exchange | None:
-    """A codex or hive transcript; None for the backends whose transcripts lack the request."""
+    """A Codex/Hive request log or a native Claude one-shot transcript with a prompt snapshot."""
     # cast: transcripts are written by intent_aligner.llm, one JSON object per line.
     lines = [cast(dict[str, Any], json.loads(line)) for line in path.read_text().splitlines()]
     request = lines[0] if lines else {}
     if request.get("type") != "request":
-        return None
+        return _claude_exchange(path, lines)
     reply: str | None = None
     reasoning: str | None = None
     summaries: list[str] = []
@@ -216,6 +216,94 @@ def read_exchange(path: Path) -> Exchange | None:
         schema=request.get("json_schema"),
         reply=reply,
         reasoning="\n\n".join(summaries) if summaries else reasoning,
+        usage=usage,
+        finish=finish,
+        ended=datetime.fromtimestamp(path.stat().st_mtime, UTC),
+    )
+
+
+def _claude_exchange(path: Path, lines: list[dict[str, Any]]) -> Exchange | None:
+    """Claude splits one API message into block records with the same usage and message ID.
+
+    The prompt snapshot records the supplied system prompt and StructuredOutput schema;
+    tool-result user messages are not new prompts. Empty or redacted thinking has no
+    readable summary to recover. Signatures are never used as thinking text.
+    """
+    prompt: str | None = None
+    system: str | None = None
+    schema: dict[str, Any] | None = None
+    settings: dict[str, Any] = {"backend": "claude"}
+    texts: list[str] = []
+    summaries: list[str] = []
+    structured: dict[str, Any] | None = None
+    messages: dict[str, dict[str, Any]] = {}
+    finish = "no reply"
+    for line in lines:
+        if line.get("isSidechain"):
+            continue
+        snapshot = line.get("attachment", {})
+        if snapshot.get("type") == "prompt_snapshot":
+            system = "\n\n".join(snapshot["systemPrompt"])
+            for tool in snapshot.get("tools", []):
+                if tool.get("name") == "StructuredOutput":
+                    schema = tool["schema"]["input_schema"]
+        kind = line.get("type")
+        message = line.get("message", {})
+        content = message.get("content", [])
+        if kind == "user" and prompt is None:
+            if isinstance(content, str):
+                prompt = content
+            else:
+                parts = [block["text"] for block in content if block["type"] == "text"]
+                if parts:
+                    prompt = "\n\n".join(parts)
+        if kind != "assistant":
+            continue
+        settings["model"] = line.get("requestedModel", message["model"])
+        if "effort" in line:
+            settings["effort"] = line["effort"]
+        if "usage" in message:
+            messages[message["id"]] = message["usage"]
+        if message.get("stop_reason"):
+            finish = message["stop_reason"]
+        for block in content:
+            if block["type"] == "thinking" and block.get("thinking"):
+                summaries.append(block["thinking"])
+            elif block["type"] == "text":
+                texts.append(block["text"])
+            elif block["type"] == "tool_use" and block["name"] == "StructuredOutput":
+                structured = block["input"]
+    if prompt is None or system is None or "model" not in settings:
+        return None
+    usage: dict[str, Any] = {}
+    for counts in messages.values():
+        for key, value in counts.items():
+            if isinstance(value, int):
+                usage[key] = usage.get(key, 0) + value
+    if messages and all(
+        "thinking_tokens" in m.get("output_tokens_details", {}) for m in messages.values()
+    ):
+        usage["output_tokens_details"] = {
+            "thinking_tokens": sum(
+                m["output_tokens_details"]["thinking_tokens"] for m in messages.values()
+            )
+        }
+    if finish == "end_turn" or (finish == "tool_use" and structured is not None):
+        finish = "stop"
+    elif finish == "max_tokens":
+        finish = "length"
+    reply = "\n\n".join(texts) if texts else None
+    if structured is not None:
+        reply = json.dumps(structured, ensure_ascii=False)
+    return Exchange(
+        path=path,
+        request=settings,
+        model=settings["model"],
+        system=system,
+        prompt=prompt,
+        schema=schema,
+        reply=reply,
+        reasoning="\n\n".join(summaries) if summaries else None,
         usage=usage,
         finish=finish,
         ended=datetime.fromtimestamp(path.stat().st_mtime, UTC),
@@ -390,7 +478,8 @@ def matched_calls(
     found: list[tuple[Exchange, str, str, list[str]]] = []
     others: list[Exchange] = []
     finder = _JobFinder(conversation=conversation)
-    for path in sorted((LLM_HOME / run.backend).glob("*.jsonl")):
+    pattern = "projects/*/*.jsonl" if run.backend == "claude" else "*.jsonl"
+    for path in sorted((LLM_HOME / run.backend).glob(pattern)):
         mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
         if (since and mtime < since) or (until and mtime > until):
             continue
