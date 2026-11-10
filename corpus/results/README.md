@@ -18,11 +18,11 @@
 
 ## `claude-87eeb4bd-qwen-final/`
 
-同一个对话，模型是 Hive 角色 `qwen38-pool`（`pc-qwen38-np6` 的 6 个槽位加 `art-qwen38-np2` 的 2 个槽位，第一级压缩用 8 个并发），思考强度 xhigh，窗口 `--window-rounds 2`，按现行提示词从空图谱重跑。第一级压缩、发言切分和主循环都在这一轮里做，所有调用都用同一个思考上限 `llm.HIVE_THINKING_BUDGET`。这一轮在 hive 请求把 schema 写进系统提示词之前开始，主循环跑到单元 17 时停掉，由 `claude-87eeb4bd-qwen-schema/` 接替；它的第一级压缩是 schema 修复前后对比的原始数据。
+同一个对话，模型是 Hive 角色 `qwen38-27b-pool`（`pc-qwen38-np6` 的 6 个槽位加 `art-qwen38-np2` 的 2 个槽位，第一级压缩用 8 个并发），思考强度 xhigh，窗口 `--window-rounds 2`，按现行提示词从空图谱重跑。第一级压缩、发言切分和主循环都在这一轮里做，所有调用都用同一个思考上限 `llm.HIVE_THINKING_BUDGET`。这一轮在 hive 请求把 schema 写进系统提示词之前开始，主循环跑到单元 17 时停掉，由 `claude-87eeb4bd-qwen-schema/` 接替；它的第一级压缩是 schema 修复前后对比的原始数据。
 
 ## `claude-87eeb4bd-qwen-schema/`
 
-和 `claude-87eeb4bd-qwen-final/` 的模型、窗口和规则相同，hive 请求的系统提示词里带上了 schema。这次运行用来在 Qwen 上验证 `backups/intent-aligner-capped-thinking-rerun-2026-11-09/problem-table.md` 里的改动：调用 C 还会不会把思考顶满，serves 和 responds 怎样使用。
+和 `claude-87eeb4bd-qwen-final/` 的模型、窗口和规则相同，hive 请求的系统提示词里带上了 schema。这次运行用来在 Qwen 上验证 `docs/problem-table.md` 里的改动：调用 C 还会不会把思考顶满，serves 和 responds 怎样使用。
 
 ## `claude-87eeb4bd-sol/`
 
