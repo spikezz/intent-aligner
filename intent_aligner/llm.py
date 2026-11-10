@@ -53,6 +53,7 @@ HIVE_FRAME_URL = os.environ.get("HIVE_FRAME_URL", "http://127.0.0.1:8790").rstri
 # The one thinking cap for every Hive call at every effort, so calls of one run are
 # comparable; window.PROMPT_BUDGET is the np6 slot minus this cap.
 HIVE_THINKING_BUDGET = 10_240
+HIVE_SCHEMA_INTRO = "回答是符合下面这个 JSON schema 的 JSON："
 # The gateway answered 409 to a burst right after a stopped run and accepted the same
 # requests about 40 s later (2026-11-06), so a 409 is waited out before it counts as failure.
 _HIVE_CAPACITY_WAIT = 1800
@@ -404,11 +405,19 @@ def hive_request_body(call: LLMCall, client: dict[str, Any]) -> dict[str, Any]:
 
     `client` is the deployment's `hive.client` entry from the gateway's /v1/models;
     pi builds its Hive model menu from the same entry.
+
+    A schema is also written into the system prompt: response_format only constrains the
+    sampled tokens, so a model that cannot read the schema plans another shape while it thinks
+    and the grammar then cuts its answer short (2026-11-10: 6 of 51 compressions on Qwen3.8
+    wrote `targets` as "[", "..." or the word "targets").
     """
+    system = call.system_prompt
+    if call.json_schema is not None:
+        system += f"\n{HIVE_SCHEMA_INTRO}\n{json.dumps(call.json_schema, ensure_ascii=False)}\n"
     body: dict[str, Any] = {
         "model": call.model,
         "messages": [
-            {"role": "system", "content": call.system_prompt},
+            {"role": "system", "content": system},
             {"role": "user", "content": call.prompt},
         ],
     }

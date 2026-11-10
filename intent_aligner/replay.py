@@ -218,7 +218,10 @@ def read_exchange(path: Path) -> Exchange | None:
         path=path,
         request=_request_settings(request),
         model=request["model"],
-        system=request["system_prompt"],
+        # A hive body carries the system prompt the model read, schema included (llm.hive_request_body).
+        system=request["body"]["messages"][0]["content"]
+        if "body" in request
+        else request["system_prompt"],
         prompt=request["prompt"],
         schema=request.get("json_schema"),
         reply=reply,

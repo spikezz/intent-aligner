@@ -95,7 +95,7 @@ echo "调查清楚 somnia-farm 项目的使用方法" | $PY -m intent_aligner.ll
 ```
 
 - `--backend` 可以是 `claude`、`codex`、`pi` 或 `hive`。`--model` 按对应命令行的写法给出，pi 的写法是 `provider/model-id`，hive 的写法是网关 `/v1/models` 列出的 `deployment/<部署名>`。
-- `hive` 不经过任何 agent 命令行，发给网关的请求里只有系统提示和用户 prompt。网关地址默认是 `http://127.0.0.1:8790`，可以用环境变量 `HIVE_FRAME_URL` 改。思考参数按网关为这个部署声明的模型协议设置：Qwen 模板的模型打开思考，所有 effort 档位都用同一个思考预算 `llm.HIVE_THINKING_BUDGET`；单槽 `window.SLOT_TOKENS` 扣掉这个预算以后，剩下的由 prompt 和答案共用（`window.PROMPT_BUDGET`）。
+- `hive` 不经过任何 agent 命令行，发给网关的请求里只有系统提示和用户 prompt。网关地址默认是 `http://127.0.0.1:8790`，可以用环境变量 `HIVE_FRAME_URL` 改。思考参数按网关为这个部署声明的模型协议设置：Qwen 模板的模型打开思考，所有 effort 档位都用同一个思考预算 `llm.HIVE_THINKING_BUDGET`；单槽 `window.SLOT_TOKENS` 扣掉这个预算以后，剩下的由 prompt 和答案共用（`window.PROMPT_BUDGET`）。给了 `--schema` 时，schema 除了作为 `response_format` 约束输出，还以 `llm.HIVE_SCHEMA_INTRO` 开头写进系统提示的末尾，因为 `response_format` 只约束生成的 token，模型思考时读不到它。
 - `--effort` 可以是 `low`、`medium`、`high` 或 `xhigh`，默认是 `xhigh`。
 - `--stream` 和 `--no-stream` 决定 `hive` 用流式还是整块接收回复，默认是流式，对其他后端没有影响。`--no-stream` 的请求如果超过网关 1200 秒的读取超时，这个槽位就会一直被占着，直到部署重启。`extract` 也有这两个选项。
 - `--schema` 是可选的 JSON schema，给出时回复就是满足它的 JSON。pi 不支持这个参数。

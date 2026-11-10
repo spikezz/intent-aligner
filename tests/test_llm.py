@@ -189,6 +189,14 @@ def test_hive_schema_becomes_response_format() -> None:
     assert body["response_format"]["json_schema"]["schema"] == SCHEMA, body
 
 
+def test_hive_schema_is_also_in_the_system_prompt() -> None:
+    body = hive_request_body(_hive_call(schema=True), QWEN_CLIENT)
+    system = body["messages"][0]["content"]
+
+    assert system.startswith("You are a terse calculator."), system
+    assert f"{llm.HIVE_SCHEMA_INTRO}\n{json.dumps(SCHEMA, ensure_ascii=False)}" in system, system
+
+
 def _listing(*clients: dict[str, object]) -> dict[str, dict[str, Any]]:
     entries: dict[str, dict[str, Any]] = {
         f"deployment/d{n}": {"id": f"deployment/d{n}", "hive": {"client": c}}
