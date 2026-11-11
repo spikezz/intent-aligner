@@ -40,9 +40,9 @@ $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
     --backend hive --model deployment/pc-qwen38-np6 --out $OUT/extract
 ```
 
-第 4 步的一次压缩如果思考达到了上限（`llm.HIVE_THINKING_BUDGET`），就用同一个提示词重新问，因为模型看不到上一次的思考，重新采样就是重试。一次压缩最多问 `compress.MAX_ATTEMPTS` 次，次数和校验不通过的重问共用。如果每一次都达到上限，就保留最后一个能通过校验的回答，并在这条压缩结果里写上 `review_reason`。第 5 步照常使用这样的压缩结果，并把原因记进这个单元的 `capped_reviews`。
+第 4 步的一次压缩如果思考达到了上限（`llm.HIVE_THINKING_BUDGET`），就用同一个提示词重新问，因为模型看不到上一次的思考，重新采样就是重试。一次压缩最多问 `compress.MAX_ATTEMPTS` 次，次数和校验不通过的重问共用。如果每一次都达到上限，就保留最后一个能通过校验的回答，并在这条压缩结果里写上 `review_reason`。如果每一次都达到上限、而且没有一个回答能通过校验，这次压缩就和其他失败一样报错，重跑同一条命令时会再试一次。第 5 步照常使用带 `review_reason` 的压缩结果，并把原因记进这个单元的 `capped_reviews`。
 
-第 5 步的每一次调用（包括切分和放不下时的概括）也一样：思考达到上限就用同一个提示词重新问，一共 3 次仍然达到上限时，采用最后一个能通过校验的回答，把原因写进这个单元的 `capped_reviews` 和 `run.log`（以 `capped in` 开头），然后继续往下跑。如果每一次都达到上限、而且没有一个回答能通过校验，这次压缩就和其他失败一样报错，重跑同一条命令时会再试一次。
+第 5 步的每一次调用（包括切分和放不下时的概括）也一样：思考达到上限就用同一个提示词重新问，一共 3 次仍然达到上限时，采用最后一个能通过校验的回答，把原因写进这个单元的 `capped_reviews` 和 `run.log`（以 `capped in` 开头），然后继续往下跑。如果 3 次顶满的回答都通过不了校验，就按回答不合格处理：用完重答次数仍然不通过时，这个单元标记 `needs_review`。
 
 第 3 步输出的单元有 `user_message`（用户消息全文，附带图片路径）、`ai_text`（AI 对用户说的一段话）、`user_signal`、`tool_call` 和 `observation`。用户消息和 AI 说的话都算发言，用同样的方式处理。
 

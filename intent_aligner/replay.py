@@ -55,7 +55,7 @@ from intent_aligner.llm import (
     qwen_tokens,
 )
 from intent_aligner.segment import Segment
-from intent_aligner.store import IntentNode, Stores
+from intent_aligner.store import IntentNode, Stores, completed
 from intent_aligner.units import (
     SPEAKER_NAMES,
     Item,
@@ -1299,9 +1299,10 @@ def _route(unit: Unit, record: Assignment, stores: Stores) -> list[str]:
         return ["T"]
     actor = unit.speech.speaker if isinstance(unit, SpeechSegment) else "user"
     known = record.topic is not None
+    done = set() if store is None else completed(store.meta.graph)
     has_candidates = store is not None and any(
-        isinstance(node, IntentNode) and node.actor == actor
-        for node in store.meta.graph.nodes.values()
+        isinstance(node, IntentNode) and node.actor == actor and node_id not in done
+        for node_id, node in store.meta.graph.nodes.items()
     )
     if isinstance(unit, SpeechSegment):
         registry = ["B"] if has_candidates else [] if known else ["B?"]

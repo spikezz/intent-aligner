@@ -13,7 +13,7 @@ the oldest tool records of the window into one passage (intent_aligner.window).
 
 Usage: python -m intent_aligner.compress MERGED.jsonl --backend hive
            --model deployment/pc-qwen38-np6 --out DIGESTS.jsonl
-           [--workers 8] [--until UUID]
+           [--workers 6] [--until UUID]
 The output is appended to as digests are made, so a stopped run resumes where it was.
 """
 

@@ -1009,6 +1009,15 @@ ONE_ROUND: list[Item] = [
     _result("c2"),
 ]
 ONE_SEGMENT = {"u1": [_segment(0, 3)]}
+# Both calls are filed before the first result, so the second result can update an
+# aggregate the first one completed.
+TWO_CALLS_THEN_RESULTS: list[Item] = [
+    _user("u1", "第一条"),
+    _call("c1"),
+    _call("c2"),
+    _result("c1"),
+    _result("c2"),
+]
 
 
 def _one_round(
@@ -1016,14 +1025,17 @@ def _one_round(
     outcome: Ask = _no_outcomes,
     aggregate: Ask = _one_aggregate,
     outcome_update: Ask = _no_outcomes_summary,
+    items: list[Item] = ONE_ROUND,
+    registry: Ask = _all_new,
 ) -> tuple[list[Assignment], Stores]:
-    stores = Stores(merged_file="merged.jsonl", items=ONE_ROUND)
+    stores = Stores(merged_file="merged.jsonl", items=items)
     got = _assignments(
-        ONE_ROUND,
+        items,
         ONE_SEGMENT,
         FULL,
         _new_then_first([]),
         aggregate=aggregate,
+        registry=registry,
         stores=stores,
         relation=relation,
         step_relation=relation,
@@ -1040,6 +1052,7 @@ def _edges(stores: Stores) -> list[tuple[str, str, str, str | None]]:
 
 def test_an_update_replaces_the_text_and_the_edges_of_the_aggregates_node() -> None:
     _, stores = _one_round(
+        items=TWO_CALLS_THEN_RESULTS,
         outcome=lambda prompt: '{"outcomes": [{"relation": "satisfies", "target": "G001"}]}',
         outcome_update=lambda prompt: json.dumps(
             {"outcomes": [{"relation": "satisfies", "target": "G001"}], "summary": "合并"}
@@ -1059,6 +1072,7 @@ def test_an_update_replaces_the_text_and_the_edges_of_the_aggregates_node() -> N
 
 def test_an_update_that_no_longer_shows_it_done_puts_the_aggregate_back_to_pending() -> None:
     _, stores = _one_round(
+        items=TWO_CALLS_THEN_RESULTS,
         outcome=lambda prompt: '{"outcomes": [{"relation": "satisfies", "target": "G001"}]}',
     )
 
@@ -1066,6 +1080,60 @@ def test_an_update_that_no_longer_shows_it_done_puts_the_aggregate_back_to_pendi
     assert graph.edges == [], graph.edges
     status = graph_with_status(graph)["nodes"]["G001"]["status"]  # type: ignore[index]
     assert status == "待完成", status
+
+
+_SATISFIES_G001 = '{"outcomes": [{"relation": "satisfies", "target": "G001"}]}'
+
+
+def test_work_after_an_aggregate_is_done_opens_a_new_one_that_call_c_may_link() -> None:
+    seen: list[list[object]] = []
+
+    def aggregate(prompt: str) -> str:
+        candidates = _header(prompt)["candidates"]
+        assert isinstance(candidates, list)
+        seen.append(candidates)
+        return json.dumps({"answers": [{"aggregate": "NEW", "title": "调查项目"}]})
+
+    relation_candidates: list[object] = []
+
+    def relation(prompt: str) -> str:
+        relation_candidates.append(_header(prompt)["candidates"])
+        return '{"edges": []}'
+
+    _, stores = _one_round(
+        outcome=lambda prompt: _SATISFIES_G001, aggregate=aggregate, relation=relation
+    )
+
+    assert seen == [[], []], "a completed aggregate is no candidate of call G"
+    nodes = stores.stores["T001"].meta.graph.nodes
+    assert [i for i, n in nodes.items() if n.type == "aggregate"] == ["G001", "G002"], nodes
+    assert "G001" in str(relation_candidates[-1]), "an edge may still point at a completed node"
+
+
+def test_a_completed_intent_is_no_candidate_of_call_b() -> None:
+    first, second = _said("做第一件事"), _said("再做第一件事")
+    segments = _with_user_intents(first, second)
+    asked: list[object] = []
+
+    def registry(prompt: str) -> str:
+        asked.append(_header(prompt)["candidates"])
+        return _all_new(prompt)
+
+    items: list[Item] = [_user("u1", "第一条"), _call("c1"), _result("c1"), _user("u2", "第二条")]
+    stores = Stores(merged_file="merged.jsonl", items=items)
+    _assignments(
+        items,
+        segments,
+        FULL,
+        _new_then_first([]),
+        stores=stores,
+        registry=registry,
+        outcome=lambda prompt: '{"outcomes": [{"relation": "satisfies", "target": "I001"}]}',
+    )
+
+    assert asked == [], "with I001 done, call B has no candidates and is skipped"
+    nodes = stores.stores["T001"].meta.graph.nodes
+    assert [i for i, n in nodes.items() if n.type == "intent"] == ["I001", "I002"], nodes
 
 
 def test_calls_and_results_are_paired_outside_the_graph() -> None:

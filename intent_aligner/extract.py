@@ -99,6 +99,7 @@ from intent_aligner.store import (
     PendingObservation,
     SpanIntent,
     Stores,
+    completed,
     graph_with_status,
     write_stores,
 )
@@ -182,7 +183,7 @@ A_SCHEMA = {
 B_SYSTEM_PROMPT = """\
 你在把对话里一个单元的意图对照意图注册表：判断每个意图是这个 topic 已经登记的哪一个意图，还是新意图。
 
-<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个单元所属的 topic；unit 是这个单元的类型、发出者和时间；graph 是这个 topic 的意图图谱，nodes 是已经登记的意图（编号、发出者、标准文本），也就是注册表，edges 是它们之间的关系；candidates 是可以回答的已有编号，只包含和这个单元同一发出者的意图：用户的意图只和用户的意图比较，AI 的意图只和 AI 的意图比较。
+<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个单元所属的 topic；unit 是这个单元的类型、发出者和时间；graph 是这个 topic 的意图图谱，nodes 是已经登记的意图（编号、发出者、标准文本），也就是注册表，edges 是它们之间的关系；candidates 是可以回答的已有编号，只包含和这个单元同一发出者、状态为待完成的意图：用户的意图只和用户的意图比较，AI 的意图只和 AI 的意图比较。
 
 <此前的对话> 是这个单元之前的对话。<当前单元> 是这个单元：发言段落给出整次发言，用 <当前段落> 和 </当前段落> 标出这一段；工具调用给出它的意图和操作对象的概括。<本单元的意图> 按顺序列出这个单元的每个意图：编号、文本和原文依据。
 
@@ -194,7 +195,7 @@ B_SYSTEM_PROMPT = """\
 G_SYSTEM_PROMPT = """\
 你在把 AI 一个工具调用的底层意图归入意图聚合。底层意图是具体操作，比如读某个文件的某几行；意图聚合说明一串操作合起来在做什么，它和发言的意图在同一个层级，比如“调查 somnia-farm 的文档和目录结构”“搭建音频分析环境”。
 
-<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个工具调用所属的 topic；unit 是这个单元的类型和时间；graph 是这个 topic 的意图图谱，type 为 intent 的节点是用户或 AI 发言的意图（actor 说明是谁），type 为 aggregate 的节点是已有的意图聚合，label 是它们的标准文本；candidates 是可以回答的已有聚合编号，可以是空列表。
+<header> 是结构化的信息：topics 是已经登记的 topic 列表；current_topic 是这个工具调用所属的 topic；unit 是这个单元的类型和时间；graph 是这个 topic 的意图图谱，type 为 intent 的节点是用户或 AI 发言的意图（actor 说明是谁），type 为 aggregate 的节点是已有的意图聚合，label 是它们的标准文本；candidates 是可以回答的已有聚合编号，只包含待完成的聚合，可以是空列表。
 
 <此前的对话> 是这个工具调用之前的对话。<当前单元> 是这个工具调用的意图和操作对象的概括。<本单元的意图> 按顺序列出这个调用的每个底层意图：编号、文本和原文依据。<此后的对话> 是这个工具调用之后接着发生的事，用来看清这个操作最终是为了做成什么；要回答的只有 <本单元的意图> 里的意图。
 
@@ -1128,9 +1129,14 @@ def _file_under_aggregates(
     """Call G, then call L for each aggregate that has members, then the ids.
 
     NEW answers with the same title share one new aggregate. A new aggregate has no
-    members to match, so it skips call L.
+    members to match, so it skips call L. A completed aggregate is no candidate: work
+    after it opens a new aggregate even when it means the same, and call C may link the
+    two (Spike, 2026-11-11).
     """
-    candidates = [i for i, n in stores.topic_nodes(topic).items() if n.type == "aggregate"]
+    done = completed(stores.stores[topic].meta.graph)
+    candidates = [
+        i for i, n in stores.topic_nodes(topic).items() if n.type == "aggregate" and i not in done
+    ]
     head = _graph_header(step, context, topic, stores, candidates)
     try:
         following = render_following(context.items, step.index, context.digests, context.count)
@@ -1258,13 +1264,15 @@ def _match_intents(
 
     Only what someone stated comes here; a tool call's intents go to call G. The
     candidates are the same actor's, because an AI statement matched to a user intent
-    would leave no trace that the AI said it. With no candidates call B is skipped.
+    would leave no trace that the AI said it, and still to do, because a completed node
+    takes no more units, as in call G. With no candidates call B is skipped.
     """
     actor = _actor(step.unit)
+    done = completed(stores.stores[topic].meta.graph)
     candidates = [
         node_id
         for node_id, node in stores.topic_nodes(topic).items()
-        if isinstance(node, IntentNode) and node.actor == actor
+        if isinstance(node, IntentNode) and node.actor == actor and node_id not in done
     ]
     if not candidates:
         matches = [_Match(match=NEW, complete=True) for _ in intents]

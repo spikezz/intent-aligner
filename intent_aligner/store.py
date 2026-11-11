@@ -191,9 +191,14 @@ def load_store(path: Path) -> TopicStore:
     return TopicStore.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
 
 
+def completed(graph: Graph) -> set[str]:
+    """The intents and aggregates a satisfies edge points at, which the header shows as done."""
+    return {e.to for e in graph.edges if e.relation == "satisfies"}
+
+
 def graph_with_status(graph: Graph) -> dict[str, object]:
     """The graph as a call's header shows it: each intent and aggregate with its status."""
-    done = {e.to for e in graph.edges if e.relation == "satisfies"}
+    done = completed(graph)
     data = graph.model_dump(by_alias=True, exclude_none=True)
     for node_id, node in data["nodes"].items():
         if node["type"] in ("intent", "aggregate"):
