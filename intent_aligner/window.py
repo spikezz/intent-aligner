@@ -49,8 +49,8 @@ class CallDigest(BaseModel):
 
     `intents` are the call's intents for the main loop as well, so each carries its
     evidence in the rendered call text. `review_reason` is set when every attempt hit the
-    thinking cap: the digest is the last capped answer and the main loop marks the call
-    needs_review.
+    thinking cap: the digest is the last capped answer, which the main loop uses and
+    puts up for review.
     """
 
     model_config = ConfigDict(frozen=True)

@@ -48,6 +48,7 @@ import argparse
 import json
 import sys
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
 
@@ -64,11 +65,14 @@ from intent_aligner.intent import INTENT_SCHEMA, Intent, is_excerpt, stray_evide
 from intent_aligner.llm import (
     CALL_SUBJECT,
     CALLS_FILE,
+    CAPPED_ATTEMPTS,
     TRUNCATED_FEEDBACK,
     Ask,
     CallLog,
+    ThinkingCapped,
     TruncatedReply,
     asker,
+    capped_review,
     qwen_tokens,
 )
 from intent_aligner.segment import (
@@ -454,7 +458,9 @@ class Assignment(BaseModel):
     """One line of assignments.jsonl; `topic` is None when the unit is unassigned.
 
     `new_title` is set on the unit that opened its topic. `review_reason` says why a
-    unit needs review; `attempts` counts call T's calls and is 0 when none was made.
+    unit failed and needs review; `capped_reviews` say which answers the unit was built
+    from although their thinking reached the cap, so a human checks a unit that went on.
+    `attempts` counts call T's calls and is 0 when none was made.
     `edges` are the edges this unit set up, their spans filled in when the stores are
     folded. `observations` are the nodes it built: its own, or those its triggers edges
     pointed at. `aggregate_observations` update the nodes of a tool result's aggregates,
@@ -470,6 +476,7 @@ class Assignment(BaseModel):
     intents: list[UnitIntent] = Field(default_factory=list)
     needs_review: bool = False
     review_reason: str | None = None
+    capped_reviews: list[str] = Field(default_factory=list)
     attempts: int
     edges: list[Edge] = Field(default_factory=list)
     observations: list[NewObservation] = Field(default_factory=list)
@@ -711,6 +718,8 @@ def extract_units(
             into_stores(stores, step, record)
         else:
             window = _Round(in_force=compressions, ask=asks.round)
+            if isinstance(step.unit, SpeechSegment):
+                window.capped_reviews.extend(step.unit.segment.capped_reviews)
             CALL_SUBJECT.set(f"unit:{position}")
             record = _assign(step, ref, context, window, call_topics, asks.topic)
             if record.new_title is not None:
@@ -722,6 +731,7 @@ def extract_units(
                 record = _with_intents(step, record, context, window, asks, stores)
                 if record.intents and not record.needs_review:
                     record = _relate(step, record, context, window, asks, stores)
+            record = record.model_copy(update={"capped_reviews": window.capped_reviews})
             into_stores(stores, step, record)
             yield from window.fresh
             yield record
@@ -807,6 +817,8 @@ def _speech_segments(
             window = _Round(in_force=compressions, ask=asks.round)
             start = 0 if known is None else known[-1].end
             segment = _make_segment(index, speech, start, context, window, asks.segment)
+            reviews = [*window.capped_reviews, *segment.capped_reviews]
+            segment = segment.model_copy(update={"capped_reviews": reviews})
             yield from window.fresh
             known = segments.setdefault(uuid, [])
             known.append(segment)
@@ -859,12 +871,14 @@ class _Round:
     """The passages in force around one unit; `fresh` are the ones made for it.
 
     `in_force` is the run's own list, so a passage made for one call of a unit is in
-    force for its later calls and for the units after it.
+    force for its later calls and for the units after it. `capped_reviews` collect the
+    capped answers the unit's calls and passages kept.
     """
 
     in_force: list[ToolCompression]
     ask: Ask
     fresh: list[ToolCompression] = attrs.field(factory=list)
+    capped_reviews: list[str] = attrs.field(factory=list)
 
 
 def _within_budget(
@@ -909,13 +923,11 @@ def _compress_oldest(low: int, index: int, rounds: int, context: _Context, windo
         return False
     lines = [" ".join(round_entry(items[position], digests).split()) for position in batch]
     speeches = [item for item in items[: batch[0]] if isinstance(item, Speech)]
-    summary = summarize_trajectory(
-        speeches[-1] if speeches else None,
-        lines,
-        window.ask,
-        count,
-        f"items {batch[0]} to {batch[-1]}",
+    where = f"items {batch[0]} to {batch[-1]}"
+    summary, reviews = summarize_trajectory(
+        speeches[-1] if speeches else None, lines, window.ask, count, where
     )
+    window.capped_reviews.extend(f"round compression of {where}: {r}" for r in reviews)
     compression = ToolCompression(begin=batch[0], through=batch[-1] + 1, summary=summary)
     window.in_force.append(compression)
     window.fresh.append(compression)
@@ -971,7 +983,7 @@ def _assign(
             raise ValueError(f"{answer.topic!r} 不在 topics 列表里，只能回答列表里的编号或 NEW。")
         return answer
 
-    answer, attempts, feedback = _ask_until_valid(ask, prompt, parse, T_ATTEMPTS)
+    answer, attempts, feedback = _ask_until_valid(ask, prompt, parse, T_ATTEMPTS, window, "T")
     if answer is None:
         return Assignment(
             unit=ref,
@@ -989,25 +1001,46 @@ def _assign(
 
 
 def _ask_until_valid[Answer](
-    ask: Ask, prompt: str, parse: Callable[[str], Answer], attempts: int
+    ask: Ask,
+    prompt: str,
+    parse: Callable[[str], Answer],
+    attempts: int,
+    window: _Round,
+    call: str,
 ) -> tuple[Answer | None, int, str]:
     """The first reply `parse` accepts, the calls made, and the last feedback.
 
     `parse` raises ValueError with what is wrong (a pydantic ValidationError when the
-    reply is not the schema); that message goes back to the model with the prompt. A truncated reply counts
-    as a failed call too.
+    reply is not the schema); that message goes back to the model with the prompt. A
+    truncated reply counts as a failed call too. A reply whose thinking reached the cap
+    is asked again with the same feedback and does not count against `attempts`; after
+    CAPPED_ATTEMPTS of them, or when the failed calls run out, the last capped answer
+    `parse` accepts is returned and `call` goes into the window's capped reviews.
     """
     feedback = ""
-    for attempt in range(1, attempts + 1):
+    kept: tuple[Answer, ThinkingCapped] | None = None
+    made = failures = cuts = 0
+    while failures < attempts and cuts < CAPPED_ATTEMPTS:
+        made += 1
         try:
-            return parse(ask(prompt + feedback)), attempt, ""
+            return parse(ask(prompt + feedback)), made, ""
+        except ThinkingCapped as error:
+            cuts += 1
+            with suppress(ValueError):
+                kept = parse(error.text), error
         except TruncatedReply:
+            failures += 1
             feedback = f"\n\n{TRUNCATED_FEEDBACK}"
         except ValidationError as error:
+            failures += 1
             feedback = f"\n\n你上一次的回答不是要求的 JSON，请重新回答：{error}"
         except ValueError as error:
+            failures += 1
             feedback = f"\n\n你上一次的回答有问题，请重新回答：{error}"
-    return None, attempts, feedback.strip()
+    if kept is None:
+        return None, made, feedback.strip()
+    window.capped_reviews.append(f"call {call}: {capped_review(kept[1])}")
+    return kept[0], made, ""
 
 
 def _with_intents(
@@ -1033,7 +1066,7 @@ def _with_intents(
     elif isinstance(unit, ToolCall):
         digest = context.digests.calls[unit.tool_use_id]
         if digest.review_reason is not None:
-            return _review(record, f"level-1 compression: {digest.review_reason}")
+            window.capped_reviews.append(f"level-1 compression: {digest.review_reason}")
         filed = digest.intents
         return _file_under_aggregates(
             step, record, topic, filed, context, window, asks.aggregate, asks.tool_intent, stores
@@ -1056,7 +1089,9 @@ def _with_intents(
                 )
             return found
 
-        answered, _, feedback = _ask_until_valid(asks.signal, prompt, parse_a, CALL_ATTEMPTS)
+        answered, _, feedback = _ask_until_valid(
+            asks.signal, prompt, parse_a, CALL_ATTEMPTS, window, "A"
+        )
         if answered is None:
             return _review(
                 record, f"call A gave no valid answer in {CALL_ATTEMPTS} attempts: {feedback}"
@@ -1121,7 +1156,7 @@ def _file_under_aggregates(
             raise ValueError("aggregate 为 NEW 时 title 不能为空。")
         return got
 
-    answered, _, feedback = _ask_until_valid(ask, prompt, parse, CALL_ATTEMPTS)
+    answered, _, feedback = _ask_until_valid(ask, prompt, parse, CALL_ATTEMPTS, window, "G")
     if answered is None:
         return _review(
             record, f"call G gave no valid answer in {CALL_ATTEMPTS} attempts: {feedback}"
@@ -1203,7 +1238,7 @@ def _match_tool_intents(
             )
         return got
 
-    answered, _, feedback = _ask_until_valid(ask, prompt, parse, CALL_ATTEMPTS)
+    answered, _, feedback = _ask_until_valid(ask, prompt, parse, CALL_ATTEMPTS, window, "L")
     if answered is None:
         return f"call L gave no valid answer in {CALL_ATTEMPTS} attempts: {feedback}"
     return answered
@@ -1255,7 +1290,7 @@ def _match_intents(
                 )
             return got
 
-        answered, _, feedback = _ask_until_valid(ask, prompt, parse_b, CALL_ATTEMPTS)
+        answered, _, feedback = _ask_until_valid(ask, prompt, parse_b, CALL_ATTEMPTS, window, "B")
         if answered is None:
             return _review(
                 record, f"call B gave no valid answer in {CALL_ATTEMPTS} attempts: {feedback}"
@@ -1324,9 +1359,13 @@ def _relate(
 ) -> Assignment:
     """Call C: the edges of this unit's intents, and a node for each observation they name.
 
-    A unit's intents may relate to each other: "A before B" often opens both at once. A
-    tool call filed under an aggregate that already has a node is asked only for what
+    A tool call filed under an aggregate that already has a node is asked only for what
     this step adds (C_STEP_SYSTEM_PROMPT).
+
+    Two kinds of edge are taken out of the answer and the rest of it is kept: an edge
+    whose two ends come from one speech, and a trigger from an aggregate's own observation
+    into that aggregate. The code recognises both by itself, and asking again only to have
+    the model delete them was 13 of the 87 relation calls of claude-87eeb4bd-qwen-schema.
     """
     topic = record.topic
     assert topic is not None
@@ -1374,23 +1413,20 @@ def _relate(
     shown_input = prompt[prompt.index("<此前的对话>") :]
 
     def parse(reply: str) -> list[_CEdge]:
-        got = _CAnswer.model_validate_json(reply).edges
+        got = [
+            edge
+            for edge in _CAnswer.model_validate_json(reply).edges
+            if len({edge.from_, edge.to} & same_speech) < 2
+            and not (edge.relation == "triggers" and edge.to == own_aggregate.get(edge.from_))
+        ]
         for edge in got:
             ends = (edge.from_, edge.to)
-            if len(set(ends) & same_speech) == 2:
-                raise ValueError(
-                    f"{ends!r} 出自同一次发言。同一次发言里的几个意图之间没有关系，去掉这条边。"
-                )
             if not set(ends) & set(unit_nodes) or not set(ends) & allowed:
                 raise ValueError(f"{ends!r} 必须一端在 unit_intents 里，另一端在 candidates 里。")
             start, end, _ = _C_RELATIONS[edge.relation]
             kinds = tuple("observation" if e in observations else "intent" for e in ends)
             if kinds != (start, end):
                 raise ValueError(f"{edge.relation} 的方向必须是 {start} -> {end}，{ends!r} 不是。")
-            if edge.relation == "triggers" and edge.to == own_aggregate.get(edge.from_):
-                raise ValueError(
-                    f"{edge.from_} 是 {edge.to} 自己的工具调用产生的结果。同一个聚合内部，结果引出下一步操作属于这个聚合本身的推进，去掉这条 triggers 边。"
-                )
             if edge.relation == "responds" and {speakers.get(e) for e in ends} != {"user", "ai"}:
                 raise ValueError(
                     f"responds 只连用户和 AI 之间相互回应的话：{ends!r} 必须一端是用户的意图，另一端是 AI 的意图。"
@@ -1399,7 +1435,7 @@ def _relate(
                 raise ValueError(f"evidence {edge.evidence!r} 不是当前单元或此前对话的原文摘录。")
         return got
 
-    answered, _, feedback = _ask_until_valid(ask, prompt, parse, CALL_ATTEMPTS)
+    answered, _, feedback = _ask_until_valid(ask, prompt, parse, CALL_ATTEMPTS, window, "C")
     if answered is None:
         return _review(
             record, f"call C gave no valid answer in {CALL_ATTEMPTS} attempts: {feedback}"
@@ -1495,7 +1531,7 @@ def _observe(
     if unit.tool_use_id is not None:
         review = context.digests.results[unit.tool_use_id].review_reason
         if review is not None:
-            return failed(f"level-1 compression: {review}")
+            window.capped_reviews.append(f"level-1 compression: {review}")
     topic = record.topic
     if topic is None:
         return failed(record.review_reason or "The tool call that produced this has no topic.")
@@ -1522,7 +1558,12 @@ def _observe(
         except WindowError as error:
             return str(error)
         answered, _, feedback = _ask_until_valid(
-            ask, prompt, lambda r: _parse_outcomes(r, candidates, needs_summary), CALL_ATTEMPTS
+            ask,
+            prompt,
+            lambda r: _parse_outcomes(r, candidates, needs_summary),
+            CALL_ATTEMPTS,
+            window,
+            "D",
         )
         if answered is None:
             return f"call D gave no valid answer in {CALL_ATTEMPTS} attempts: {feedback}"
@@ -1578,12 +1619,14 @@ def into_stores(stores: Stores, step: _Step, record: Assignment) -> None:
     """Register the record's new intents and put the unit's span in its store.
 
     An observation has no span: it goes on a node, or waits as a triggers candidate.
+    A unit with capped reviews puts its span and new observation nodes up for review too.
     """
     unit, topic = step.unit, record.topic
+    review = record.needs_review or bool(record.capped_reviews)
     if topic is not None and topic not in stores.stores:
         stores.open_topic(topic)
     if isinstance(unit, Observation):
-        _add_observations(stores, topic, record)
+        _add_observations(stores, topic, record, review)
         if record.tool_result is not None:
             assert topic is not None and unit.tool_use_id is not None
             stores.add_tool_pair(topic, unit.tool_use_id, record.tool_result)
@@ -1616,17 +1659,14 @@ def into_stores(stores: Stores, step: _Step, record: Assignment) -> None:
     ]
     if isinstance(unit, SpeechSegment):
         segment = unit.segment
-        review = record.needs_review or segment.needs_review
         span = stores.add_speech_text(
-            topic, unit.speech, (segment.start, segment.end), spans, review
+            topic, unit.speech, (segment.start, segment.end), spans, review or segment.needs_review
         )
     elif isinstance(unit, UserSignal):
-        span = stores.add_user_signal(topic, unit, spans, record.needs_review)
+        span = stores.add_user_signal(topic, unit, spans, review)
     else:
-        span = stores.add_tool_call(
-            topic, unit, step.index, spans, frozenset(aggregates), record.needs_review
-        )
-    _add_observations(stores, topic, record)
+        span = stores.add_tool_call(topic, unit, step.index, spans, frozenset(aggregates), review)
+    _add_observations(stores, topic, record, review)
     details = [
         Edge.model_validate(
             {"from": i.id, "to": i.details_of, "relation": "serves", "evidence": i.evidence}
@@ -1639,10 +1679,10 @@ def into_stores(stores: Stores, step: _Step, record: Assignment) -> None:
     )
 
 
-def _add_observations(stores: Stores, topic: str | None, record: Assignment) -> None:
+def _add_observations(stores: Stores, topic: str | None, record: Assignment, review: bool) -> None:
     for built in record.observations:
         stores.add_observation(
-            topic, built.id, built.label, built.source, review=built.needs_review
+            topic, built.id, built.label, built.source, review=review or built.needs_review
         )
         stores.pending.pop(built.item, None)
 
@@ -1777,9 +1817,10 @@ def log_lines(assignment: Assignment) -> list[str]:
         lines.append(f"new topic {assignment.topic}: {assignment.new_title} (opened by {where})")
     if assignment.placeholder:
         lines.append(f"whole speech has no intent, placeholder span: {where}")
+    place = assignment.topic or "unassigned"
     if assignment.review_reason is not None:
-        place = assignment.topic or "unassigned"
         lines.append(f"needs_review in {place}: {where}: {assignment.review_reason}")
+    lines.extend(f"capped in {place}: {where}: {r}" for r in assignment.capped_reviews)
     return lines
 
 
@@ -1811,7 +1852,15 @@ def main() -> None:
 
     def ask(name: str, system: str, schema: dict[str, Any]) -> Ask:
         return asker(
-            args.backend, args.model, args.effort, system, schema, args.stream, calls, name
+            args.backend,
+            args.model,
+            args.effort,
+            system,
+            schema,
+            args.stream,
+            calls,
+            name,
+            refuse_capped=True,
         )
 
     asks = Asks(

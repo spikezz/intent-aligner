@@ -23,10 +23,17 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from intent_aligner.intent import INTENT_SCHEMA, Intent, stray_evidence
-from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, TruncatedReply
+from intent_aligner.llm import (
+    CAPPED_ATTEMPTS,
+    TRUNCATED_FEEDBACK,
+    Ask,
+    ThinkingCapped,
+    TruncatedReply,
+    capped_review,
+)
 from intent_aligner.units import SPEAKER_NAMES, Item, Speech
 from intent_aligner.window import PROMPT_BUDGET, Count, Digests, ToolCompression, window_text
 
@@ -75,7 +82,12 @@ class SegmentAnswer(BaseModel):
 
 
 class Segment(BaseModel):
-    """Characters [start, end) of the message body, with the intents the model gave."""
+    """Characters [start, end) of the message body, with the intents the model gave.
+
+    `needs_review` marks a segment the model could not place. `capped_reviews` are the
+    reasons a placed segment still wants a human's look: an answer it rests on, its own or
+    a round compression's, was kept although its thinking reached the cap.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -85,6 +97,7 @@ class Segment(BaseModel):
     intents: list[Intent]
     attempts: int
     needs_review: bool = False
+    capped_reviews: list[str] = Field(default_factory=list)
 
 
 class MessageSegments(BaseModel):
@@ -171,20 +184,33 @@ def build_prompt(header: str, window: str, message: Speech, start: int, feedback
 def next_segment(header: str, window: str, message: Speech, start: int, ask: Ask) -> Segment:
     """The segment at the pointer `start`; `ask` sends one prompt and returns the reply text.
 
-    A segment still not located after MAX_ATTEMPTS calls takes the rest of the body
-    as one `needs_review` segment, because the pointer cannot move past it.
+    A reply whose thinking reached the cap is asked again with the same feedback, up to
+    CAPPED_ATTEMPTS such replies; the last capped one that places a segment is then kept
+    with a capped review. A segment still not located after MAX_ATTEMPTS failed calls
+    takes the rest of the body as one `needs_review` segment, because the pointer cannot
+    move past it.
     """
     feedback = ""
     from_start = False
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    kept: Segment | None = None
+    attempt = failures = cuts = 0
+    while failures < MAX_ATTEMPTS and cuts < CAPPED_ATTEMPTS:
+        attempt += 1
+        capped: ThinkingCapped | None = None
         try:
-            answer = SegmentAnswer.model_validate_json(
-                ask(build_prompt(header, window, message, start, feedback))
-            )
-            end = locate_end(message.body, start, answer.segment_end, from_start=from_start)
+            reply = ask(build_prompt(header, window, message, start, feedback))
         except TruncatedReply:
+            failures += 1
             feedback = TRUNCATED_FEEDBACK
             continue
+        except ThinkingCapped as error:
+            cuts += 1
+            reply, capped = error.text, error
+        # Counted before it is checked: an uncapped reply that places a segment returns.
+        failures += capped is None
+        try:
+            answer = SegmentAnswer.model_validate_json(reply)
+            end = locate_end(message.body, start, answer.segment_end, from_start=from_start)
         except ValidationError as error:
             feedback = f"回答不符合要求：{error}"
             continue
@@ -202,14 +228,19 @@ def next_segment(header: str, window: str, message: Speech, start: int, ask: Ask
                 "并且按原文的先后顺序排列。"
             )
             continue
-        return Segment(start=start, end=end, text=text, intents=answer.intents, attempts=attempt)
+        segment = Segment(start=start, end=end, text=text, intents=answer.intents, attempts=attempt)
+        if capped is None:
+            return segment
+        kept = segment.model_copy(update={"capped_reviews": [capped_review(capped)]})
+    if kept is not None:
+        return kept.model_copy(update={"attempts": attempt})
     print(
         f"needs_review: segment at char {start} of message {message.source.uuid} was not "
-        f"located in {MAX_ATTEMPTS} attempts; last feedback: {feedback}",
+        f"located in {attempt} attempts; last feedback: {feedback}",
         file=sys.stderr,
         flush=True,
     )
-    return review_segment(message, start, MAX_ATTEMPTS)
+    return review_segment(message, start, attempt)
 
 
 def review_segment(message: Speech, start: int, attempts: int) -> Segment:

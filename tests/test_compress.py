@@ -118,11 +118,11 @@ def test_a_call_that_leaves_no_room_for_its_result_fails_with_its_id() -> None:
 
 def test_a_long_trajectory_is_summarized_again() -> None:
     rounds = _Script(_round_answer(""), _round_answer(""), _round_answer(""))
-    summary = summarize_trajectory(
+    summary, reviews = summarize_trajectory(
         _user("u1", "做"), ["意" * (PROMPT_BUDGET // 2)] * 2, rounds, len, "r"
     )
 
-    assert summary == "看了目录", summary
+    assert (summary, reviews) == ("看了目录", []), (summary, reviews)
     assert "（第 2/2 段）" in rounds.prompts[1], rounds.prompts[1][:60]
     assert (
         rounds.prompts[2] == "<发言>（用户）\n做\n</发言>\n<轨迹>\n看了目录\n看了目录\n</轨迹>"
@@ -220,6 +220,14 @@ def test_a_result_capped_on_every_attempt_is_marked_for_review() -> None:
     result = next(d for d in made if isinstance(d, ResultDigest))
     assert result.summaries == ["列出了文件"], result
     assert "chunk 1/1" in (result.review_reason or ""), result
+
+
+def test_a_trajectory_capped_on_every_attempt_keeps_its_passage_for_review() -> None:
+    rounds = _Script(*[_capped(_round_answer(""))] * compress.MAX_ATTEMPTS)
+    summary, reviews = summarize_trajectory(None, ["一行"], rounds, len, "r")
+
+    assert summary == "看了目录" and len(reviews) == 1, (summary, reviews)
+    assert "capped.jsonl" in reviews[0], reviews
 
 
 def test_capped_answers_that_never_validate_fail_the_job() -> None:

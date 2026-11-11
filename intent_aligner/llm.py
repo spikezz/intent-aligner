@@ -157,6 +157,19 @@ class ThinkingCapped(LLMError):
         self.text = text
 
 
+# Calls one prompt gets whose thinking reaches the cap; then the last capped answer is
+# kept and marked for a human's review, so one hard prompt does not stop the run.
+CAPPED_ATTEMPTS = 3
+
+
+def capped_review(error: ThinkingCapped) -> str:
+    """The review reason of a kept answer whose thinking reached the cap."""
+    return (
+        f"no call gave a valid answer within the {HIVE_THINKING_BUDGET:,}-token thinking cap; "
+        f"the last capped answer is kept, see {error.transcript}"
+    )
+
+
 TRUNCATED_FEEDBACK = (
     "你上一次的思考和回答超出了长度上限，没有写完。请直接给出答案，不要反复核对同一处细节。"
 )

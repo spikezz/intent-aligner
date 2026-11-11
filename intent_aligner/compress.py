@@ -2,8 +2,8 @@
 
 The call becomes its intents and what it acts on, the result one sentence per chunk,
 read against the call's intents and full text. A reply whose thinking reached the cap is
-asked again; when all MAX_ATTEMPTS hit it, the last capped answer is kept and the digest
-is marked for review. The call's intents, each with evidence
+asked again; when no attempt gives an uncapped answer, the last capped answer is kept and
+the digest is marked for review. The call's intents, each with evidence
 in the call text, are also the intents the main loop records for the call, so it does
 not ask for them again. A call and its result are one job; jobs read nothing of the
 conversation around them and run in parallel.
@@ -33,7 +33,6 @@ from intent_aligner.intent import INTENT_SCHEMA, Intent, stray_evidence
 from intent_aligner.llm import (
     CALL_SUBJECT,
     CALLS_FILE,
-    HIVE_THINKING_BUDGET,
     TRUNCATED_FEEDBACK,
     Ask,
     CallLog,
@@ -41,6 +40,7 @@ from intent_aligner.llm import (
     ThinkingCapped,
     TruncatedReply,
     asker,
+    capped_review,
     qwen_tokens,
 )
 from intent_aligner.units import (
@@ -262,11 +262,12 @@ def _compress_result(
 
 def summarize_trajectory(
     speech: Speech | None, trajectory: list[str], ask: Ask, count: Count, where: str
-) -> str:
+) -> tuple[str, list[str]]:
     """One passage for `trajectory`, the level-one lines of consecutive tool records.
 
     `ask` must carry ROUND_SYSTEM_PROMPT and SUMMARY_SCHEMA; `where` names the records
-    in the errors raised. Raises WindowError when the speech leaves no room for them.
+    in the errors raised. The list holds the review reasons of capped answers the passage
+    was made from. Raises WindowError when the speech leaves no room for them.
     """
     head = _speech_block(speech, count)
     room = PROMPT_BUDGET - count(ROUND_SYSTEM_PROMPT) - count(head) - FEEDBACK_ROOM - LABEL_ROOM
@@ -276,15 +277,19 @@ def summarize_trajectory(
             f"({room} tokens after the system prompt and the speech)"
         )
     lines = trajectory
+    reviews = []
     while True:
         parts = chunks("\n".join(lines), room, count)
         summaries = []
         for number, part in enumerate(parts, 1):
             label = f"（第 {number}/{len(parts)} 段）" if len(parts) > 1 else ""
             prompt = f"{head}<轨迹>{label}\n{part}\n</轨迹>"
-            summaries.append(_ask_until_valid(ask, prompt, _SummaryAnswer, where)[0].summary)
+            answer, review = _ask_until_valid(ask, prompt, _SummaryAnswer, where)
+            summaries.append(answer.summary)
+            if review is not None:
+                reviews.append(review)
         if len(summaries) == 1:
-            return summaries[0]
+            return summaries[0], reviews
         lines = [" ".join(summary.split()) for summary in summaries]
 
 
@@ -346,22 +351,19 @@ def _ask_until_valid[Answer: BaseModel](
     its earlier thinking, so a fresh sample is the retry.
     """
     feedback = ""
-    capped: Answer | None = None
+    capped: tuple[Answer, ThinkingCapped] | None = None
     for _ in range(MAX_ATTEMPTS):
         try:
             return schema.model_validate_json(ask(prompt + feedback), context=context), None
         except ThinkingCapped as error:
             with suppress(ValidationError):
-                capped = schema.model_validate_json(error.text, context=context)
+                capped = schema.model_validate_json(error.text, context=context), error
         except TruncatedReply:
             feedback = f"\n\n{TRUNCATED_FEEDBACK}"
         except ValidationError as error:
             feedback = f"\n\n你上一次的回答不符合要求，请重新回答：{error}"
     if capped is not None:
-        return capped, (
-            f"the thinking reached the {HIVE_THINKING_BUDGET:,}-token cap in {MAX_ATTEMPTS} "
-            "attempts; the last capped answer is kept"
-        )
+        return capped[0], capped_review(capped[1])
     raise LLMError(f"No valid digest for {tool_use_id} in {MAX_ATTEMPTS} attempts: {feedback}")
 
 

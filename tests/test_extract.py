@@ -13,6 +13,7 @@ import yaml
 from intent_aligner.extract import (
     CALL_ATTEMPTS,
     FEEDBACK_ROOM,
+    G_SYSTEM_PROMPT,
     T_ATTEMPTS,
     T_SYSTEM_PROMPT,
     Asks,
@@ -25,7 +26,13 @@ from intent_aligner.extract import (
     write_topic_files,
 )
 from intent_aligner.intent import Intent
-from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, TruncatedReply
+from intent_aligner.llm import (
+    CAPPED_ATTEMPTS,
+    TRUNCATED_FEEDBACK,
+    Ask,
+    ThinkingCapped,
+    TruncatedReply,
+)
 from intent_aligner.segment import MessageSegments, Segment
 from intent_aligner.store import (
     UNASSIGNED_FILE,
@@ -816,7 +823,10 @@ def _heavy_results(text: str) -> int:
 
 
 def _long_run(
-    round_prompts: list[str], t_prompts: list[str], compressed: list[ToolCompression] | None = None
+    round_prompts: list[str],
+    t_prompts: list[str],
+    compressed: list[ToolCompression] | None = None,
+    aggregate: Ask = _one_aggregate,
 ) -> list[Assignment | ToolCompression]:
     def ask_round(prompt: str) -> str:
         round_prompts.append(prompt)
@@ -826,7 +836,7 @@ def _long_run(
         topic=_new_then_first(t_prompts),
         signal=_no_signal_intents,
         registry=_all_new,
-        aggregate=_one_aggregate,
+        aggregate=aggregate,
         tool_intent=_no_repeats,
         relation=_no_edges,
         step_relation=_no_edges,
@@ -862,7 +872,7 @@ def test_the_oldest_records_are_compressed_only_when_the_prompt_would_not_fit(
     before = [p for p in t_prompts if "已压缩" not in p]
     used = _heavy_results(T_SYSTEM_PROMPT) + _heavy_results(before[-1])
     assert used <= budget, f"the last uncompressed prompt must fit: {used:,}"
-    assert used + 1000 > budget - 100, f"compressed too early: {used:,} of {budget:,} used"
+    assert used + PROMPT_BUDGET // 9 > budget, f"one more result would still have fit: {used:,}"
 
 
 def test_the_passage_replaces_only_tool_records() -> None:
@@ -910,23 +920,25 @@ def test_earlier_passages_count_against_the_budget(no_following: None) -> None:
     used = _heavy_results(T_SYSTEM_PROMPT) + _heavy_results(with_first_only[-1])
 
     assert used <= budget, f"the last prompt before the second compression must fit: {used:,}"
-    assert used + 1000 > budget - 100, (
+    assert used + PROMPT_BUDGET // 9 > budget, (
         f"second compression too early: {used:,} of {budget:,} used with passage 1 counted"
     )
 
 
-def test_what_call_g_sees_ahead_counts_against_the_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def first_compression() -> int:
-        events = _long_run([], [])
-        return next(i for i, e in enumerate(events) if isinstance(e, ToolCompression))
+def test_what_call_g_sees_ahead_counts_against_the_budget() -> None:
+    g_prompts: list[str] = []
 
-    with_following = first_compression()
-    monkeypatch.setattr("intent_aligner.extract.render_following", lambda *_: "")
-    without = first_compression()
+    def aggregate(prompt: str) -> str:
+        g_prompts.append(prompt)
+        return _one_aggregate(prompt)
 
-    assert with_following < without, f"{with_following} vs {without}"
+    _long_run([], [], aggregate=aggregate)
+    budget = PROMPT_BUDGET - FEEDBACK_ROOM
+    ahead = [p for p in g_prompts if "【工具结果】" in p.split("<此后的对话>")[1]]
+    used = [_heavy_results(G_SYSTEM_PROMPT) + _heavy_results(p) for p in ahead]
+
+    assert all(u <= budget for u in used), f"a prompt with what follows must fit: {used}"
+    assert max(used) + PROMPT_BUDGET // 9 > budget, f"never near the budget: {max(used):,}"
 
 
 def test_call_g_alone_sees_what_follows_the_unit() -> None:
@@ -1123,21 +1135,21 @@ def test_a_call_that_joins_an_existing_aggregate_is_asked_only_for_its_step() ->
     assert asked == [("relation", "G001"), ("step_relation", "G001")], asked
 
 
-def test_call_c_retries_a_trigger_into_the_aggregate_that_produced_the_observation() -> None:
+def test_call_c_drops_a_trigger_into_the_aggregate_that_produced_the_observation() -> None:
     prompts: list[str] = []
 
     def relation(prompt: str) -> str:
         prompts.append(prompt)
-        if "O001" not in prompt or len(prompts) > 2:
+        if "O001" not in prompt:
             return '{"edges": []}'
         edge = {"from": "O001", "to": "G001", "relation": "triggers", "evidence": "结果c1"}
         return json.dumps({"edges": [edge]})
 
     got, stores = _one_round(relation=relation)
 
-    assert "自己的工具调用产生的结果" in prompts[2], prompts[2]
+    assert not any("请重新回答" in p for p in prompts), "dropping the edge must not ask again"
     assert not any(a.needs_review for a in got), got
-    assert _edges(stores) == [], "the rejected edge must not be stored"
+    assert _edges(stores) == [], "the dropped edge must not be stored"
 
 
 def test_call_c_retries_an_edge_against_the_direction_of_its_relation() -> None:
@@ -1265,7 +1277,7 @@ def test_call_c_does_not_offer_or_keep_an_edge_between_intents_of_one_speech() -
     )
 
     assert _header(prompts[1])["candidates"] == [], _header(prompts[1])["candidates"]
-    assert "出自同一次发言" in prompts[2], prompts[2]
+    assert len(prompts) == 2, "dropping the edge must not ask again"
     assert _edges(stores) == [], _edges(stores)
 
 
@@ -1333,23 +1345,74 @@ def test_a_message_without_intents_is_logged_as_a_placeholder() -> None:
     assert any("placeholder" in line for line in log_lines(got[0])), got
 
 
-def test_a_call_whose_compression_needs_review_is_marked_without_call_l() -> None:
+def test_a_call_whose_compression_was_capped_keeps_its_intents_for_review() -> None:
     capped = FULL.calls["c1"].model_copy(update={"review_reason": "capped"})
     digests = Digests(calls={**FULL.calls, "c1": capped}, results=FULL.results)
 
-    got = _assignments(TIMELINE, SEGMENTS, digests, _new_then_first([]), tool_intent=_not_asked)
+    got = _assignments(TIMELINE, SEGMENTS, digests, _new_then_first([]))
     call = next(a for a in got if a.unit.uuid == "c1")
 
-    assert (call.needs_review, call.intents) == (True, []), call
-    assert call.review_reason == "level-1 compression: capped", call
+    assert not call.needs_review and call.intents, call
+    assert call.capped_reviews == ["level-1 compression: capped"], call
 
 
-def test_a_result_whose_compression_needs_review_leaves_a_needs_review_node() -> None:
+def test_a_result_whose_compression_was_capped_still_updates_its_aggregate() -> None:
     capped = FULL.results["c1"].model_copy(update={"review_reason": "capped"})
     digests = Digests(calls=FULL.calls, results={**FULL.results, "c1": capped})
 
     got = _assignments(TIMELINE, SEGMENTS, digests, _new_then_first([]))
     result = next(a for a in got if a.unit.uuid == "r-c1")
 
-    assert result.needs_review and [o.needs_review for o in result.observations] == [True], result
-    assert result.review_reason == "level-1 compression: capped", result
+    assert not result.needs_review and result.aggregate_observations, result
+    assert result.capped_reviews == ["level-1 compression: capped"], result
+
+
+def _capped_first(times: int) -> tuple[Ask, list[str]]:
+    """Call T whose first `times` replies reached the thinking cap, each still answering NEW."""
+    prompts: list[str] = []
+    answer = json.dumps({"topic": "NEW", "title": "事"})
+
+    def ask(prompt: str) -> str:
+        prompts.append(prompt)
+        if len(prompts) <= times:
+            raise ThinkingCapped("capped", answer, Path(f"capped-{len(prompts)}.jsonl"))
+        return _new_then_first([])(prompt)
+
+    return ask, prompts
+
+
+def test_a_capped_reply_is_asked_again_with_the_same_prompt() -> None:
+    ask, prompts = _capped_first(1)
+    first = _run(ask)[0]
+
+    assert prompts[0] == prompts[1], prompts[:2]
+    assert (first.attempts, first.capped_reviews) == (2, []), first
+
+
+def test_an_answer_capped_on_every_call_is_kept_and_the_run_goes_on() -> None:
+    ask, prompts = _capped_first(CAPPED_ATTEMPTS)
+    got = _run(ask)
+    first = got[0]
+
+    assert len(set(prompts[:CAPPED_ATTEMPTS])) == 1, prompts[:CAPPED_ATTEMPTS]
+    assert (first.topic, first.needs_review, first.attempts) == ("T001", False, 3), first
+    assert len(first.capped_reviews) == 1, first
+    assert first.capped_reviews[0].startswith("call T: "), first.capped_reviews
+    assert "capped-3.jsonl" in first.capped_reviews[0], "the review points at the last capped call"
+    assert any(line.startswith("capped in T001: ") for line in log_lines(first)), log_lines(first)
+    assert all(a.topic == "T001" for a in got), "the units after it run as usual"
+
+
+def test_a_capped_answer_that_does_not_parse_is_not_kept() -> None:
+    prompts: list[str] = []
+
+    def ask(prompt: str) -> str:
+        prompts.append(prompt)
+        if len(prompts) <= CAPPED_ATTEMPTS:
+            raise ThinkingCapped("capped", "不是 JSON", Path("capped.jsonl"))
+        return _new_then_first([])(prompt)
+
+    first = _run(ask)[0]
+
+    assert first.topic is None and first.needs_review, first
+    assert first.capped_reviews == [], first

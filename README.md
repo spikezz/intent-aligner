@@ -40,7 +40,9 @@ $PY -m intent_aligner.extract corpus/merged/claude-5a1f0c1a.jsonl \
     --backend hive --model deployment/pc-qwen38-np6 --out $OUT/extract
 ```
 
-第 4 步的一次压缩如果思考达到了上限（`llm.HIVE_THINKING_BUDGET`），就用同一个提示词重新问，因为模型看不到上一次的思考，重新采样就是重试。一次压缩最多问 `compress.MAX_ATTEMPTS` 次，次数和校验不通过的重问共用。如果每一次都达到上限，就保留最后一个能通过校验的回答，并在这条压缩结果里写上 `review_reason`。第 5 步遇到这样的工具调用时把它标成 `needs_review`，不再归入聚合；遇到这样的结果时，给它建一个 `needs_review` 的观测节点。如果每一次都达到上限、而且没有一个回答能通过校验，这次压缩就和其他失败一样报错，重跑同一条命令时会再试一次。
+第 4 步的一次压缩如果思考达到了上限（`llm.HIVE_THINKING_BUDGET`），就用同一个提示词重新问，因为模型看不到上一次的思考，重新采样就是重试。一次压缩最多问 `compress.MAX_ATTEMPTS` 次，次数和校验不通过的重问共用。如果每一次都达到上限，就保留最后一个能通过校验的回答，并在这条压缩结果里写上 `review_reason`。第 5 步照常使用这样的压缩结果，并把原因记进这个单元的 `capped_reviews`。
+
+第 5 步的每一次调用（包括切分和放不下时的概括）也一样：思考达到上限就用同一个提示词重新问，一共 3 次仍然达到上限时，采用最后一个能通过校验的回答，把原因写进这个单元的 `capped_reviews` 和 `run.log`（以 `capped in` 开头），然后继续往下跑。如果每一次都达到上限、而且没有一个回答能通过校验，这次压缩就和其他失败一样报错，重跑同一条命令时会再试一次。
 
 第 3 步输出的单元有 `user_message`（用户消息全文，附带图片路径）、`ai_text`（AI 对用户说的一段话）、`user_signal`、`tool_call` 和 `observation`。用户消息和 AI 说的话都算发言，用同样的方式处理。
 
@@ -50,7 +52,7 @@ N 由第 5 步的 `--window-rounds` 设定，默认值是 2。回放从 `run.sh`
 
 切分时，模型重试几次仍然定位不到段落结尾，或者连一轮对话都放不进窗口时，剩下的文本成为一段 `needs_review: true`、意图为空的段落，原因打印在标准错误里。
 
-第 5 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（发言和用户信号的意图节点、工具调用的意图聚合节点、聚合的观测节点、其他观测节点、边、成对存放的工具调用和结果，以及段落；意图节点的 `actor` 标明是用户的还是 AI 的）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic、整次没有意图的发言和 `needs_review` 单元的 `run.log`，以及 `tool_compressions.jsonl`：模型看到的内容放不下时，最旧的一批工具操作会压缩成一段话，较新的保持逐条，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
+第 5 步在 `--out` 目录下写出 `assignments.jsonl`（每个单元一行：单元的位置和它的 topic 编号，判断不出时为 null 并标记 `needs_review`）、`topics.yaml`、每个 topic 一个 `topics/<topic 编号>.yaml`（发言和用户信号的意图节点、工具调用的意图聚合节点、聚合的观测节点、其他观测节点、边、成对存放的工具调用和结果，以及段落；意图节点的 `actor` 标明是用户的还是 AI 的）、topic 判断不出的单元所在的 `topics/unassigned.yaml`，记录新 topic、整次没有意图的发言、`needs_review` 单元和采用了思考顶满回答的单元的 `run.log`，以及 `tool_compressions.jsonl`：模型看到的内容放不下时，最旧的一批工具操作会压缩成一段话，较新的保持逐条，每次压缩的结果记在这里。中断后重跑会从下一个单元继续。
 
 第 1 步完成后，`corpus/index.json` 会列出每个合并后的对话，包括成员 session、记录条数、丢弃的 fork 复制品数量，以及损坏的行。
 

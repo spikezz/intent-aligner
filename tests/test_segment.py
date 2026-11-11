@@ -6,11 +6,19 @@ import doctest
 import json
 import re
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from intent_aligner import segment
-from intent_aligner.llm import TRUNCATED_FEEDBACK, Ask, LLMError, TruncatedReply
+from intent_aligner.llm import (
+    CAPPED_ATTEMPTS,
+    TRUNCATED_FEEDBACK,
+    Ask,
+    LLMError,
+    ThinkingCapped,
+    TruncatedReply,
+)
 from intent_aligner.segment import (
     AnchorError,
     Segment,
@@ -174,6 +182,26 @@ def test_an_inferred_intent_without_grounds_is_retried() -> None:
     assert segments[0].attempts == 2, segments[0]
     assert segments[0].intents[0].note == "此前 AI 在排查 blocked 任务", segments[0]
     assert "note 必须写推断依据" in script.prompts[1], script.prompts[1]
+
+
+def _capped(answer: str) -> ThinkingCapped:
+    return ThinkingCapped("capped", answer, Path("capped.jsonl"))
+
+
+def test_a_capped_segment_is_asked_again_with_the_same_prompt() -> None:
+    script = _Script(_capped(_answer("好的。")), _answer("好的。"))
+    segments = segment_message("", _message("好的。"), script)
+
+    assert script.prompts[0] == script.prompts[1], script.prompts
+    assert (segments[0].attempts, segments[0].capped_reviews) == (2, []), segments[0]
+
+
+def test_a_segment_capped_on_every_call_keeps_its_last_answer_for_review() -> None:
+    script = _Script(*[_capped(_answer("好的。"))] * CAPPED_ATTEMPTS)
+    segments = segment_message("", _message("好的。"), script)
+
+    assert (segments[0].text, segments[0].needs_review) == ("好的。", False), segments[0]
+    assert segments[0].intents and len(segments[0].capped_reviews) == 1, segments[0]
 
 
 def test_unlocatable_segment_takes_the_rest_for_review() -> None:
