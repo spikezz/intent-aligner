@@ -1185,6 +1185,56 @@ def test_call_c_keeps_responds_between_user_and_ai_and_retries_it_between_two_us
     assert [e[:3] for e in _edges(stores)] == [("I002", "I001", "responds")], _edges(stores)
 
 
+def test_call_c_keeps_responds_from_a_user_signal_to_the_ai() -> None:
+    interrupt = UserSignal(
+        source=_source("s1"),
+        signal="interrupt",
+        text="[Request interrupted by user]",
+        tool_use_id=None,
+    )
+    timeline: list[Item] = [
+        _user("u1", "第一条"),
+        AIText(source=_source("a1"), text="第二条"),
+        interrupt,
+    ]
+    said = Intent(text="说话", evidence="第", explicit=True, note="")
+    segments = {
+        u: [Segment(start=0, end=3, text="", intents=[said], attempts=1)] for u in ("u1", "a1")
+    }
+    stores = Stores(merged_file="merged.jsonl", items=timeline)
+    prompts: list[str] = []
+
+    def signal(prompt: str) -> str:
+        intent = {"text": "停下", "evidence": "Request interrupted", "explicit": True, "note": ""}
+        return json.dumps({"intents": [intent]})
+
+    def relation(prompt: str) -> str:
+        prompts.append(prompt)
+        unit = re.findall(r'"unit_intents":\s*\[\{"id":\s*"(\w+)"', prompt)[0]
+        if unit != "I003":
+            return '{"edges": []}'
+        edge = {
+            "from": unit,
+            "to": "I002",
+            "relation": "responds",
+            "evidence": "Request interrupted",
+        }
+        return json.dumps({"edges": [edge]})
+
+    got = _assignments(
+        timeline,
+        segments,
+        FULL,
+        _new_then_first([]),
+        signal=signal,
+        stores=stores,
+        relation=relation,
+    )
+
+    assert not any(a.needs_review for a in got), [a.review_reason for a in got]
+    assert [e[:3] for e in _edges(stores)] == [("I003", "I002", "responds")], _edges(stores)
+
+
 def test_call_c_does_not_offer_or_keep_an_edge_between_intents_of_one_speech() -> None:
     timeline: list[Item] = [_user("u1", "第一条第二条")]
     said = Intent(text="做事", evidence="第", explicit=True, note="")

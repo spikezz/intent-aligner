@@ -1368,8 +1368,8 @@ def _relate(
     observations = {i for i, n in known.items() if isinstance(n, _OBSERVATION_NODES)} | set(pending)
     allowed = {*linkable, *pending}
     speakers = {i: n.actor for i, n in known.items() if isinstance(n, IntentNode)}
-    if isinstance(step.unit, SpeechSegment):
-        speakers |= {i: step.unit.speech.speaker for i in unit_nodes if i not in speakers}
+    if isinstance(step.unit, SpeechSegment | UserSignal):
+        speakers |= {i: _actor(step.unit) for i in unit_nodes if i not in speakers}
     source = _unit_source(step.unit)
     shown_input = prompt[prompt.index("<此前的对话>") :]
 
