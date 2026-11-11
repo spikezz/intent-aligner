@@ -1,6 +1,6 @@
 # 轨迹提取器：概念与存储格式
 
-本文档定义轨迹提取器的概念、存储格式、关系类型和判断原则；提取流程（处理单元、context 组装、LLM 调用和校验）定义在 `docs/workflow.md`。topic 列表 `playground/topics.yaml` 和各个 topic 存储文件 `playground/topics/<topic 编号>.yaml` 的结构以本文档为准，自动提取写到 `--out` 目录下的 `topics.yaml` 和 `topics/` 用的是同样的结构；存储文件、代码或提示词和这两份文档冲突时，先改文档，再改它们。
+本文档定义轨迹提取器的概念、存储格式、关系类型和判断原则；提取流程（处理单元、context 组装、LLM 调用和校验）定义在 `docs/workflow.md`。地图抽出来以后怎样使用、怎样在使用中修正，以及由此对抽取提出的约束，定义在 `docs/map-usage.md`。topic 列表 `playground/topics.yaml` 和各个 topic 存储文件 `playground/topics/<topic 编号>.yaml` 的结构以本文档为准，自动提取写到 `--out` 目录下的 `topics.yaml` 和 `topics/` 用的是同样的结构；存储文件、代码或提示词和这两份文档冲突时，先改文档，再改它们。
 
 轨迹提取器的工作方式是：从一段对话的时间线开头开始，依次读取用户说的话、AI 的工具调用，以及环境返回的结果。它从用户的话、AI 对用户说的话和 AI 的工具调用里提取意图，把影响了意图走向的环境结果记为观测，再记录这些节点之间的关系，最后形成一张意图图谱。提取由 `intent_aligner.extract` 自动执行，模型可以是本地 LLM，也可以是 Claude 或 Codex 的模型。`playground/` 里是手工完成的示范提取。
 

@@ -15,6 +15,4 @@ refresh_results(Path("results-direct-claude-opus-5-5.jsonl"))
 
 Claude 的 thinking 取 `output_tokens_details.thinking_tokens`；其余输出取 `output_tokens - thinking_tokens`，包含文本和结构化工具调用，字段名仍为 `answer`。输入计数包含 `input_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens`。缺少拆分字段时 tokens 保持未知，原始 usage 仍保留。
 
-两份实验脚本已纳入仓库：[exp_direct.py](../scripts/exp_direct.py)、[exp_unverified.py](../scripts/exp_unverified.py)。本机原实验目录中的入口链接到这两份受版本管理的脚本；并发数、模型、提示词、实验单元和重复次数保持原配置。
-
-本次从现有转录补齐 33 + 12 条 Opus 结果的用量，回答不变。崩溃前另有 7 条成功转录，已单独恢复到 V 盘任务目录 `intent-aligner-claude-accounting-20261110`。这些旧记录能确定单元，但未保存原始重复编号，因此编号保留未知，不混入 33 条正式对照。全程新增模型调用为 0。
+仓库里的回放实验脚本 [exp_direct.py](../scripts/exp_direct.py) 和 [exp_unverified.py](../scripts/exp_unverified.py) 按这个方式工作：每次调用的回答先经 `record_reply()` 写进 receipts，启动时先调用 `refresh_results()` 把上次中断时只写进 receipts 的回答补回结果文件，所以中断后重新运行只补缺少的 `(unit, run)`。

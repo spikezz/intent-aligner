@@ -14,7 +14,7 @@
 
 ## `claude-87eeb4bd-qwen/`
 
-对话 `corpus/merged/claude-87eeb4bd.jsonl`，模型是 Hive 网关上的 `deployment/pc-qwen38-np8`（Qwen 3.8 27B），思考强度 xhigh，窗口 `--window-rounds 2`，规则和 `claude-5a1f0c1a-sol-rewrite/` 相同。这次运行用来观察思考 token 随 header 里图谱变大怎样增长。目录里的文件和上面相同。
+对话 `corpus/merged/claude-87eeb4bd.jsonl`，模型是 Hive 网关上的 `deployment/pc-qwen38-np6`（Qwen 3.8 27B），思考强度 xhigh，窗口 `--window-rounds 2`，规则和 `claude-5a1f0c1a-sol-rewrite/` 相同。这次运行用来观察思考 token 随 header 里图谱变大怎样增长。目录里的文件和上面相同。
 
 ## `claude-87eeb4bd-qwen-final/`
 
@@ -22,7 +22,7 @@
 
 ## `claude-87eeb4bd-qwen-schema/`
 
-和 `claude-87eeb4bd-qwen-final/` 的模型、窗口和规则相同，hive 请求的系统提示词里带上了 schema。这次运行用来在 Qwen 上验证 `docs/problem-table.md` 里的改动：调用 C 还会不会把思考顶满，serves 和 responds 怎样使用。
+和 `claude-87eeb4bd-qwen-final/` 的模型、窗口和规则相同，hive 请求的系统提示词里带上了 schema。这次运行用来在 Qwen 上验证 `docs/problem-table.md` 里的改动：调用 C 还会不会把思考顶满，serves 和 responds 怎样使用。这一轮的进程在思考上限从 10,240 改成 12,288 之前启动，所以它发出的调用都用 10,240。之后单元 16、67、81 顶满的调用用 12,288 按原请求各重跑了一次，没有顶满，回答和原来完全一样，后面的单元也不依赖它们，所以这 3 次重跑的调用记录追加到了 `extract/calls.jsonl`，回放里由它们取代原来的回答；`assignments.jsonl` 和图谱没有改。其他顶满的调用重跑后结论有变化或仍然顶满，没有覆盖，见 `docs/problem-table.md` 第 16、17 项。覆盖之前的两个文件备份在 `/home/spikezz/.openclaw/backups/intent-aligner-capped-thinking-rerun-2026-11-09/qwen-schema-calls-before-12288-overwrite-20261111/`。
 
 ## `claude-87eeb4bd-sol/`
 
