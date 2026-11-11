@@ -48,6 +48,7 @@ from intent_aligner.extract import (
 )
 from intent_aligner.llm import (
     CALLS_FILE,
+    HIVE_CAPPED_MARGIN,
     LLM_HOME,
     TRUNCATED_FEEDBACK,
     CallRecord,
@@ -712,7 +713,8 @@ class Attempt(BaseModel):
     many it could have held, the run's window size or the rounds that exist if fewer.
     `origin` is the other run directory that made the call (see Call). `tokens` is
     None when the reply carries no usage; `thinking_budget` is the cap its request set,
-    None for a backend without one.
+    None for a backend without one. `thinking_capped` judges the thinking against that
+    cap the way llm.LLMReply does.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -739,6 +741,7 @@ class Attempt(BaseModel):
     origin: str | None
     tokens: TokenUse | None
     thinking_budget: int | None
+    thinking_capped: bool
 
 
 def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
@@ -776,6 +779,7 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
                 verdict, reason = "rejected", gave_up
             exchange = call.exchange
             window_seen, window_limit = _window_seen(call, conversation)
+            tokens, budget = _tokens(exchange), _thinking_budget(exchange.request)
             judged.append(
                 Attempt(
                     stage=call.stage,
@@ -798,11 +802,23 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
                     usage=exchange.usage,
                     finish=exchange.finish,
                     origin=call.origin,
-                    tokens=_tokens(exchange),
-                    thinking_budget=_thinking_budget(exchange.request),
+                    tokens=tokens,
+                    thinking_budget=budget,
+                    thinking_capped=tokens is not None
+                    and budget is not None
+                    and tokens.thinking >= budget - HIVE_CAPPED_MARGIN,
                 )
             )
-    return sorted(judged, key=lambda a: (a.started or a.ended, a.ended))
+    # A main-loop call made later for an earlier unit (a rerun) stays with that unit's calls, so
+    # the page steps through the units in order; within a run each unit's calls are contiguous.
+    opened: dict[str, datetime] = {}
+    for a in sorted(judged, key=lambda a: a.started or a.ended):
+        if a.stage == "LOOP":
+            opened.setdefault(a.subject, a.started or a.ended)
+    return sorted(
+        judged,
+        key=lambda a: (opened.get(a.subject, a.started or a.ended), a.started or a.ended, a.ended),
+    )
 
 
 def _tokens(exchange: Exchange) -> TokenUse | None:

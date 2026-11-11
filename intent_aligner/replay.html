@@ -754,16 +754,19 @@ function lastTopic(units) {
   return null;
 }
 
-/* Graph drawing: Cytoscape with the dagre layered layout. Positions the viewer drags are kept per run
-   and topic in localStorage, because a watched page reloads itself every few seconds. */
-const DRAGGED_KEY = "intent-aligner-dragged:" + PAGE.directory;
+/* Graph drawing: Cytoscape with the dagre layered layout, or rings around a node the viewer double-clicked.
+   Positions the viewer drags and the node in focus are kept per run and topic in localStorage, because a
+   watched page reloads itself every few seconds. */
+const DRAGGED_KEY = "intent-aligner-dragged:" + PAGE.directory, FOCUS_KEY = "intent-aligner-focus:" + PAGE.directory;
 let cy = null, shownGraph = "", shownTopic = "";
-let dragged = (() => { try { return JSON.parse(localStorage.getItem(DRAGGED_KEY) ?? "{}"); } catch { return {}; } })();
+const loadStored = key => { try { return JSON.parse(localStorage.getItem(key) ?? "{}"); } catch { return {}; } };
+let dragged = loadStored(DRAGGED_KEY), focus = loadStored(FOCUS_KEY);
 function saveDragged() { try { localStorage.setItem(DRAGGED_KEY, JSON.stringify(dragged)); } catch { /* the page works without it */ } }
+function saveFocus() { try { localStorage.setItem(FOCUS_KEY, JSON.stringify(focus)); } catch { /* the page works without it */ } }
 const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const measure = document.createElement("canvas").getContext("2d");
 /* Long labels are cut to NODE_LINES lines so the whole graph fits at a readable zoom; a click shows the full text. */
-const NODE_FONT = '11px system-ui, "Noto Sans CJK SC", sans-serif', NODE_TEXT_W = 230, NODE_LINES = 3;
+const NODE_FONT = '11px system-ui, "Noto Sans CJK SC", sans-serif', NODE_TEXT_W = 230, NODE_LINES = 3, NODE_W = NODE_TEXT_W + 16;
 
 /* Wraps CJK between characters and Latin between words; a word wider than the line (a path) is cut. */
 function wrapLines(text) {
@@ -802,10 +805,72 @@ function graphStyle() {
     {selector: "edge", style: {"curve-style": "bezier", width: 1.2, "line-color": muted, "target-arrow-shape": "triangle", "target-arrow-color": muted,
       "arrow-scale": 0.9, label: "data(label)", "font-size": 10, color: muted, "text-background-color": panel, "text-background-opacity": 1,
       "text-background-padding": 2}},
+    {selector: "edge[bow]", style: {"curve-style": "unbundled-bezier", "control-point-distances": "data(bow)", "control-point-weights": 0.5}},
     {selector: "edge.pending", style: {"line-style": "dashed"}},
     {selector: "edge.owner", style: {"line-style": "dotted", width: 1.6, "line-color": cssVar("--O"), "target-arrow-color": cssVar("--O"), color: cssVar("--O")}},
     {selector: ":selected", style: {"border-color": ink, "line-color": ink, "target-arrow-color": ink, "border-width": 3}},
   ];
+}
+
+/* Columns to the right of the node in focus: its neighbours in the first column, their further neighbours in
+   the next, and so on, ordered by dagre so that crossings stay few. Every edge then joins neighbouring columns,
+   except edges within a column, which bow to the right far enough to clear the boxes between their ends; the gap
+   after a column grows to hold its bows. Nothing else can touch the centre's box or its edges, which lie left of
+   the first column where no other edge goes. Nodes the focus cannot reach go in columns of their own after the
+   last. Returns the centre, or null when the focus is not among the connected nodes. */
+const COL_GAP = 110, BOW_CLEAR = 24;
+function fanLayout(connected, focusId) {
+  const centre = cy.getElementById(focusId);
+  if (!connected.anySame(centre)) return null;
+  const depth = new Map([[focusId, 0]]), order = [focusId];
+  for (let i = 0; i < order.length; i++) {
+    const next = [];
+    cy.getElementById(order[i]).neighborhood("node").forEach(n => { if (connected.anySame(n) && !depth.has(n.id())) { depth.set(n.id(), depth.get(order[i]) + 1); next.push(n.id()); } });
+    order.push(...next.sort());
+  }
+  const g = new dagre.graphlib.Graph().setGraph({rankdir: "LR", nodesep: 18, ranksep: COL_GAP, edgesep: 12}).setDefaultEdgeLabel(() => ({}));
+  for (const id of order) g.setNode(id, {width: NODE_W, height: cy.getElementById(id).data("h")});
+  const ends = e => [e.source().id(), e.target().id()];
+  const reachable = cy.edges().filter(e => ends(e).every(id => depth.has(id)));
+  /* Edges oriented by depth make the focus the only source, so dagre's ranks are the depths. */
+  reachable.forEach(e => { const [a, b] = ends(e); if (depth.get(a) < depth.get(b)) g.setEdge(a, b); else if (depth.get(a) > depth.get(b)) g.setEdge(b, a); });
+  dagre.layout(g);
+  const columns = [];
+  for (const id of order) { cy.getElementById(id).position({x: g.node(id).x, y: g.node(id).y}); (columns[depth.get(id)] ??= []).push(id); }
+  const pos = id => cy.getElementById(id).position(), half = id => cy.getElementById(id).data("h") / 2;
+  /* A bow is a quadratic curve whose control point sits `bow` to the right of the midpoint, so at a fraction s of
+     the way down it is 2s(1-s)·bow to the right; the nearest box edge between the ends decides how far it needs. */
+  const reach = [];
+  reachable.forEach(e => {
+    const [a, b] = ends(e), d = depth.get(a);
+    if (depth.get(a) !== depth.get(b) || a === b) return;
+    const y0 = Math.min(pos(a).y, pos(b).y), span = Math.abs(pos(a).y - pos(b).y);
+    let bow = 0;
+    for (const id of columns[d]) {
+      if (id === a || id === b) continue;
+      for (const edge of [pos(id).y - half(id), pos(id).y + half(id)]) {
+        const s = (edge - y0) / span;
+        if (s > 0 && s < 1) bow = Math.max(bow, (NODE_W / 2 + BOW_CLEAR) / (2 * s * (1 - s)));
+      }
+    }
+    if (!bow) return;
+    /* Cytoscape measures control-point distance to the left of the source-to-target direction. */
+    e.data("bow", pos(a).y < pos(b).y ? -bow : bow);
+    reach[d] = Math.max(reach[d] ?? 0, bow / 2);
+  });
+  let shift = 0;
+  columns.forEach((column, d) => {
+    for (const id of column) cy.getElementById(id).shift({x: shift});
+    const next = columns[d + 1];
+    if (next && reach[d]) shift += Math.max(0, pos(column[0]).x + reach[d] + BOW_CLEAR - (pos(next[0]).x + shift - NODE_W / 2));
+  });
+  const loose = connected.filter(n => !depth.has(n.id()));
+  if (loose.length) {
+    loose.union(loose.connectedEdges().filter(e => loose.anySame(e.source()) && loose.anySame(e.target()))).layout({name: "dagre", rankDir: "LR", nodeSep: 18, rankSep: COL_GAP, fit: false, animate: false}).run();
+    const main = connected.not(loose).boundingBox(), box = loose.boundingBox();
+    loose.shift({x: main.x2 + COL_GAP - box.x1, y: main.y1 - box.y1});
+  }
+  return centre;
 }
 
 /* Nodes without any edge sit in their own box left of the connected graph, so dagre does not scatter them between ranks. */
@@ -814,9 +879,11 @@ function layoutGraph() {
   const own = dragged[shownTopic] ?? {};
   const orphans = cy.nodes(`[parent = "orphans:${shownTopic}"]`).sort((p, q) => p.id().localeCompare(q.id()));
   const connected = cy.nodes(`[parent = "topic:${shownTopic}"]`);
-  if (connected.length) connected.union(cy.edges()).layout({name: "dagre", rankDir: "RL", nodeSep: 18, rankSep: 110, edgeSep: 12, fit: false, animate: false}).run();
+  cy.edges().removeData("bow");
+  const centre = connected.length && focus[shownTopic] !== undefined ? fanLayout(connected, focus[shownTopic]) : null;
+  if (connected.length && !centre) connected.union(cy.edges()).layout({name: "dagre", rankDir: "RL", nodeSep: 18, rankSep: COL_GAP, edgeSep: 12, fit: false, animate: false}).run();
   const box = connected.length ? connected.boundingBox() : {x1: 0, y1: 0, h: 0};
-  const cellW = NODE_TEXT_W + 16, rowH = Math.max(0, ...orphans.map(n => n.data("h"))) + ORPHAN_ROW_GAP;
+  const cellW = NODE_W, rowH = Math.max(0, ...orphans.map(n => n.data("h"))) + ORPHAN_ROW_GAP;
   const rows = Math.max(1, Math.floor(box.h / rowH)), cols = Math.ceil(orphans.length / rows);
   const left = box.x1 - ORPHAN_GAP - cols * (cellW + ORPHAN_COL_GAP) + ORPHAN_COL_GAP;
   orphans.forEach((n, i) => n.position({x: left + Math.floor(i / rows) * (cellW + ORPHAN_COL_GAP) + cellW / 2, y: box.y1 + (i % rows) * rowH + rowH / 2}));
@@ -827,7 +894,10 @@ function layoutGraph() {
   bench.style.height = Math.round(Math.min(Math.max(fitted, 200), innerHeight * 0.85)) + "px";
   cy.resize();
   cy.fit(undefined, pad);
+  return centre;
 }
+/* The centre stays selected, with its text shown, as if it had just been clicked. */
+function focusOn(centre) { cy.elements().unselect(); centre.select(); noteOf(centre); }
 
 function ensureGraph() {
   if (cy) return;
@@ -838,9 +908,15 @@ function ensureGraph() {
   });
   cy.on("tap", "node, edge", e => noteOf(e.target));
   cy.on("tap", e => { if (e.target === cy) $("gnote").textContent = "点击节点或边查看全文和改动过它的单元。"; });
+  /* Dragged positions go with the double-click: kept, they would pull nodes off their rings. */
+  cy.on("dbltap", "node", e => {
+    const n = e.target; if (n.data("parent") !== "topic:" + shownTopic) return;
+    focus[shownTopic] = n.id(); delete dragged[shownTopic]; saveFocus(); saveDragged();
+    focusOn(layoutGraph());
+  });
   new ResizeObserver(() => cy.resize()).observe($("bench"));
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => cy.style(graphStyle()));
-  $("relayout").onclick = () => { delete dragged[shownTopic]; saveDragged(); layoutGraph(); };
+  $("relayout").onclick = () => { delete dragged[shownTopic]; delete focus[shownTopic]; saveDragged(); saveFocus(); layoutGraph(); };
 }
 
 function noteOf(el) {
@@ -924,7 +1000,7 @@ function drawBench(f, job) {
     const wrapped = wrapLines(n.label ?? ""), shown = wrapped.slice(0, NODE_LINES);
     if (wrapped.length > NODE_LINES) shown[NODE_LINES - 1] = shown[NODE_LINES - 1].slice(0, -1) + "…";
     const lines = [nameOf(id, n), ...shown];
-    elements.push({group: "nodes", data: {id, parent, label: lines.join("\n"), full: n.label ?? "", color: colorOf(n), w: NODE_TEXT_W + 16, h: 14 * lines.length + 12},
+    elements.push({group: "nodes", data: {id, parent, label: lines.join("\n"), full: n.label ?? "", color: colorOf(n), w: NODE_W, h: 14 * lines.length + 12},
       classes: [fresh.has(id) && !committed ? "pending" : "", candidates.has(id) ? "hot" : "", done.has(id) ? "done" : ""].join(" ")});
   }
   for (const e of edges) if (nodes[e.from] && nodes[e.to])
@@ -940,8 +1016,10 @@ function drawBench(f, job) {
     return;
   }
   shownGraph = shape; shownTopic = topic;
-  cy.elements().remove(); cy.add(elements); layoutGraph();
-  $("gnote").textContent = "点击节点或边查看全文和改动过它的单元。拖动节点会记住位置，滚轮缩放，拖动空白处平移。";
+  cy.elements().remove(); cy.add(elements);
+  const centre = layoutGraph();
+  $("gnote").textContent = "点击节点或边查看全文和改动过它的单元。双击节点以它为中心重排：直接相连的节点排在它右边一列，它们的邻居再往右一列。拖动节点会记住位置，滚轮缩放，拖动空白处平移。";
+  if (centre) focusOn(centre);
 }
 
 /* ---------- what the viewer set by hand survives frame changes and the auto-refresh reload ---------- */
@@ -993,7 +1071,7 @@ const tokRows = calls.flatMap((c, i) => {
   const h = headerOf(c.prompt), graph = h !== null && ("graph" in h || "graphs" in h), t = c.tokens;
   return [{c, i, graph, size: graph ? graphSize([h.graph, h.graphs]) : 0, ...t, context: t.prompt + t.thinking + t.answer}];
 });
-/* A run that switched deployments sent different budgets; the page draws only the highest. */
+/* A run whose calls were sent under different caps draws only the highest; each call is still judged against its own. */
 const sentBudgets = tokRows.map(r => r.c.thinking_budget).filter(b => b !== null);
 const budgets = sentBudgets.length ? [Math.max(...sentBudgets)] : [];
 const fmtN = n => Math.round(n).toLocaleString("en-US");
@@ -1003,7 +1081,8 @@ const PARTS = [["prompt", "提示词", "var(--tk-prompt)"], ["thinking", "思考
 const TOKEN_TABS = {
   thinking: {value: r => r.thinking, budgets, parts: null,
     note: () => `${tokRows.length} 次调用带用量记录。${SOURCES}${AXIS_NOTE}` +
-      (budgets.length ? `红色虚线是请求里设的思考上限 ${budgets.map(fmtN).join("、")}。` : "这个后端的请求没有设思考上限。"),
+      (budgets.length ? `红色虚线是请求里设的思考上限 ${budgets.map(fmtN).join("、")}。` +
+        (new Set(sentBudgets).size > 1 ? "有些调用是在更低的上限下发出的，鼠标悬浮显示每次调用自己的上限，是否顶满也按它判断。" : "") : "这个后端的请求没有设思考上限。"),
     bars: "每根柱子是一次调用，按思考 token 从小到大排列，颜色是调用所属的阶段。橙色实线是平均数，黑色点线是中位数。"},
   context: {value: r => r.context, budgets: [], parts: PARTS,
     note: () => `${tokRows.length} 次调用带用量记录。完整上下文是一次调用在端点上占用的全部 token：提示词 + 思考 + 回答。` +
@@ -1078,14 +1157,12 @@ $("tokZoomBar").onclick = e => {
   if (what === "home") setBarZoom(0, 1);
   else if (what) zoomBars(what === "in" ? 0.5 : 2, 0.5);
 };
-/* Shift+wheel pans; some browsers report it as deltaX, others keep deltaY with shiftKey set. Sideways trackpad scrolls pan too. */
+/* The wheel pans; Ctrl+wheel zooms around the cursor. A sideways trackpad scroll arrives as deltaX. */
 $("tokBars").addEventListener("wheel", e => {
   e.preventDefault();
-  const sideways = e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY);
-  if (sideways) {
-    const [lo, hi] = barZoom, delta = e.deltaX || e.deltaY;
-    setBarZoom(lo + Math.sign(delta) * 0.1 * (hi - lo), hi - lo);
-  } else zoomBars(e.deltaY < 0 ? 0.8 : 1.25, barFraction(e));
+  if (e.ctrlKey) return zoomBars(e.deltaY < 0 ? 0.8 : 1.25, barFraction(e));
+  const [lo, hi] = barZoom, delta = e.deltaX || e.deltaY;
+  setBarZoom(lo + Math.sign(delta) * 0.1 * (hi - lo), hi - lo);
 }, {passive: false});
 /* A press that moves more than a few pixels pans; the click it ends in is then swallowed so it does not jump to a call. */
 $("tokBars").addEventListener("mousedown", e => {
@@ -1135,7 +1212,7 @@ function drawTokens() {
   tokRowsShown = values.length;
   const first = Math.floor(barZoom[0] * values.length), last = Math.max(first + 1, Math.ceil(barZoom[1] * values.length));
   const slot = (bBox[1] - bBox[0]) / (last - first), width = Math.max(slot - (slot > 4 ? 1 : 0), 0.6);
-  $("tokBarsRange").textContent = values.length ? `显示第 ${first + 1}–${Math.min(last, values.length)} 根，共 ${values.length} 根 · 滚轮以光标处为中心缩放，Shift+滚轮或按住拖动左右平移` : "";
+  $("tokBarsRange").textContent = values.length ? `显示第 ${first + 1}–${Math.min(last, values.length)} 根，共 ${values.length} 根 · 滚轮或按住拖动左右平移，Ctrl+滚轮以光标处为中心缩放` : "";
   sorted.forEach((r, n) => {
     if (n < first || n >= last) return;
     const x = bBox[0] + (n - first) * slot, extra = `第 ${n + 1} / ${values.length} 次 · `;
@@ -1159,9 +1236,9 @@ function drawTokens() {
     refLine(bars, bBox, b.sy, mean, `平均数 ${fmtN(mean)}`, "var(--warn)", "", false);
     refLine(bars, bBox, b.sy, median, `中位数 ${fmtN(median)}`, "var(--ink)", "2 3", true);
     $("tokTable").innerHTML = `<tr><th></th><th>调用次数</th><th>平均数</th><th>中位数</th><th>p90</th><th>p99</th><th>最大</th>` +
-      tab.budgets.map(() => "<th>达到自己请求的上限</th>").join("") + "</tr>" +
+      (tab.budgets.length ? "<th>思考顶到自己请求的上限</th>" : "") + "</tr>" +
       `<tr><th>${yLabel}</th><td>${values.length}</td><td>${fmtN(mean)}</td><td>${fmtN(median)}</td><td>${fmtN(at(.9))}</td><td>${fmtN(at(.99))}</td><td>${fmtN(values[values.length - 1])}</td>` +
-      tab.budgets.map(() => `<td>${sorted.filter(r => r.c.thinking_budget !== null && r.thinking >= r.c.thinking_budget).length}</td>`).join("") + "</tr>";
+      (tab.budgets.length ? `<td>${sorted.filter(r => r.c.thinking_capped).length}</td>` : "") + "</tr>";
   } else $("tokTable").innerHTML = "";
   markTokens();
 }
