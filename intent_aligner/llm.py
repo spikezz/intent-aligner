@@ -54,7 +54,7 @@ HIVE_FRAME_URL = os.environ.get("HIVE_FRAME_URL", "http://127.0.0.1:8790").rstri
 
 # The one thinking cap for every Hive call at every effort, so calls of one run are
 # comparable; window.PROMPT_BUDGET is the np6 slot minus this cap.
-HIVE_THINKING_BUDGET = 10_240
+HIVE_THINKING_BUDGET = 12_288
 HIVE_SCHEMA_INTRO = "回答是符合下面这个 JSON schema 的 JSON："
 # A capped reply's thinking, counted as completion minus the answer under TOKENIZER, came
 # to 10,231-10,278 on 64 capped Qwen3.8 calls (2026-11-10) and to at most 10,124 on the
