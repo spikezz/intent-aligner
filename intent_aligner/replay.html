@@ -118,6 +118,10 @@ details.more summary { cursor: pointer; color: var(--muted); }
 #tokens .tabs button { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 4px; padding: 3px 12px; cursor: pointer; font: inherit; font-size: 13px; }
 #tokens .tabs button.on { background: var(--ink); color: var(--panel); border-color: var(--ink); }
 #tokens .mark.on { stroke: var(--active); stroke-width: 2; }
+#tokens .zoombar { display: flex; gap: 4px; align-items: center; margin-top: 6px; font-size: 12px; color: var(--muted); }
+#tokens .zoombar button { border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 4px; padding: 1px 10px; cursor: pointer; font: inherit; }
+#tokBars { cursor: grab; }
+#tokBars.dragging { cursor: grabbing; }
 #tokens select { font: inherit; font-size: 12px; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 4px; }
 #tokens table { border-collapse: collapse; font-size: 12px; margin-top: 6px; }
 #tokens td, #tokens th { border: 1px solid var(--line); padding: 2px 8px; text-align: right; }
@@ -186,6 +190,7 @@ details.more summary { cursor: pointer; color: var(--muted); }
       · 点一个点或一根柱子跳到那次调用，黑框是当前帧的调用</div>
     <svg id="tokScatter" viewBox="0 0 1060 400" role="img" aria-label="token 和图谱大小的散点图"></svg>
     <p class="note legend" id="tokBarsNote"></p>
+    <div class="zoombar" id="tokZoomBar"><button data-zoom="in">+</button><button data-zoom="out">−</button><button data-zoom="home">Home</button><span id="tokBarsRange"></span></div>
     <svg id="tokBars" viewBox="0 0 1060 360" role="img" aria-label="所有调用的 token 从小到大排列"></svg>
     <table id="tokTable"></table>
   </details>
@@ -956,7 +961,7 @@ document.addEventListener("click", e => {
 });
 function saveView() {
   const view = {opened, graphTop: $("gbox").getBoundingClientRect().top, scrolled: [...document.querySelectorAll(SCROLLED)].map(x => [x.scrollTop, x.scrollLeft]),
-    bench: $("bench").style.height, topic: shownTopic, tokAsk: $("tokAsk").value, tokTab, graph: cy ? {zoom: cy.zoom(), pan: cy.pan()} : null};
+    bench: $("bench").style.height, topic: shownTopic, tokAsk: $("tokAsk").value, tokTab, barZoom, graph: cy ? {zoom: cy.zoom(), pan: cy.pan()} : null};
   try { sessionStorage.setItem(VIEW_KEY, JSON.stringify(view)); } catch { /* the reload then starts from the defaults */ }
 }
 function restoreView() {
@@ -967,6 +972,7 @@ function restoreView() {
   if (view.bench) $("bench").style.height = view.bench;
   if (view.tokAsk && [...$("tokAsk").options].some(o => o.value === view.tokAsk)) $("tokAsk").value = view.tokAsk;
   if (view.tokTab in TOKEN_TABS) tokTab = view.tokTab;
+  if (view.barZoom) barZoom = view.barZoom;
   drawTokens();
   if (cy && view.graph && view.topic === shownTopic) { cy.resize(); cy.viewport({zoom: view.graph.zoom, pan: view.graph.pan}); }
   document.querySelectorAll(SCROLLED).forEach((x, i) => { if (view.scrolled[i]) [x.scrollTop, x.scrollLeft] = view.scrolled[i]; });
@@ -1049,6 +1055,54 @@ function refLine(svg, box, sy, v, label, color, dash, atEnd) {
   svgEl(svg, "line", {x1: x0, x2: x1, y1: sy(v), y2: sy(v), stroke: color, "stroke-width": 1.5, "stroke-dasharray": dash});
   svgEl(svg, "text", {x: atEnd ? x1 : x0 + 6, y: sy(v) - 4, "text-anchor": atEnd ? "end" : "start", style: `fill: ${color}`}, label);
 }
+/* The bar chart shows bars [lo, hi) of the sorted calls, as fractions of all of them. */
+let barZoom = [0, 1], tokRowsShown = 0;
+const BAR_BOX = [64, 1040, 12, 320], MIN_BARS = 5;
+function setBarZoom(start, span) {
+  const n = Math.max(tokRowsShown, 1);
+  span = Math.min(1, Math.max(Math.min(1, MIN_BARS / n), span));
+  start = Math.min(1 - span, Math.max(0, start));
+  barZoom = [start, start + span]; drawTokens();
+}
+function zoomBars(factor, at) {
+  const [lo, hi] = barZoom, span = (hi - lo) * factor;
+  setBarZoom(lo + at * (hi - lo) - at * span, span);
+}
+/* Where pointer event `e` sits across the bar plot, from 0 at its left edge to 1 at its right. */
+function barFraction(e) {
+  const rect = $("tokBars").getBoundingClientRect(), x = (e.clientX - rect.left) / rect.width * 1060;
+  return Math.min(1, Math.max(0, (x - BAR_BOX[0]) / (BAR_BOX[1] - BAR_BOX[0])));
+}
+$("tokZoomBar").onclick = e => {
+  const what = e.target.dataset?.zoom;
+  if (what === "home") setBarZoom(0, 1);
+  else if (what) zoomBars(what === "in" ? 0.5 : 2, 0.5);
+};
+$("tokBars").addEventListener("wheel", e => { e.preventDefault(); zoomBars(e.deltaY < 0 ? 0.8 : 1.25, barFraction(e)); }, {passive: false});
+/* A press that moves more than a few pixels pans; the click it ends in is then swallowed so it does not jump to a call. */
+$("tokBars").addEventListener("mousedown", e => {
+  if (e.button !== 0) return;
+  const svg = $("tokBars"), plotWidth = svg.getBoundingClientRect().width * (BAR_BOX[1] - BAR_BOX[0]) / 1060;
+  let lastX = e.clientX, moved = 0;
+  const move = m => {
+    moved += Math.abs(m.clientX - lastX);
+    if (moved > 3) {
+      svg.classList.add("dragging");
+      const [lo, hi] = barZoom; setBarZoom(lo - (m.clientX - lastX) / plotWidth * (hi - lo), hi - lo);
+    }
+    lastX = m.clientX;
+  };
+  const up = () => {
+    removeEventListener("mousemove", move); removeEventListener("mouseup", up); svg.classList.remove("dragging");
+    if (moved <= 3) return;
+    /* The click, if any, fires right after this mouseup; one that never comes must not eat a later click. */
+    const swallow = c => { if (svg.contains(c.target)) c.stopPropagation(); };
+    addEventListener("click", swallow, {capture: true, once: true});
+    setTimeout(() => removeEventListener("click", swallow, {capture: true}), 0);
+  };
+  addEventListener("mousemove", move); addEventListener("mouseup", up);
+  e.preventDefault();
+});
 function drawTokens() {
   const tab = TOKEN_TABS[tokTab], value = tab.value, yLabel = tokTab === "thinking" ? "思考 token" : "完整上下文 token";
   document.querySelectorAll("#tokTabs button").forEach(b => { b.classList.toggle("on", b.dataset.tab === tokTab); b.setAttribute("aria-selected", b.dataset.tab === tokTab); });
@@ -1067,12 +1121,16 @@ function drawTokens() {
   for (const r of rows) bindMark(svgEl(scatter, "circle", {cx: s.sx(r.size), cy: s.sy(value(r)), r: 4.5,
     fill: STAGE_COLORS[r.c.stage], "fill-opacity": 0.7, stroke: "var(--panel)", "stroke-width": 1}), r, "");
 
-  const bars = $("tokBars"), bBox = [64, 1040, 12, 320]; bars.innerHTML = "";
+  const bars = $("tokBars"), bBox = BAR_BOX; bars.innerHTML = "";
   const b = tokAxes(bars, bBox, 1, yMax, `每一次调用，按${yLabel}从小到大排列`, yLabel);
   const sorted = [...rows].sort((p, q) => value(p) - value(q)), values = sorted.map(value);
-  const slot = (bBox[1] - bBox[0]) / Math.max(values.length, 1), width = Math.max(slot - (slot > 4 ? 1 : 0), 0.6);
+  tokRowsShown = values.length;
+  const first = Math.floor(barZoom[0] * values.length), last = Math.max(first + 1, Math.ceil(barZoom[1] * values.length));
+  const slot = (bBox[1] - bBox[0]) / (last - first), width = Math.max(slot - (slot > 4 ? 1 : 0), 0.6);
+  $("tokBarsRange").textContent = values.length ? `显示第 ${first + 1}–${Math.min(last, values.length)} 根，共 ${values.length} 根 · 滚轮以光标处为中心缩放，按住拖动左右平移` : "";
   sorted.forEach((r, n) => {
-    const x = bBox[0] + n * slot, extra = `第 ${n + 1} / ${values.length} 次 · `;
+    if (n < first || n >= last) return;
+    const x = bBox[0] + (n - first) * slot, extra = `第 ${n + 1} / ${values.length} 次 · `;
     if (!tab.parts) {
       const y = b.sy(value(r));
       bindMark(svgEl(bars, "rect", {x, y, width, height: Math.max(bBox[3] - y, 0.5), fill: STAGE_COLORS[r.c.stage]}), r, extra);
