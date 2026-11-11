@@ -1078,7 +1078,15 @@ $("tokZoomBar").onclick = e => {
   if (what === "home") setBarZoom(0, 1);
   else if (what) zoomBars(what === "in" ? 0.5 : 2, 0.5);
 };
-$("tokBars").addEventListener("wheel", e => { e.preventDefault(); zoomBars(e.deltaY < 0 ? 0.8 : 1.25, barFraction(e)); }, {passive: false});
+/* Shift+wheel pans; some browsers report it as deltaX, others keep deltaY with shiftKey set. Sideways trackpad scrolls pan too. */
+$("tokBars").addEventListener("wheel", e => {
+  e.preventDefault();
+  const sideways = e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY);
+  if (sideways) {
+    const [lo, hi] = barZoom, delta = e.deltaX || e.deltaY;
+    setBarZoom(lo + Math.sign(delta) * 0.1 * (hi - lo), hi - lo);
+  } else zoomBars(e.deltaY < 0 ? 0.8 : 1.25, barFraction(e));
+}, {passive: false});
 /* A press that moves more than a few pixels pans; the click it ends in is then swallowed so it does not jump to a call. */
 $("tokBars").addEventListener("mousedown", e => {
   if (e.button !== 0) return;
@@ -1127,7 +1135,7 @@ function drawTokens() {
   tokRowsShown = values.length;
   const first = Math.floor(barZoom[0] * values.length), last = Math.max(first + 1, Math.ceil(barZoom[1] * values.length));
   const slot = (bBox[1] - bBox[0]) / (last - first), width = Math.max(slot - (slot > 4 ? 1 : 0), 0.6);
-  $("tokBarsRange").textContent = values.length ? `显示第 ${first + 1}–${Math.min(last, values.length)} 根，共 ${values.length} 根 · 滚轮以光标处为中心缩放，按住拖动左右平移` : "";
+  $("tokBarsRange").textContent = values.length ? `显示第 ${first + 1}–${Math.min(last, values.length)} 根，共 ${values.length} 根 · 滚轮以光标处为中心缩放，Shift+滚轮或按住拖动左右平移` : "";
   sorted.forEach((r, n) => {
     if (n < first || n >= last) return;
     const x = bBox[0] + (n - first) * slot, extra = `第 ${n + 1} / ${values.length} 次 · `;
