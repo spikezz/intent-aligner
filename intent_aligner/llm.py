@@ -30,7 +30,8 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from functools import cache
@@ -38,7 +39,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import attrs
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from tokenizers import Tokenizer
 
 from intent_aligner.corpus import TOOL_ROOT
@@ -217,12 +218,135 @@ CALLS_FILE = "calls.jsonl"
 CALL_SUBJECT: ContextVar[str] = ContextVar("CALL_SUBJECT")
 
 
+@attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
+class Offer:
+    """What the calls of one job may ask to see before they answer.
+
+    `menu` is the sentence that tells the model what a name in `need` can be and what it
+    gets for it. `fetch` gives the text behind one name and raises LookupError for a name
+    it does not know. `room` is how many tokens the prompt has left for the instructions
+    this adds and for everything fetched.
+    """
+
+    menu: str
+    fetch: Callable[[str], str]
+    room: int
+
+
+@attrs.frozen(slots=True, auto_attribs=True, kw_only=True)
+class _Offered:
+    """An Offer in force: the rounds of names asked for so far and the text each name got.
+
+    It outlives one Ask call, so a retry of the same prompt keeps what was already shown
+    and does not get the rounds back.
+    """
+
+    offer: Offer
+    rounds: list[list[str]] = attrs.field(factory=list)
+    shown: dict[str, str] = attrs.field(factory=dict)
+
+    def block(self) -> str:
+        if not self.shown:
+            return ""
+        parts = "\n\n".join(f"【{name}】\n{text}" for name, text in self.shown.items())
+        return f"\n\n<补充的内容>\n{parts}\n</补充的内容>"
+
+    def take(self, names: list[str], room: int) -> None:
+        """Fetch `names` in the order asked while the block stays within `room` tokens."""
+        self.rounds.append(names)
+        for name in dict.fromkeys(names):
+            if name in self.shown:
+                continue
+            try:
+                text = self.offer.fetch(name)
+            except LookupError:
+                text = OFFER_UNKNOWN
+            self.shown[name] = text
+            if qwen_tokens(self.block()) > room:
+                self.shown[name] = OFFER_NO_ROOM
+
+
+# Rounds of asking one job gets; the call after them has to answer. Two, so that the
+# model can follow up once on what the first round showed it.
+OFFER_ROUNDS = 2
+OFFER_UNKNOWN = "没有这项内容。"
+OFFER_NO_ROOM = "提示词放不下这项内容。"
+_OFFER_SHOWN = "<补充的内容> 是你之前要求看的内容。"
+_OFFER_EXIT = (
+    "答案写在 reply 里。提示词里的内容不足以回答时，reply 先写成 "
+    '{{"need": [...]}}，列出还想看的内容。{menu}它们会放进 <补充的内容>，然后再问你一次。'
+)
+_NEED_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"need": {"type": "array", "items": {"type": "string"}, "minItems": 1}},
+    "required": ["need"],
+    "additionalProperties": False,
+}
+
+_OFFERED: ContextVar[_Offered | None] = ContextVar("_OFFERED", default=None)
+
+
+@contextmanager
+def offering(offer: Offer) -> Iterator[None]:
+    """Every Ask call made inside may ask to see more, as `offer` allows.
+
+    It is a context and not an Ask argument for the same reason as CALL_SUBJECT: the job
+    that knows what can be shown sits above the retry loops that call the Ask.
+    """
+    token = _OFFERED.set(_Offered(offer=offer))
+    try:
+        yield
+    finally:
+        _OFFERED.reset(token)
+
+
+def offer_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """`schema` with the exit: `reply` is either an answer or the names the model needs.
+
+    The root stays an object because the claude and codex CLIs reject a root `anyOf`.
+    """
+    return {
+        "type": "object",
+        "properties": {"reply": {"anyOf": [schema, _NEED_SCHEMA]}},
+        "required": ["reply"],
+        "additionalProperties": False,
+    }
+
+
+class _Need(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    need: list[str] = Field(min_length=1)
+
+
+class _Wrapped(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    reply: _Need | dict[str, Any] = Field(union_mode="left_to_right")
+
+
+def _unwrap(text: str) -> tuple[list[str] | None, str]:
+    """The names a reply under offer_schema asks for, or else its answer as JSON text.
+
+    A reply that is not the wrapper is passed on as it is, so the caller's own check
+    rejects it and sends its feedback.
+    """
+    try:
+        reply = _Wrapped.model_validate_json(text).reply
+    except ValidationError:
+        return None, text
+    if isinstance(reply, _Need):
+        return reply.need, text
+    return None, json.dumps(reply, ensure_ascii=False)
+
+
 class CallRecord(BaseModel):
     """One endpoint call of a pipeline command, as a line of its calls.jsonl.
 
     `ask` is the asker's role in the command (e.g. "topic", "call"). A retry is a
     separate record; its prompt in the transcript is the first prompt plus the feedback.
-    `transcript` is None only when the backend failed before writing one.
+    A call that asked to see more is a separate record too. `transcript` is None only
+    when the backend failed before writing one.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -260,56 +384,85 @@ def asker(
     *,
     refuse_capped: bool = False,
 ) -> Ask:
-    """An Ask: one isolated call per prompt under a fixed system prompt and reply schema.
+    """An Ask: the answer to one prompt under a fixed system prompt and reply schema.
+
+    Outside `offering` that is one isolated call. Inside it, a call may reply with the
+    names of what it needs to see instead of an answer; their text goes after the prompt
+    and the prompt is sent again, until the model answers or OFFER_ROUNDS are used up,
+    after which the call has no exit. An offer whose room does not hold the exit's own
+    instructions is not made.
 
     Every call, failed or not, is logged under `name` and the caller's CALL_SUBJECT. With
-    `refuse_capped`, a reply whose thinking reached the cap raises ThinkingCapped.
+    `refuse_capped`, an answer whose thinking reached the cap raises ThinkingCapped; a
+    capped reply that asks to see more is followed like any other.
     """
 
-    def ask(prompt: str) -> str:
+    def call_once(system: str, prompt: str, wrapped: bool) -> tuple[list[str] | None, str]:
         call = LLMCall(
             backend=backend,
             model=model,
             effort=effort,
-            system_prompt=system_prompt,
+            system_prompt=system,
             prompt=prompt,
-            json_schema=schema,
+            json_schema=offer_schema(schema) if wrapped else schema,
             stream=stream,
         )
         subject = CALL_SUBJECT.get()
         started = datetime.now(UTC)
-        try:
-            reply = complete(call)
-            if refuse_capped and reply.thinking_capped:
-                raise ThinkingCapped(
-                    f"The thinking reached the {HIVE_THINKING_BUDGET:,}-token cap; "
-                    f"see {reply.transcript}.",
-                    reply.text,
-                    reply.transcript,
-                )
-        except LLMError as error:
-            transcript = None if error.transcript is None else str(error.transcript)
+
+        def record(transcript: Path | None, error: LLMError | None = None) -> None:
             log.write(
                 CallRecord(
                     ask=name,
                     subject=subject,
                     started=started,
                     ended=datetime.now(UTC),
-                    transcript=transcript,
-                    error=str(error),
+                    transcript=None if transcript is None else str(transcript),
+                    error=None if error is None else str(error),
                 )
             )
+
+        try:
+            reply = complete(call)
+        except LLMError as error:
+            record(error.transcript, error)
             raise
-        log.write(
-            CallRecord(
-                ask=name,
-                subject=subject,
-                started=started,
-                ended=datetime.now(UTC),
-                transcript=str(reply.transcript),
+        need, text = _unwrap(reply.text) if wrapped else (None, reply.text)
+        if need is None and refuse_capped and reply.thinking_capped:
+            capped = ThinkingCapped(
+                f"The thinking reached the {HIVE_THINKING_BUDGET:,}-token cap; "
+                f"see {reply.transcript}.",
+                text,
+                reply.transcript,
             )
+            record(reply.transcript, capped)
+            raise capped
+        record(reply.transcript)
+        return need, text
+
+    def ask(prompt: str) -> str:
+        offered = _OFFERED.get()
+        if offered is None:
+            return call_once(system_prompt, prompt, False)[1]
+        base = system_prompt.rstrip("\n")
+        exit_text = _OFFER_EXIT.format(menu=offered.offer.menu)
+        wrapping = json.dumps(offer_schema(schema), ensure_ascii=False)
+        room = offered.offer.room - (
+            qwen_tokens(f"\n\n{_OFFER_SHOWN}{exit_text}")
+            + qwen_tokens(wrapping)
+            - qwen_tokens(json.dumps(schema, ensure_ascii=False))
         )
-        return reply.text
+        while True:
+            shown = _OFFER_SHOWN if offered.shown else ""
+            if room < 0 or len(offered.rounds) >= OFFER_ROUNDS:
+                system = f"{base}\n\n{shown}\n" if shown else system_prompt
+                return call_once(system, prompt + offered.block(), False)[1]
+            need, text = call_once(
+                f"{base}\n\n{shown}{exit_text}\n", prompt + offered.block(), True
+            )
+            if need is None:
+                return text
+            offered.take(need, room)
 
     return ask
 

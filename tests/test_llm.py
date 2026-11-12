@@ -489,3 +489,118 @@ def test_an_asker_that_refuses_capped_replies_logs_and_raises(
     assert raised.value.text == "{}", raised.value.text
     errors = [json.loads(line)["error"] for line in log.path.read_text().splitlines()]
     assert errors[0] is None and "cap" in errors[1], errors
+
+
+OFFERED_TEXTS = {"a": "text of a", "b": "text of b", "big": "字" * 5_000}
+MENU = "可以写 a 或 b。"
+
+
+def _offer(room: int = 1_000) -> llm.Offer:
+    return llm.Offer(menu=MENU, fetch=OFFERED_TEXTS.__getitem__, room=room)
+
+
+def _scripted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *replies: str, capped: bool = False
+) -> list[LLMCall]:
+    """Make `complete` give `replies` in order; the list fills with the calls it gets."""
+    calls: list[LLMCall] = []
+    texts = iter(replies)
+
+    def fake_complete(call: LLMCall) -> LLMReply:
+        calls.append(call)
+        transcript = tmp_path / f"t{len(calls)}"
+        return LLMReply(
+            text=next(texts), session_id="s", transcript=transcript, thinking_capped=capped
+        )
+
+    monkeypatch.setattr(llm, "complete", fake_complete)
+    CALL_SUBJECT.set("unit:1")
+    return calls
+
+
+def _need(*names: str) -> str:
+    return json.dumps({"reply": {"need": list(names)}})
+
+
+def test_a_call_under_an_offer_gets_what_it_asks_for_and_is_asked_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _scripted(monkeypatch, tmp_path, _need("a", "nope", "big"), '{"reply": {"answer": 4}}')
+    log = CallLog(path=tmp_path / "calls.jsonl")
+    ask = asker("hive", "m", "xhigh", "system", SCHEMA, True, log, "relation")
+
+    with llm.offering(_offer()):
+        got = ask("p")
+
+    assert json.loads(got) == {"answer": 4}, got
+    first, second = calls
+    assert first.prompt == "p", first.prompt
+    assert first.json_schema == llm.offer_schema(SCHEMA), first.json_schema
+    assert first.system_prompt.startswith("system\n\n") and MENU in first.system_prompt, first
+    assert second.prompt == (
+        "p\n\n<补充的内容>\n"
+        f"【a】\ntext of a\n\n【nope】\n{llm.OFFER_UNKNOWN}\n\n【big】\n{llm.OFFER_NO_ROOM}\n"
+        "</补充的内容>"
+    ), second.prompt
+    assert "<补充的内容> 是" in second.system_prompt, second.system_prompt
+    assert len(log.path.read_text().splitlines()) == 2, log.path.read_text()
+
+
+def test_after_the_rounds_of_an_offer_the_call_has_to_answer_and_a_retry_keeps_what_was_shown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer = '{"answer": 4}'
+    calls = _scripted(monkeypatch, tmp_path, _need("a"), _need("b"), answer, answer)
+    ask = asker("hive", "m", "xhigh", "system", SCHEMA, True, CallLog(path=tmp_path / "c"), "x")
+
+    with llm.offering(_offer()):
+        assert ask("p") == answer
+        assert ask("p 你上次的回答不合格。") == answer
+
+    assert llm.OFFER_ROUNDS == 2
+    for forced in calls[2:]:
+        assert forced.json_schema == SCHEMA, forced.json_schema
+        assert MENU not in forced.system_prompt, forced.system_prompt
+        assert "text of a" in forced.prompt and "text of b" in forced.prompt, forced.prompt
+
+
+def test_an_offer_without_room_for_its_own_instructions_is_not_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _scripted(monkeypatch, tmp_path, '{"answer": 4}')
+    ask = asker("hive", "m", "xhigh", "system", SCHEMA, True, CallLog(path=tmp_path / "c"), "x")
+
+    with llm.offering(_offer(room=10)):
+        assert ask("p") == '{"answer": 4}'
+
+    assert (calls[0].system_prompt, calls[0].prompt, calls[0].json_schema) == (
+        "system",
+        "p",
+        SCHEMA,
+    ), calls[0]
+
+
+def test_a_reply_under_an_offer_that_is_not_the_wrapper_reaches_the_callers_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _scripted(monkeypatch, tmp_path, '{"answer": 4}')
+    ask = asker("hive", "m", "xhigh", "system", SCHEMA, True, CallLog(path=tmp_path / "c"), "x")
+
+    with llm.offering(_offer()):
+        assert ask("p") == '{"answer": 4}'
+
+
+def test_a_capped_request_to_see_more_is_followed_and_a_capped_answer_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _scripted(monkeypatch, tmp_path, _need("a"), '{"reply": {"answer": 4}}', capped=True)
+    log = CallLog(path=tmp_path / "calls.jsonl")
+    ask = asker("hive", "m", "xhigh", "system", SCHEMA, True, log, "x", refuse_capped=True)
+
+    with llm.offering(_offer()), pytest.raises(ThinkingCapped) as raised:
+        ask("p")
+
+    assert json.loads(raised.value.text) == {"answer": 4}, raised.value.text
+    assert len(calls) == 2, calls
+    errors = [json.loads(line)["error"] for line in log.path.read_text().splitlines()]
+    assert errors[0] is None and "cap" in errors[1], errors
