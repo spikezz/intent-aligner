@@ -79,6 +79,25 @@ def test_question_asked_again_from_scratch_fails_the_earlier_one() -> None:
     assert got == expected, f"{got!r} vs {expected!r}"
 
 
+def test_only_the_accepted_attempt_of_an_answered_question_is_not_superseded() -> None:
+    calls = [
+        _call("tool:a", "P", 0, error="The thinking reached the cap"),
+        _call("tool:a", "P", 1),
+        _call("tool:a", "P\n\n你上一次的回答不符合要求", 2),
+        _call("tool:b", "P", 3, error="The thinking reached the cap"),
+        _call("tool:b", "P", 4, error="The thinking reached the cap"),
+    ]
+    got = [(a.subject, a.verdict, a.superseded) for a in judge(calls, _empty())]
+    expected = [
+        ("tool:a", "failed", True),
+        ("tool:a", "rejected", True),
+        ("tool:a", "accepted", False),
+        ("tool:b", "failed", False),
+        ("tool:b", "failed", False),
+    ]
+    assert got == expected, f"{got!r} vs {expected!r}"
+
+
 def test_errored_call_fails() -> None:
     got = [a.verdict for a in judge([_call("tool:a", "P", 0, error="HTTP 500")], _empty())]
     assert got == ["failed"], got

@@ -1066,8 +1066,9 @@ function graphSize(v) {
   if (v.nodes && Array.isArray(v.edges)) return Object.keys(v.nodes).length + v.edges.length;
   return Object.values(v).reduce((n, x) => n + graphSize(x), 0);
 }
+/* A superseded call is left out: its question was asked again and answered, and only that answer's size counts. */
 const tokRows = calls.flatMap((c, i) => {
-  if (c.tokens === null) return [];
+  if (c.tokens === null || c.superseded) return [];
   const h = headerOf(c.prompt), graph = h !== null && ("graph" in h || "graphs" in h), t = c.tokens;
   return [{c, i, graph, size: graph ? graphSize([h.graph, h.graphs]) : 0, ...t, context: t.prompt + t.thinking + t.answer}];
 });
@@ -1078,14 +1079,17 @@ const fmtN = n => Math.round(n).toLocaleString("en-US");
 const SOURCES = "思考 token：codex 直接报告 reasoning_output_tokens；claude 报告 output_tokens_details.thinking_tokens，回答是 output_tokens 减去思考，包括全部非思考输出（含工具调用的 JSON），不只是最后的结构化答案；hive 只报告 completion_tokens，页面用 Qwen 分词器数出回答的 token，剩下的算思考，误差只来自较短的回答。";
 const AXIS_NOTE = "横轴是 header 里 graph 和 graphs 的节点数加边数，没有 header 的调用（第一层压缩）算 0。";
 const PARTS = [["prompt", "提示词", "var(--tk-prompt)"], ["thinking", "思考", "var(--tk-think)"], ["answer", "回答", "var(--tk-answer)"]];
+const tokSuperseded = calls.filter(c => c.tokens !== null && c.superseded).length;
+const COUNTED = `${tokRows.length} 次调用计入统计。` + (tokSuperseded
+  ? `另有 ${tokSuperseded} 次调用不计入：它们的回答没有被采用（思考顶满、被驳回或出错），同一个问题重新问了以后得到了被接受的回答，统计只算被接受的那一次。` : "");
 const TOKEN_TABS = {
   thinking: {value: r => r.thinking, budgets, parts: null,
-    note: () => `${tokRows.length} 次调用带用量记录。${SOURCES}${AXIS_NOTE}` +
+    note: () => `${COUNTED}${SOURCES}${AXIS_NOTE}` +
       (budgets.length ? `红色虚线是请求里设的思考上限 ${budgets.map(fmtN).join("、")}。` +
         (new Set(sentBudgets).size > 1 ? "有些调用是在更低的上限下发出的，鼠标悬浮显示每次调用自己的上限，是否顶满也按它判断。" : "") : "这个后端的请求没有设思考上限。"),
     bars: "每根柱子是一次调用，按思考 token 从小到大排列，颜色是调用所属的阶段。橙色实线是平均数，黑色点线是中位数。"},
   context: {value: r => r.context, budgets: [], parts: PARTS,
-    note: () => `${tokRows.length} 次调用带用量记录。完整上下文是一次调用在端点上占用的全部 token：提示词 + 思考 + 回答。` +
+    note: () => `${COUNTED}完整上下文是一次调用在端点上占用的全部 token：提示词 + 思考 + 回答。` +
       `提示词取服务端报告的 prompt_tokens（hive）或 input_tokens（codex）；claude 的提示词是 input_tokens 加上缓存写入和缓存读取的 token。${SOURCES}${AXIS_NOTE}`,
     bars: "每根柱子是一次调用，按完整上下文 token 从小到大排列，柱子从下往上分成三段：" +
       PARTS.map(([, name, color]) => `<span class="sw" style="background:${color}"></span>${name}`).join(" ") + "。橙色实线是平均数，黑色点线是中位数。"},

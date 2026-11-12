@@ -714,7 +714,8 @@ class Attempt(BaseModel):
     `origin` is the other run directory that made the call (see Call). `tokens` is
     None when the reply carries no usage; `thinking_budget` is the cap its request set,
     None for a backend without one. `thinking_capped` judges the thinking against that
-    cap the way llm.LLMReply does.
+    cap the way llm.LLMReply does. `superseded` marks an attempt whose question a later
+    attempt answered acceptably; the page's token statistics count only that accepted one.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -742,6 +743,26 @@ class Attempt(BaseModel):
     tokens: TokenUse | None
     thinking_budget: int | None
     thinking_capped: bool
+    superseded: bool
+
+
+def _verdicts(
+    question: Sequence[Call], rerun: bool, conversation: Conversation
+) -> list[tuple[str, str]]:
+    """The verdict and reason of each call of one question; only its last call can be accepted."""
+    base = question[0].exchange.prompt
+    verdicts = [("rejected", later.exchange.prompt[len(base) :].strip()) for later in question[1:]]
+    last = question[-1]
+    gave_up = _gave_up(last, conversation)
+    if last.error is not None:
+        verdicts.append(("failed", last.error))
+    elif rerun:
+        verdicts.append(("failed", "后来同一个问题又从头问了一次，这次的回答没有被保留。"))
+    elif gave_up is not None:
+        verdicts.append(("rejected", gave_up))
+    else:
+        verdicts.append(("accepted", ""))
+    return verdicts
 
 
 def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
@@ -750,33 +771,28 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
     questions: list[list[Call]] = []
     open_question: dict[tuple[str, str], list[Call]] = {}
     for call in ordered:
-        key = (call.ask, call.subject)
-        question = open_question.get(key)
+        job = (call.ask, call.subject)
+        question = open_question.get(job)
         if question and _extends(call.exchange.prompt, question[0].exchange.prompt):
             question.append(call)
         else:
             question = [call]
             questions.append(question)
-            open_question[key] = question
-    last_asked = {
-        (q[0].ask, q[0].subject, q[0].exchange.prompt): n for n, q in enumerate(questions)
-    }
+            open_question[job] = question
+    keys = [(q[0].ask, q[0].subject, q[0].exchange.prompt) for q in questions]
+    last_asked = {key: n for n, key in enumerate(keys)}
+    verdicts = [
+        _verdicts(question, last_asked[key] != n, conversation)
+        for n, (key, question) in enumerate(zip(keys, questions, strict=True))
+    ]
+    answered = {key for key, n in last_asked.items() if verdicts[n][-1][0] == "accepted"}
     literals = literal_texts()
     judged: list[Attempt] = []
-    for n, question in enumerate(questions):
+    for key, question, question_verdicts in zip(keys, questions, verdicts, strict=True):
         base = question[0].exchange.prompt
-        rerun = last_asked[(question[0].ask, question[0].subject, base)] != n
-        for k, call in enumerate(question):
-            verdict, reason = "accepted", ""
-            gave_up = _gave_up(call, conversation)
-            if k + 1 < len(question):
-                verdict, reason = "rejected", question[k + 1].exchange.prompt[len(base) :].strip()
-            elif call.error is not None:
-                verdict, reason = "failed", call.error
-            elif rerun:
-                verdict, reason = "failed", "后来同一个问题又从头问了一次，这次的回答没有被保留。"
-            elif gave_up is not None:
-                verdict, reason = "rejected", gave_up
+        for k, (call, (verdict, reason)) in enumerate(
+            zip(question, question_verdicts, strict=True)
+        ):
             exchange = call.exchange
             window_seen, window_limit = _window_seen(call, conversation)
             tokens, budget = _tokens(exchange), _thinking_budget(exchange.request)
@@ -807,6 +823,7 @@ def judge(calls: Sequence[Call], conversation: Conversation) -> list[Attempt]:
                     thinking_capped=tokens is not None
                     and budget is not None
                     and tokens.thinking >= budget - HIVE_CAPPED_MARGIN,
+                    superseded=verdict != "accepted" and key in answered,
                 )
             )
     # A main-loop call made later for an earlier unit (a rerun) stays with that unit's calls, so
